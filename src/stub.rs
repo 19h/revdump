@@ -178,28 +178,21 @@ impl StubGenerator {
 
     /// Check if a value looks like a vtable pointer.
     ///
-    /// A vtable pointer should:
-    /// 1. Point into the module's readable sections (.rdata typically)
-    /// 2. Contain function pointers (addresses in .text)
+    /// A vtable pointer should point into the module's readable sections (.rdata typically).
+    /// We don't validate vtable entries anymore - if it points into the module, it's likely
+    /// a vtable. This is more permissive but handles edge cases better (external vtables,
+    /// vtables with RTTI at negative offsets, etc.)
     #[inline]
     fn is_likely_vtable(&self, ptr: u64) -> bool {
-        // Must be in module
-        if !self.is_in_module(ptr) {
-            return false;
-        }
+        // Just check if it's in module - that's sufficient for our purposes
+        self.is_in_module(ptr)
+    }
 
-        // Read first few entries and check if they look like code pointers
-        let mut buf = [0u8; 24]; // Check first 3 entries
-        if !safe_read_memory(ptr as *const u8, &mut buf) {
-            return false;
-        }
-
-        let entries: &[u64] = unsafe {
-            std::slice::from_raw_parts(buf.as_ptr() as *const u64, 3)
-        };
-
-        // At least one entry should point to code (in module, typically .text)
-        entries.iter().any(|&e| self.is_in_module(e))
+    #[allow(dead_code)]
+    fn is_likely_vtable_verbose(&self, ptr: u64) -> bool {
+        let result = self.is_in_module(ptr);
+        eprintln!("            vtable check: 0x{:X} in_module={}", ptr, result);
+        result
     }
 
     /// Probe a heap object to find vtable pointer offsets.
@@ -207,6 +200,15 @@ impl StubGenerator {
     /// Returns a set of offsets where vfptrs are located.
     /// Handles multiple inheritance where objects have multiple vfptrs.
     fn probe_vfptr_offsets(&self, addr: u64) -> BTreeSet<usize> {
+        self.probe_vfptr_offsets_inner(addr, false)
+    }
+
+    /// Verbose version for debugging.
+    fn probe_vfptr_offsets_verbose(&self, addr: u64) -> BTreeSet<usize> {
+        self.probe_vfptr_offsets_inner(addr, true)
+    }
+
+    fn probe_vfptr_offsets_inner(&self, addr: u64, verbose: bool) -> BTreeSet<usize> {
         let mut offsets = BTreeSet::new();
         let max_probe = self.config.max_vfptr_probe;
 
@@ -219,6 +221,9 @@ impl StubGenerator {
             if safe_read_memory(addr as *const u8, &mut buf[..8]) {
                 8
             } else {
+                if verbose {
+                    eprintln!("        could not read memory at 0x{:X}", addr);
+                }
                 return offsets;
             }
         };
@@ -229,7 +234,21 @@ impl StubGenerator {
             std::slice::from_raw_parts(buf.as_ptr() as *const u64, num_qwords)
         };
 
+        if verbose {
+            eprintln!("        probing {} qwords at heap object:", num_qwords.min(8));
+        }
+
         for (i, &val) in qwords.iter().enumerate() {
+            // Only show first 8 qwords in verbose mode
+            if verbose && i < 8 {
+                let in_module = self.is_in_module(val);
+                let likely_vtable = if in_module { self.is_likely_vtable_verbose(val) } else { false };
+                eprintln!(
+                    "          [+0x{:02X}] 0x{:016X} in_module={} likely_vtable={}",
+                    i * 8, val, in_module, likely_vtable
+                );
+            }
+
             if val >= self.config.min_ptr_value
                 && val <= self.config.max_ptr_value
                 && self.is_likely_vtable(val)
@@ -243,7 +262,14 @@ impl StubGenerator {
             let first_qword = qwords[0];
             if self.is_in_module(first_qword) {
                 offsets.insert(0);
+                if verbose {
+                    eprintln!("        fallback: using offset 0 (first qword in module)");
+                }
             }
+        }
+
+        if verbose && !offsets.is_empty() {
+            eprintln!("        found vfptr offsets: {:?}", offsets);
         }
 
         offsets
@@ -278,35 +304,75 @@ impl StubGenerator {
 
     /// Process all heap pointer locations and create stubs.
     pub fn process_heap_pointers(&mut self, heap_ptr_locs: &[(u32, u64)]) {
+        self.process_heap_pointers_inner(heap_ptr_locs, false)
+    }
+
+    /// Process heap pointers with optional verbose debugging.
+    pub fn process_heap_pointers_verbose(&mut self, heap_ptr_locs: &[(u32, u64)]) {
+        self.process_heap_pointers_inner(heap_ptr_locs, true)
+    }
+
+    fn process_heap_pointers_inner(&mut self, heap_ptr_locs: &[(u32, u64)], verbose: bool) {
         let mut stats = StubCreationStats::default();
 
-        for &(_rva, target_addr) in heap_ptr_locs {
+        if verbose {
+            eprintln!("\n=== Heap Pointer Analysis (verbose) ===");
+            eprintln!("Module range: 0x{:X} - 0x{:X}", self.mod_base, self.mod_end);
+            eprintln!("Total pointers to analyze: {}\n", heap_ptr_locs.len());
+        }
+
+        for &(rva, target_addr) in heap_ptr_locs {
             stats.total += 1;
+
+            if verbose {
+                eprintln!("  [{}] RVA 0x{:X} -> heap 0x{:X}", stats.total, rva, target_addr);
+            }
 
             // Track why stubs fail to be created
             if self.visited.contains(&target_addr) {
                 stats.already_visited += 1;
+                if verbose {
+                    eprintln!("      SKIP: already visited");
+                }
                 continue;
             }
 
             if !self.is_valid_heap_ptr(target_addr) {
                 stats.invalid_heap_ptr += 1;
+                if verbose {
+                    eprintln!("      SKIP: not a valid heap pointer");
+                    eprintln!("        reason: {}", self.debug_check_pointer(target_addr));
+                }
                 continue;
             }
 
             self.visited.insert(target_addr);
 
-            let vfptr_offsets = self.probe_vfptr_offsets(target_addr);
+            let vfptr_offsets = if verbose {
+                self.probe_vfptr_offsets_verbose(target_addr)
+            } else {
+                self.probe_vfptr_offsets(target_addr)
+            };
+
             if vfptr_offsets.is_empty() {
                 stats.no_vfptr_found += 1;
+                if verbose {
+                    eprintln!("      SKIP: no vfptr found at any offset");
+                }
                 continue;
             }
 
             // Try to create the stub
             if self.create_stub_internal(target_addr, vfptr_offsets).is_some() {
                 stats.created += 1;
+                if verbose {
+                    eprintln!("      OK: stub created");
+                }
             } else {
                 stats.vtable_not_in_module += 1;
+                if verbose {
+                    eprintln!("      SKIP: vtable not in module");
+                }
             }
         }
 

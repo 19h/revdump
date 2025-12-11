@@ -16,6 +16,7 @@ use crate::pe::{
     SectionInfo, HEAP_SECTION_CHARACTERISTICS, PE_SIGNATURE,
 };
 use crate::scanner::{PointerScanner, ScanResult};
+use crate::devirt::{self, DevirtConfig, DevirtStats};
 
 use std::fs::File;
 use std::io::Write;
@@ -42,6 +43,7 @@ pub enum ProgressStage {
     AssigningRvas,
     BuildingOutput,
     ApplyingFixups,
+    Devirtualizing,
     WritingFile,
     Complete,
 }
@@ -57,6 +59,7 @@ impl ProgressStage {
             Self::AssigningRvas => "Assigning RVAs",
             Self::BuildingOutput => "Building output PE",
             Self::ApplyingFixups => "Applying fixups",
+            Self::Devirtualizing => "Devirtualizing vcalls",
             Self::WritingFile => "Writing file",
             Self::Complete => "Complete",
         }
@@ -114,6 +117,10 @@ pub struct DumpConfig {
     pub skip_sections: Vec<usize>,
     /// Progress callback.
     pub progress_callback: Option<ProgressCallback>,
+    /// Enable vcall devirtualization (rewrite indirect calls to direct calls).
+    pub enable_devirt: bool,
+    /// Devirtualization configuration.
+    pub devirt_config: DevirtConfig,
 }
 
 impl std::fmt::Debug for DumpConfig {
@@ -124,6 +131,8 @@ impl std::fmt::Debug for DumpConfig {
             .field("max_vfptr_probe", &self.max_vfptr_probe)
             .field("skip_sections", &self.skip_sections)
             .field("progress_callback", &self.progress_callback.is_some())
+            .field("enable_devirt", &self.enable_devirt)
+            .field("devirt_config", &self.devirt_config)
             .finish()
     }
 }
@@ -136,6 +145,8 @@ impl Default for DumpConfig {
             max_vfptr_probe: 256,
             skip_sections: Vec::new(),
             progress_callback: None,
+            enable_devirt: false,
+            devirt_config: DevirtConfig::default(),
         }
     }
 }
@@ -287,13 +298,35 @@ impl Dumper {
         progress.stage = ProgressStage::BuildingOutput;
         report(&progress);
 
-        let output = self.build_output_pe(
+        let (mut output, section_mappings) = self.build_output_pe(
             pe,
             &stub_generator,
             &heap_ptr_locs,
             heap_section_va,
             heap_section_size,
         )?;
+
+        // Devirtualize vcalls if enabled
+        if config.enable_devirt {
+            progress.stage = ProgressStage::Devirtualizing;
+            report(&progress);
+
+            let devirt_stats = self.apply_devirt(
+                &mut output,
+                pe,
+                &stub_generator,
+                &heap_ptr_locs,
+                &section_mappings,
+                config,
+            )?;
+
+            eprintln!(
+                "Devirt: {} vcalls found, {} resolved, {} patched",
+                devirt_stats.vcalls_detected,
+                devirt_stats.vcalls_resolved,
+                devirt_stats.patches_applied,
+            );
+        }
 
         // Write to file
         progress.stage = ProgressStage::WritingFile;
@@ -394,6 +427,7 @@ impl Dumper {
     }
 
     /// Build the output PE with heap section.
+    /// Returns the output buffer and section mappings for devirt.
     fn build_output_pe(
         &self,
         pe: &PeParser,
@@ -401,7 +435,7 @@ impl Dumper {
         heap_ptr_locs: &[ScanResult],
         heap_section_va: u32,
         heap_section_size: usize,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<(Vec<u8>, Vec<SectionMapping>)> {
         // Calculate sizes
         let num_sections = pe.sections.len() + 1; // +1 for .heap
         let headers_size = pe.pe_offset as usize
@@ -600,7 +634,7 @@ impl Dumper {
             aligned_headers,
         );
 
-        Ok(output)
+        Ok((output, section_mappings))
     }
 
     /// Dump a section's data from memory.
@@ -611,28 +645,78 @@ impl Dumper {
         }
 
         let mut result = vec![0u8; size];
-        const CHUNK_SIZE: usize = 0x40_0000; // 4MB
-
         let sec_addr = unsafe { self.base.add(section.virtual_address as usize) };
 
-        let mut off = 0;
-        while off < size {
-            let read_size = CHUNK_SIZE.min(size - off);
-            let src = unsafe { sec_addr.add(off) };
-
-            if is_memory_readable(src, read_size) {
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        src,
-                        result.as_mut_ptr().add(off),
-                        read_size,
-                    );
-                }
+        // Try to read the entire section at once first
+        if is_memory_readable(sec_addr, size) {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    sec_addr,
+                    result.as_mut_ptr(),
+                    size,
+                );
             }
-            off += CHUNK_SIZE;
+        } else {
+            // Fallback: read page by page
+            const PAGE_SIZE: usize = 0x1000;
+            let mut off = 0;
+            while off < size {
+                let read_size = PAGE_SIZE.min(size - off);
+                let src = unsafe { sec_addr.add(off) };
+
+                if is_memory_readable(src, read_size) {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            src,
+                            result.as_mut_ptr().add(off),
+                            read_size,
+                        );
+                    }
+                }
+                off += PAGE_SIZE;
+            }
         }
 
         result
+    }
+
+    /// Apply devirtualization to the output PE.
+    fn apply_devirt(
+        &self,
+        output: &mut [u8],
+        pe: &PeParser,
+        stub_generator: &StubGenerator,
+        heap_ptr_locs: &[ScanResult],
+        section_mappings: &[SectionMapping],
+        config: &DumpConfig,
+    ) -> Result<DevirtStats> {
+        // Find .text section (or first code section)
+        let text_section = pe.sections.iter()
+            .find(|s| s.name == ".text" || (s.characteristics & 0x20) != 0) // IMAGE_SCN_CNT_CODE
+            .ok_or_else(|| Error::SectionNotFound { name: ".text".to_string() })?;
+
+        // Calculate headers size for protection
+        let num_sections = pe.sections.len() + 1; // +1 for .heap
+        let headers_size = pe.pe_offset as usize
+            + 4  // PE signature
+            + std::mem::size_of::<FileHeader>()
+            + pe.size_of_optional_header as usize
+            + num_sections * std::mem::size_of::<SectionHeader>();
+        let aligned_headers = PeParser::align_up(headers_size, pe.file_alignment as usize);
+
+        // Call devirtualization
+        devirt::devirtualize(
+            output,
+            self.base,
+            pe.image_base,
+            text_section.virtual_address,
+            text_section.virtual_size,
+            heap_ptr_locs,
+            stub_generator,
+            &section_mappings,
+            aligned_headers,
+            &config.devirt_config,
+        )
     }
 
     /// Standard dump without heap snapshot.

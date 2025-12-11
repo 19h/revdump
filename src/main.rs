@@ -49,6 +49,10 @@ enum Commands {
         /// Section indices to skip (comma-separated)
         #[arg(long, value_delimiter = ',')]
         skip_sections: Vec<usize>,
+
+        /// Enable vcall devirtualization (rewrite indirect calls to direct calls)
+        #[arg(long)]
+        devirt: bool,
     },
 
     /// Dump a module without heap snapshot (standard dump)
@@ -86,6 +90,7 @@ fn main() -> anyhow::Result<()> {
             max_region_size,
             skip_code,
             skip_sections,
+            devirt,
         } => {
             dump_with_heap(
                 &module,
@@ -94,6 +99,7 @@ fn main() -> anyhow::Result<()> {
                 max_region_size,
                 skip_code,
                 skip_sections,
+                devirt,
             )?;
         }
 
@@ -117,6 +123,7 @@ fn dump_with_heap(
     max_region_size: usize,
     skip_code: bool,
     mut skip_sections: Vec<usize>,
+    devirt: bool,
 ) -> anyhow::Result<()> {
     use bytesize::ByteSize;
 
@@ -142,6 +149,7 @@ fn dump_with_heap(
     let config = DumpConfig {
         max_vfptr_probe: max_depth * 8, // Convert depth to probe size
         skip_sections,
+        enable_devirt: devirt,
         progress_callback: Some(Box::new(move |info: &ProgressInfo| {
             let pct = if info.total > 0 {
                 (info.current as f64 / info.total as f64 * 100.0) as u64
@@ -168,6 +176,9 @@ fn dump_with_heap(
                         info.stubs_created
                     )
                 }
+                ProgressStage::Devirtualizing => {
+                    format!("{}", info.stage.name())
+                }
                 _ => info.stage.name().to_string(),
             };
 
@@ -176,6 +187,10 @@ fn dump_with_heap(
         })),
         ..Default::default()
     };
+
+    if devirt {
+        println!("Devirtualization: enabled");
+    }
 
     // Suppress unused variable warnings
     let _ = max_region_size;

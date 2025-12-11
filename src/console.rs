@@ -52,6 +52,8 @@ pub struct Console {
     skip_code: bool,
     /// Additional sections to skip.
     skip_sections: Vec<usize>,
+    /// Enable devirtualization.
+    devirt: bool,
 }
 
 #[cfg(target_os = "windows")]
@@ -76,6 +78,7 @@ impl Console {
             max_region_size: 0x10000,
             skip_code: false,
             skip_sections: Vec::new(),
+            devirt: false,
         }
     }
 
@@ -179,6 +182,7 @@ impl Console {
         let max_region_size = self.max_region_size;
         let skip_code = self.skip_code;
         let skip_sections = self.skip_sections.clone();
+        let devirt = self.devirt;
 
         let handle = thread::spawn(move || {
             let mut state = ConsoleState {
@@ -189,6 +193,7 @@ impl Console {
                 max_region_size,
                 skip_code,
                 skip_sections,
+                devirt,
             };
             state.run();
         });
@@ -235,6 +240,7 @@ struct ConsoleState {
     max_region_size: usize,
     skip_code: bool,
     skip_sections: Vec<usize>,
+    devirt: bool,
 }
 
 #[cfg(target_os = "windows")]
@@ -272,9 +278,11 @@ impl ConsoleState {
                 "regionsize" | "region" | "r" => self.cmd_set_region_size(),
                 "skipcode" | "sc" => self.cmd_toggle_skip_code(),
                 "skipsections" | "ss" => self.cmd_set_skip_sections(),
+                "devirt" | "dv" => self.cmd_toggle_devirt(),
                 "dump" | "dumpheap" | "dh" => self.cmd_dump_with_heap(),
                 "dumpstd" | "ds" | "standard" => self.cmd_dump_standard(),
                 "go" | "run" | "!" => self.cmd_dump_now(),
+                "debug" | "dbg" => self.cmd_debug_heap_analysis(),
                 "quit" | "exit" | "q" => {
                     println!("Goodbye!");
                     self.should_exit.store(true, Ordering::SeqCst);
@@ -317,6 +325,7 @@ impl ConsoleState {
         println!("    regionsize, r        - Set max region size");
         println!("    skipcode, sc         - Toggle skip code section");
         println!("    skipsections, ss     - Set sections to skip");
+        println!("    devirt, dv           - Toggle vcall devirtualization");
         println!();
         println!("  [Dumping]");
         println!("    dump, dumpheap, dh   - Dump with heap (interactive)");
@@ -326,6 +335,7 @@ impl ConsoleState {
         println!("  [Information]");
         println!("    status, s            - Show current settings");
         println!("    modules, m, list     - List loaded modules");
+        println!("    debug, dbg           - Debug heap pointer analysis");
         println!("    help, h, ?           - Show this help");
         println!("    clear, cls           - Clear screen");
         println!();
@@ -346,6 +356,7 @@ impl ConsoleState {
             self.max_region_size / 1024
         );
         println!("  Skip Code:        {}", if self.skip_code { "Yes" } else { "No" });
+        println!("  Devirtualize:     {}", if self.devirt { "Yes" } else { "No" });
 
         if !self.skip_sections.is_empty() {
             let sections: Vec<String> = self.skip_sections.iter().map(|s| s.to_string()).collect();
@@ -499,6 +510,14 @@ impl ConsoleState {
         );
     }
 
+    fn cmd_toggle_devirt(&mut self) {
+        self.devirt = !self.devirt;
+        println!(
+            "[OK] Vcall devirtualization: {}",
+            if self.devirt { "Enabled" } else { "Disabled" }
+        );
+    }
+
     fn cmd_set_skip_sections(&mut self) {
         println!("Enter section indices to skip (comma-separated), or 'clear' to clear:");
         print!("Sections: ");
@@ -572,6 +591,7 @@ impl ConsoleState {
         println!("  Max Depth: {}", self.max_depth);
         println!("  Max Region Size: 0x{:X}", self.max_region_size);
         println!("  Skip Code: {}", if self.skip_code { "Yes" } else { "No" });
+        println!("  Devirtualize: {}", if self.devirt { "Yes" } else { "No" });
 
         if !self.confirm("\nProceed with dump?") {
             println!("Cancelled.");
@@ -650,6 +670,7 @@ impl ConsoleState {
         let config = DumpConfig {
             max_vfptr_probe: self.max_depth * 8, // Convert depth to probe size
             skip_sections,
+            enable_devirt: self.devirt,
             progress_callback: Some(Box::new(|info: &ProgressInfo| {
                 print_progress(info);
             })),
@@ -680,6 +701,147 @@ impl ConsoleState {
                 println!("[ERROR] Failed to open module: {}", e);
             }
         }
+        println!();
+    }
+
+    fn cmd_debug_heap_analysis(&mut self) {
+        use crate::stub::{StubConfig, StubGenerator};
+        use crate::pe::PeParser;
+
+        println!();
+        println!("=== Debug Heap Analysis ===");
+        println!();
+        println!("Target: {}", self.target_module);
+        println!();
+
+        // Get module info via the module list
+        let (base, size) = {
+            let mut found = None;
+            let process = unsafe { GetCurrentProcess() };
+            let mut modules = vec![HMODULE::default(); 1024];
+            let mut needed: u32 = 0;
+
+            if unsafe {
+                EnumProcessModules(
+                    process,
+                    modules.as_mut_ptr(),
+                    (modules.len() * std::mem::size_of::<HMODULE>()) as u32,
+                    &mut needed,
+                )
+            }
+            .is_ok()
+            {
+                let count = needed as usize / std::mem::size_of::<HMODULE>();
+                for module in modules.iter().take(count) {
+                    let mut name = [0u8; 260];
+                    let mut info = MODULEINFO::default();
+
+                    unsafe {
+                        let _ = GetModuleFileNameExA(Some(process), Some(*module), &mut name);
+                        let _ = GetModuleInformation(
+                            process,
+                            *module,
+                            &mut info,
+                            std::mem::size_of::<MODULEINFO>() as u32,
+                        );
+                    }
+
+                    let name_str = std::ffi::CStr::from_bytes_until_nul(&name)
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default();
+
+                    if name_str.to_lowercase().contains(&self.target_module.to_lowercase()) {
+                        found = Some((info.lpBaseOfDll as *const u8, info.SizeOfImage as usize));
+                        break;
+                    }
+                }
+            }
+            match found {
+                Some(info) => info,
+                None => {
+                    println!("[ERROR] Could not find module: {}", self.target_module);
+                    return;
+                }
+            }
+        };
+
+        println!("Module base: 0x{:X}", base as u64);
+        println!("Module size: 0x{:X}", size);
+        println!();
+
+        // Parse PE
+        let pe = match unsafe { PeParser::parse(base, size) } {
+            Ok(pe) => pe,
+            Err(e) => {
+                println!("[ERROR] Failed to parse PE: {}", e);
+                return;
+            }
+        };
+
+        println!("Image base: 0x{:X}", pe.image_base);
+        println!();
+
+        // Create stub generator
+        let stub_config = StubConfig {
+            min_ptr_value: 0x10000,
+            max_ptr_value: 0x7FFF_FFFF_FFFF,
+            max_vfptr_probe: self.max_depth * 8,
+        };
+
+        let mut stub_gen = match StubGenerator::new(base, size, stub_config) {
+            Ok(sg) => sg,
+            Err(e) => {
+                println!("[ERROR] Failed to create stub generator: {}", e);
+                return;
+            }
+        };
+
+        // Scan for heap pointers
+        println!("Scanning for heap pointers...");
+        let scanner_config = stub_gen.scanner_config();
+        let mut heap_ptr_locs = Vec::new();
+
+        for section in &pe.sections {
+            if section.name == ".text" {
+                continue; // Skip code
+            }
+
+            let sec_data = unsafe {
+                std::slice::from_raw_parts(
+                    base.add(section.virtual_address as usize),
+                    section.virtual_size as usize,
+                )
+            };
+
+            // Simple scan for pointers
+            for offset in (0..sec_data.len().saturating_sub(8)).step_by(8) {
+                let ptr = u64::from_le_bytes(sec_data[offset..offset+8].try_into().unwrap());
+
+                if ptr >= scanner_config.min_ptr
+                    && ptr <= scanner_config.max_ptr
+                    && (ptr < scanner_config.mod_base || ptr >= scanner_config.mod_end)
+                {
+                    // Check if it's a valid heap region
+                    if stub_gen.cache().is_valid_heap_region(ptr) {
+                        let rva = section.virtual_address + offset as u32;
+                        heap_ptr_locs.push((rva, ptr));
+                    }
+                }
+            }
+        }
+
+        println!("Found {} heap pointers\n", heap_ptr_locs.len());
+
+        if heap_ptr_locs.is_empty() {
+            println!("[WARN] No heap pointers found!");
+            return;
+        }
+
+        // Process with verbose output
+        stub_gen.process_heap_pointers_verbose(&heap_ptr_locs);
+
+        println!();
+        println!("Analysis complete.");
         println!();
     }
 
@@ -749,6 +911,9 @@ fn print_progress(info: &ProgressInfo) {
         }
         ProgressStage::ApplyingFixups => {
             format!("{}/{} fixups", info.current, info.total)
+        }
+        ProgressStage::Devirtualizing => {
+            "scanning vcalls...".to_string()
         }
         _ => {
             if info.total > 0 {
