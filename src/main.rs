@@ -148,6 +148,8 @@ fn dump_with_heap(
     let pb_clone = pb.clone();
     let config = DumpConfig {
         max_vfptr_probe: max_depth * 8, // Convert depth to probe size
+        max_heap_scan_size: max_region_size,
+        recursive_heap_scan_depth: max_depth,
         skip_sections,
         enable_devirt: devirt,
         progress_callback: Some(Box::new(move |info: &ProgressInfo| {
@@ -170,11 +172,7 @@ fn dump_with_heap(
                     )
                 }
                 ProgressStage::CreatingStubs => {
-                    format!(
-                        "{} - {} stubs",
-                        info.stage.name(),
-                        info.stubs_created
-                    )
+                    format!("{} - {} stubs", info.stage.name(), info.stubs_created)
                 }
                 ProgressStage::Devirtualizing => {
                     format!("{}", info.stage.name())
@@ -191,9 +189,6 @@ fn dump_with_heap(
     if devirt {
         println!("Devirtualization: enabled");
     }
-
-    // Suppress unused variable warnings
-    let _ = max_region_size;
 
     dumper.dump_with_heap(output, &config)?;
 
@@ -217,10 +212,12 @@ fn standard_dump(module: &str, output: &PathBuf) -> anyhow::Result<()> {
 
 #[cfg(target_os = "windows")]
 fn list_modules() -> anyhow::Result<()> {
-    use windows::Win32::System::ProcessStatus::{EnumProcessModules, GetModuleFileNameExA, GetModuleInformation, MODULEINFO};
-    use windows::Win32::System::Threading::GetCurrentProcess;
-    use windows::Win32::Foundation::HMODULE;
     use bytesize::ByteSize;
+    use windows::Win32::Foundation::HMODULE;
+    use windows::Win32::System::ProcessStatus::{
+        EnumProcessModules, GetModuleFileNameExA, GetModuleInformation, MODULEINFO,
+    };
+    use windows::Win32::System::Threading::GetCurrentProcess;
 
     let process = unsafe { GetCurrentProcess() };
     let mut modules = vec![HMODULE::default(); 1024];

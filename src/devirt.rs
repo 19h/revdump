@@ -19,11 +19,9 @@
 use crate::error::Result;
 use crate::fixup::SectionMapping;
 use crate::memory::safe_read_memory;
-use crate::stub::StubGenerator;
+use crate::stub::VtableFact;
 
-use iced_x86::{
-    code_asm::*, Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register,
-};
+use iced_x86::{code_asm::*, Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
 use std::collections::HashMap;
 
 // ============================================================================
@@ -54,6 +52,10 @@ pub struct VcallSite {
     pub instruction_len: usize,
     /// The global RVA that was loaded (source of instance pointer).
     pub global_rva: u32,
+    /// Offset inside the instance where the vfptr was loaded.
+    pub instance_offset: u32,
+    /// RVA of the concrete vtable used by this site.
+    pub vtable_rva: u32,
     /// Vtable offset being accessed (e.g., 0x88 for slot 17).
     pub vtable_offset: u32,
     /// The resolved target function RVA (if resolvable).
@@ -113,8 +115,6 @@ pub struct Thunk {
 pub struct ThunkAllocator {
     /// Available slots (rva, size).
     slots: Vec<(u32, usize)>,
-    /// Next slot index.
-    next_slot: usize,
 }
 
 impl ThunkAllocator {
@@ -280,7 +280,7 @@ impl ThunkAllocator {
             }
         }
 
-        Self { slots, next_slot: 0 }
+        Self { slots }
     }
 
     /// Allocate space for a thunk. Returns (rva, available_size) or None.
@@ -349,6 +349,8 @@ pub enum RegisterValue {
         global_rva: u32,
         /// Offset into the instance where vtable was read (usually 0).
         instance_offset: u32,
+        /// RVA of the final vtable in the module.
+        vtable_rva: u32,
         /// RVA of the mov instruction that loaded the vtable.
         deref_instr_rva: u32,
         /// Length of the mov instruction.
@@ -359,6 +361,10 @@ pub enum RegisterValue {
     VtableFuncPtr {
         /// The original global this came from.
         global_rva: u32,
+        /// Offset into the instance where the vfptr was read.
+        instance_offset: u32,
+        /// RVA of the final vtable in the module.
+        vtable_rva: u32,
         /// Vtable offset the function was loaded from.
         vtable_offset: u32,
         /// RVA where the patchable sequence starts (add instruction).
@@ -373,6 +379,10 @@ pub enum RegisterValue {
     VtablePtrWithOffset {
         /// The original global this came from.
         global_rva: u32,
+        /// Offset into the instance where the vfptr was read.
+        instance_offset: u32,
+        /// RVA of the final vtable in the module.
+        vtable_rva: u32,
         /// The added offset.
         offset: u32,
         /// RVA of the add instruction (for patching).
@@ -432,21 +442,13 @@ impl RegisterState {
 fn to_64bit_reg(reg: Register) -> Register {
     match reg {
         // RAX family
-        Register::AL | Register::AH | Register::AX | Register::EAX | Register::RAX => {
-            Register::RAX
-        }
+        Register::AL | Register::AH | Register::AX | Register::EAX | Register::RAX => Register::RAX,
         // RBX family
-        Register::BL | Register::BH | Register::BX | Register::EBX | Register::RBX => {
-            Register::RBX
-        }
+        Register::BL | Register::BH | Register::BX | Register::EBX | Register::RBX => Register::RBX,
         // RCX family
-        Register::CL | Register::CH | Register::CX | Register::ECX | Register::RCX => {
-            Register::RCX
-        }
+        Register::CL | Register::CH | Register::CX | Register::ECX | Register::RCX => Register::RCX,
         // RDX family
-        Register::DL | Register::DH | Register::DX | Register::EDX | Register::RDX => {
-            Register::RDX
-        }
+        Register::DL | Register::DH | Register::DX | Register::EDX | Register::RDX => Register::RDX,
         // RSI family
         Register::SIL | Register::SI | Register::ESI | Register::RSI => Register::RSI,
         // RDI family
@@ -517,8 +519,10 @@ fn is_control_flow(instr: &Instruction) -> bool {
 
 /// Maps global RVAs to their resolved vtable information.
 pub struct GlobalVtableMap {
-    /// global_rva -> VtableInfo
-    map: HashMap<u32, VtableInfo>,
+    /// (global_rva, vfptr_offset) -> VtableInfo
+    map: HashMap<(u32, u32), VtableInfo>,
+    /// Fast test for whether a global has any vtable facts.
+    globals: HashMap<u32, usize>,
 }
 
 /// Information about a vtable accessible via a global.
@@ -529,56 +533,57 @@ struct VtableInfo {
     heap_addr: u64,
     /// RVA of the vtable within the module.
     vtable_rva: u32,
-    /// Module base for reading vtable slots.
-    mod_base: u64,
+    /// Offset inside the heap object where this vfptr lives.
+    #[allow(dead_code)]
+    vfptr_offset: u32,
 }
 
 impl GlobalVtableMap {
-    /// Build the map from scanner results and stub generator.
-    pub fn build(
-        heap_ptr_locs: &[(u32, u64)],
-        stub_generator: &StubGenerator,
-        image_base: u64,
-    ) -> Self {
-        let mut map = HashMap::with_capacity(heap_ptr_locs.len());
+    /// Build the map from flattened vtable facts.
+    pub fn build(vtable_facts: &[VtableFact], _image_base: u64) -> Self {
+        let mut map = HashMap::with_capacity(vtable_facts.len());
+        let mut globals = HashMap::new();
 
-        for &(global_rva, heap_addr) in heap_ptr_locs {
-            if let Some(stub) = stub_generator.get_stub(heap_addr) {
-                // Get the primary vtable (offset 0)
-                if let Some(vtable_ref) = stub.vtable_refs.iter().find(|r| r.offset == 0) {
-                    map.insert(
-                        global_rva,
-                        VtableInfo {
-                            heap_addr,
-                            vtable_rva: vtable_ref.vtable_rva,
-                            mod_base: image_base,
-                        },
-                    );
-                }
-            }
+        for fact in vtable_facts {
+            let Some(global_rva) = fact.source_rva else {
+                continue;
+            };
+
+            map.insert(
+                (global_rva, fact.vfptr_offset),
+                VtableInfo {
+                    heap_addr: fact.heap_addr,
+                    vtable_rva: fact.vtable_rva,
+                    vfptr_offset: fact.vfptr_offset,
+                },
+            );
+            *globals.entry(global_rva).or_insert(0) += 1;
         }
 
-        Self { map }
+        Self { map, globals }
     }
 
-    /// Check if a global RVA is in our map.
-    pub fn contains(&self, global_rva: u32) -> bool {
-        self.map.contains_key(&global_rva)
+    /// Check if a global RVA has any vtable facts.
+    pub fn contains_global(&self, global_rva: u32) -> bool {
+        self.globals.contains_key(&global_rva)
     }
 
-    /// Resolve a vcall: given a global and vtable offset, return the function RVA.
+    /// Look up the final vtable for a global and vfptr offset.
+    fn lookup(&self, global_rva: u32, vfptr_offset: u32) -> Option<&VtableInfo> {
+        self.map.get(&(global_rva, vfptr_offset))
+    }
+
+    /// Resolve a vcall: given a final vtable and slot offset, return the function RVA.
     ///
     /// This reads the vtable slot from module memory.
     pub fn resolve_vcall(
         &self,
-        global_rva: u32,
+        vtable_rva: u32,
         vtable_offset: u32,
         mod_base: *const u8,
     ) -> Option<u32> {
-        let info = self.map.get(&global_rva)?;
-
         // Calculate address of vtable slot
-        let vtable_addr = mod_base as u64 + info.vtable_rva as u64;
+        let vtable_addr = mod_base as u64 + vtable_rva as u64;
         let slot_addr = vtable_addr + vtable_offset as u64;
 
         // Read the function pointer from the vtable
@@ -590,8 +595,9 @@ impl GlobalVtableMap {
         let func_ptr = u64::from_le_bytes(func_ptr_bytes);
 
         // Convert to RVA (must be within module)
-        if func_ptr >= info.mod_base {
-            let rva = (func_ptr - info.mod_base) as u32;
+        let image_base = mod_base as u64;
+        if func_ptr >= image_base {
+            let rva = (func_ptr - image_base) as u32;
             Some(rva)
         } else {
             None
@@ -662,7 +668,8 @@ impl<'a> VcallScanner<'a> {
                 let maybe_site = match instr.mnemonic() {
                     Mnemonic::Call => {
                         // First try indirect call (call [reg+offset])
-                        if let Some(site) = self.check_indirect_call(&instr, &reg_state, instr_rva) {
+                        if let Some(site) = self.check_indirect_call(&instr, &reg_state, instr_rva)
+                        {
                             Some(site)
                         } else {
                             // Then try call register (call reg)
@@ -674,7 +681,7 @@ impl<'a> VcallScanner<'a> {
                 };
                 if let Some(mut site) = maybe_site {
                     site.resolved_target = self.global_map.resolve_vcall(
-                        site.global_rva,
+                        site.vtable_rva,
                         site.vtable_offset,
                         self.mod_base,
                     );
@@ -693,19 +700,22 @@ impl<'a> VcallScanner<'a> {
 
             // Pattern 1: mov reg, [rip+disp] - load from global
             if let Some((dest, global_rva)) = self.check_global_load(&instr) {
-                if self.global_map.contains(global_rva) {
+                if self.global_map.contains_global(global_rva) {
                     reg_state.set(dest, RegisterValue::GlobalPtr { global_rva });
                 }
                 continue;
             }
 
-            // Pattern 2: mov reg, [reg] - dereference to get vtable
-            if let Some((dest, src_global_rva)) = self.check_vtable_deref(&instr, &reg_state) {
+            // Pattern 2: mov reg, [reg+offset] - dereference to get vtable
+            if let Some((dest, src_global_rva, instance_offset, vtable_rva)) =
+                self.check_vtable_deref(&instr, &reg_state)
+            {
                 reg_state.set(
                     dest,
                     RegisterValue::VtablePtr {
                         global_rva: src_global_rva,
-                        instance_offset: 0,
+                        instance_offset,
+                        vtable_rva,
                         deref_instr_rva: instr_rva,
                         deref_instr_len: instr.len(),
                     },
@@ -716,7 +726,7 @@ impl<'a> VcallScanner<'a> {
             // Pattern 3: lea reg, [reg+offset] - load vtable slot address
             if let Some(mut site) = self.check_lea_pattern(&instr, &reg_state, instr_rva) {
                 site.resolved_target = self.global_map.resolve_vcall(
-                    site.global_rva,
+                    site.vtable_rva,
                     site.vtable_offset,
                     self.mod_base,
                 );
@@ -733,7 +743,7 @@ impl<'a> VcallScanner<'a> {
             // Pattern 4: mov reg, [reg+offset] - load function pointer from vtable
             if let Some(mut site) = self.check_mov_vtable_pattern(&instr, &reg_state, instr_rva) {
                 site.resolved_target = self.global_map.resolve_vcall(
-                    site.global_rva,
+                    site.vtable_rva,
                     site.vtable_offset,
                     self.mod_base,
                 );
@@ -748,35 +758,54 @@ impl<'a> VcallScanner<'a> {
             }
 
             // Pattern 5: add reg, imm - add offset to vtable pointer
-            if let Some((reg, global_rva, offset)) = self.check_add_offset(&instr, &reg_state) {
-                reg_state.set(reg, RegisterValue::VtablePtrWithOffset {
-                    global_rva,
-                    offset,
-                    add_instr_rva: instr_rva,
-                    add_instr_len: instr.len(),
-                });
+            if let Some((reg, global_rva, instance_offset, vtable_rva, offset)) =
+                self.check_add_offset(&instr, &reg_state)
+            {
+                reg_state.set(
+                    reg,
+                    RegisterValue::VtablePtrWithOffset {
+                        global_rva,
+                        instance_offset,
+                        vtable_rva,
+                        offset,
+                        add_instr_rva: instr_rva,
+                        add_instr_len: instr.len(),
+                    },
+                );
                 continue;
             }
 
             // Pattern 6: mov reg, [reg] where reg holds VtablePtrWithOffset
             // This loads function pointer from computed vtable slot
-            if let Some((dest, global_rva, vtable_offset, patch_start, patch_len)) =
-                self.check_load_from_offset_ptr(&instr, &reg_state, instr_rva)
+            if let Some((
+                dest,
+                global_rva,
+                instance_offset,
+                vtable_rva,
+                vtable_offset,
+                patch_start,
+                patch_len,
+            )) = self.check_load_from_offset_ptr(&instr, &reg_state, instr_rva)
             {
-                reg_state.set(dest, RegisterValue::VtableFuncPtr {
-                    global_rva,
-                    vtable_offset,
-                    patch_start_rva: patch_start,
-                    patch_len,
-                    dest_reg: dest,
-                });
+                reg_state.set(
+                    dest,
+                    RegisterValue::VtableFuncPtr {
+                        global_rva,
+                        instance_offset,
+                        vtable_rva,
+                        vtable_offset,
+                        patch_start_rva: patch_start,
+                        patch_len,
+                        dest_reg: dest,
+                    },
+                );
                 continue;
             }
 
             // Pattern 7: call reg where reg holds VtableFuncPtr
             if let Some(mut site) = self.check_call_register(&instr, &reg_state, instr_rva) {
                 site.resolved_target = self.global_map.resolve_vcall(
-                    site.global_rva,
+                    site.vtable_rva,
                     site.vtable_offset,
                     self.mod_base,
                 );
@@ -824,12 +853,12 @@ impl<'a> VcallScanner<'a> {
         Some((dest, global_rva))
     }
 
-    /// Check for `mov reg, [reg]` where source reg holds a GlobalPtr.
+    /// Check for `mov reg, [reg+offset]` where source reg holds a GlobalPtr.
     fn check_vtable_deref(
         &self,
         instr: &Instruction,
         reg_state: &RegisterState,
-    ) -> Option<(Register, u32)> {
+    ) -> Option<(Register, u32, u32, u32)> {
         if instr.mnemonic() != Mnemonic::Mov {
             return None;
         }
@@ -844,20 +873,19 @@ impl<'a> VcallScanner<'a> {
         let dest = instr.op0_register();
         let base = instr.memory_base();
 
-        // Must be simple [reg] with no displacement or index
+        // Must be simple [reg+disp] with no index
         if instr.memory_index() != Register::None {
-            return None;
-        }
-        if instr.memory_displacement64() != 0 {
             return None;
         }
         if base == Register::RIP || base == Register::None {
             return None;
         }
+        let instance_offset = instr.memory_displacement64() as u32;
 
         // Check if base register holds a GlobalPtr
         if let RegisterValue::GlobalPtr { global_rva } = reg_state.get(base) {
-            return Some((dest, *global_rva));
+            let info = self.global_map.lookup(*global_rva, instance_offset)?;
+            return Some((dest, *global_rva, instance_offset, info.vtable_rva));
         }
 
         None
@@ -891,7 +919,14 @@ impl<'a> VcallScanner<'a> {
         let displacement = instr.memory_displacement64() as u32;
 
         // Check if base holds a VtablePtr
-        if let RegisterValue::VtablePtr { global_rva, deref_instr_rva, deref_instr_len, .. } = reg_state.get(base) {
+        if let RegisterValue::VtablePtr {
+            global_rva,
+            instance_offset,
+            vtable_rva,
+            deref_instr_rva,
+            deref_instr_len,
+        } = reg_state.get(base)
+        {
             // Calculate total patchable region: from vtable deref to end of call instruction
             // This gives us enough space for a direct call
             let call_end = instr_rva + instr.len() as u32;
@@ -912,6 +947,8 @@ impl<'a> VcallScanner<'a> {
                 instruction_rva: instr_rva,
                 instruction_len: instr.len(),
                 global_rva: *global_rva,
+                instance_offset: *instance_offset,
+                vtable_rva: *vtable_rva,
                 vtable_offset: displacement,
                 resolved_target: None,
                 kind: VcallKind::IndirectCall,
@@ -951,7 +988,14 @@ impl<'a> VcallScanner<'a> {
         let displacement = instr.memory_displacement64() as u32;
 
         // Check if base holds a VtablePtr
-        if let RegisterValue::VtablePtr { global_rva, deref_instr_rva, deref_instr_len, .. } = reg_state.get(base) {
+        if let RegisterValue::VtablePtr {
+            global_rva,
+            instance_offset,
+            vtable_rva,
+            deref_instr_rva,
+            deref_instr_len,
+        } = reg_state.get(base)
+        {
             let jmp_end = instr_rva + instr.len() as u32;
             let total_patch_len = (jmp_end - deref_instr_rva) as usize;
 
@@ -967,6 +1011,8 @@ impl<'a> VcallScanner<'a> {
                 instruction_rva: instr_rva,
                 instruction_len: instr.len(),
                 global_rva: *global_rva,
+                instance_offset: *instance_offset,
+                vtable_rva: *vtable_rva,
                 vtable_offset: displacement,
                 resolved_target: None,
                 kind: VcallKind::IndirectJmp,
@@ -1016,11 +1062,19 @@ impl<'a> VcallScanner<'a> {
         }
 
         // Check if base holds a VtablePtr
-        if let RegisterValue::VtablePtr { global_rva, .. } = reg_state.get(base) {
+        if let RegisterValue::VtablePtr {
+            global_rva,
+            instance_offset,
+            vtable_rva,
+            ..
+        } = reg_state.get(base)
+        {
             return Some(VcallSite {
                 instruction_rva: instr_rva,
                 instruction_len: instr.len(),
                 global_rva: *global_rva,
+                instance_offset: *instance_offset,
+                vtable_rva: *vtable_rva,
                 vtable_offset: displacement,
                 resolved_target: None,
                 kind: VcallKind::LeaVtableSlot,
@@ -1074,11 +1128,19 @@ impl<'a> VcallScanner<'a> {
         }
 
         // Check if base holds a VtablePtr
-        if let RegisterValue::VtablePtr { global_rva, .. } = reg_state.get(base) {
+        if let RegisterValue::VtablePtr {
+            global_rva,
+            instance_offset,
+            vtable_rva,
+            ..
+        } = reg_state.get(base)
+        {
             return Some(VcallSite {
                 instruction_rva: instr_rva,
                 instruction_len: instr.len(),
                 global_rva: *global_rva,
+                instance_offset: *instance_offset,
+                vtable_rva: *vtable_rva,
                 vtable_offset: displacement,
                 resolved_target: None,
                 kind: VcallKind::MovVtableSlot,
@@ -1091,12 +1153,12 @@ impl<'a> VcallScanner<'a> {
     }
 
     /// Check for `add reg, imm` where reg holds a VtablePtr.
-    /// Returns (register, global_rva, offset).
+    /// Returns (register, global_rva, instance_offset, vtable_rva, slot offset).
     fn check_add_offset(
         &self,
         instr: &Instruction,
         reg_state: &RegisterState,
-    ) -> Option<(Register, u32, u32)> {
+    ) -> Option<(Register, u32, u32, u32, u32)> {
         if instr.mnemonic() != Mnemonic::Add {
             return None;
         }
@@ -1117,21 +1179,27 @@ impl<'a> VcallScanner<'a> {
         let reg = instr.op0_register();
 
         // Check if reg holds a VtablePtr
-        if let RegisterValue::VtablePtr { global_rva, .. } = reg_state.get(reg) {
-            return Some((reg, *global_rva, offset));
+        if let RegisterValue::VtablePtr {
+            global_rva,
+            instance_offset,
+            vtable_rva,
+            ..
+        } = reg_state.get(reg)
+        {
+            return Some((reg, *global_rva, *instance_offset, *vtable_rva, offset));
         }
 
         None
     }
 
     /// Check for `mov reg, [reg]` where source reg holds VtablePtrWithOffset.
-    /// Returns (dest_reg, global_rva, vtable_offset, patch_start_rva, patch_len).
+    /// Returns (dest_reg, global_rva, instance_offset, vtable_rva, vtable_offset, patch_start_rva, patch_len).
     fn check_load_from_offset_ptr(
         &self,
         instr: &Instruction,
         reg_state: &RegisterState,
-        instr_rva: u32,
-    ) -> Option<(Register, u32, u32, u32, usize)> {
+        _instr_rva: u32,
+    ) -> Option<(Register, u32, u32, u32, u32, u32, usize)> {
         if instr.mnemonic() != Mnemonic::Mov {
             return None;
         }
@@ -1158,10 +1226,26 @@ impl<'a> VcallScanner<'a> {
         }
 
         // Check if base register holds a VtablePtrWithOffset
-        if let RegisterValue::VtablePtrWithOffset { global_rva, offset, add_instr_rva, add_instr_len } = reg_state.get(base) {
+        if let RegisterValue::VtablePtrWithOffset {
+            global_rva,
+            instance_offset,
+            vtable_rva,
+            offset,
+            add_instr_rva,
+            add_instr_len,
+        } = reg_state.get(base)
+        {
             // Calculate total patch length: add instruction + this mov instruction
             let patch_len = *add_instr_len + instr.len();
-            return Some((dest, *global_rva, *offset, *add_instr_rva, patch_len));
+            return Some((
+                dest,
+                *global_rva,
+                *instance_offset,
+                *vtable_rva,
+                *offset,
+                *add_instr_rva,
+                patch_len,
+            ));
         }
 
         None
@@ -1185,11 +1269,22 @@ impl<'a> VcallScanner<'a> {
         let reg = instr.op0_register();
 
         // Check if reg holds a VtableFuncPtr
-        if let RegisterValue::VtableFuncPtr { global_rva, vtable_offset, patch_start_rva, patch_len, dest_reg } = reg_state.get(reg) {
+        if let RegisterValue::VtableFuncPtr {
+            global_rva,
+            instance_offset,
+            vtable_rva,
+            vtable_offset,
+            patch_start_rva,
+            patch_len,
+            dest_reg,
+        } = reg_state.get(reg)
+        {
             return Some(VcallSite {
                 instruction_rva: instr_rva,
                 instruction_len: instr.len(),
                 global_rva: *global_rva,
+                instance_offset: *instance_offset,
+                vtable_rva: *vtable_rva,
                 vtable_offset: *vtable_offset,
                 resolved_target: None,
                 kind: VcallKind::CallRegister,
@@ -1256,7 +1351,10 @@ impl PatchGenerator {
 
     /// Generate patches for all resolved vcall sites.
     /// Returns (inline_patches, sites_needing_thunks).
-    pub fn generate_patches(&self, sites: &[VcallSite]) -> (Vec<CodePatch>, Vec<(u32, usize, u32)>) {
+    pub fn generate_patches(
+        &self,
+        sites: &[VcallSite],
+    ) -> (Vec<CodePatch>, Vec<(u32, usize, u32)>) {
         let mut patches = Vec::with_capacity(sites.len());
         let mut needs_thunk = Vec::new();
 
@@ -1264,7 +1362,11 @@ impl PatchGenerator {
             if let Some(target_rva) = site.resolved_target {
                 match self.generate_patch(site, target_rva) {
                     PatchResult::Inline(patch) => patches.push(patch),
-                    PatchResult::NeedsThunk { vcall_rva, vcall_len, target_rva } => {
+                    PatchResult::NeedsThunk {
+                        vcall_rva,
+                        vcall_len,
+                        target_rva,
+                    } => {
                         needs_thunk.push((vcall_rva, vcall_len, target_rva));
                     }
                     PatchResult::Skip => {}
@@ -1279,24 +1381,18 @@ impl PatchGenerator {
         match site.kind {
             VcallKind::IndirectCall => self.generate_call_patch(site, target_rva),
             VcallKind::IndirectJmp => self.generate_jmp_patch(site, target_rva),
-            VcallKind::LeaVtableSlot => {
-                match self.generate_lea_patch(site, target_rva) {
-                    Some(p) => PatchResult::Inline(p),
-                    None => PatchResult::Skip,
-                }
-            }
-            VcallKind::MovVtableSlot => {
-                match self.generate_mov_patch(site, target_rva) {
-                    Some(p) => PatchResult::Inline(p),
-                    None => PatchResult::Skip,
-                }
-            }
-            VcallKind::CallRegister => {
-                match self.generate_call_reg_patch(site, target_rva) {
-                    Some(p) => PatchResult::Inline(p),
-                    None => PatchResult::Skip,
-                }
-            }
+            VcallKind::LeaVtableSlot => match self.generate_lea_patch(site, target_rva) {
+                Some(p) => PatchResult::Inline(p),
+                None => PatchResult::Skip,
+            },
+            VcallKind::MovVtableSlot => match self.generate_mov_patch(site, target_rva) {
+                Some(p) => PatchResult::Inline(p),
+                None => PatchResult::Skip,
+            },
+            VcallKind::CallRegister => match self.generate_call_reg_patch(site, target_rva) {
+                Some(p) => PatchResult::Inline(p),
+                None => PatchResult::Skip,
+            },
         }
     }
 
@@ -1474,8 +1570,14 @@ impl PatchGenerator {
 
         // REX prefix: REX.W (bit 3) + optional REX.R for R8-R15
         let rex_r = match dest_reg64 {
-            Register::R8 | Register::R9 | Register::R10 | Register::R11
-            | Register::R12 | Register::R13 | Register::R14 | Register::R15 => 0x44, // REX.WR
+            Register::R8
+            | Register::R9
+            | Register::R10
+            | Register::R11
+            | Register::R12
+            | Register::R13
+            | Register::R14
+            | Register::R15 => 0x44, // REX.WR
             _ => 0x48, // REX.W
         };
         patch_bytes.push(rex_r);
@@ -1555,8 +1657,14 @@ impl PatchGenerator {
 
         // REX prefix: REX.W (bit 3) + optional REX.R for R8-R15
         let rex_r = match dest_reg64 {
-            Register::R8 | Register::R9 | Register::R10 | Register::R11
-            | Register::R12 | Register::R13 | Register::R14 | Register::R15 => 0x44, // REX.WR
+            Register::R8
+            | Register::R9
+            | Register::R10
+            | Register::R11
+            | Register::R12
+            | Register::R13
+            | Register::R14
+            | Register::R15 => 0x44, // REX.WR
             _ => 0x48, // REX.W
         };
         patch_bytes.push(rex_r);
@@ -1778,14 +1886,13 @@ pub fn devirtualize(
     image_base: u64,
     text_section_rva: u32,
     text_section_size: u32,
-    heap_ptr_locs: &[(u32, u64)],
-    stub_generator: &StubGenerator,
+    vtable_facts: &[VtableFact],
     section_mappings: &[SectionMapping],
     headers_size: usize,
     config: &DevirtConfig,
 ) -> Result<DevirtStats> {
     // Build global-to-vtable mapping
-    let global_map = GlobalVtableMap::build(heap_ptr_locs, stub_generator, image_base);
+    let global_map = GlobalVtableMap::build(vtable_facts, image_base);
 
     if global_map.is_empty() {
         return Ok(DevirtStats::default());
@@ -1793,8 +1900,7 @@ pub fn devirtualize(
 
     // Read .text section from memory
     let text_addr = unsafe { mod_base.add(text_section_rva as usize) };
-    let text_data =
-        unsafe { std::slice::from_raw_parts(text_addr, text_section_size as usize) };
+    let text_data = unsafe { std::slice::from_raw_parts(text_addr, text_section_size as usize) };
 
     // Scan for vcall patterns
     let scanner = VcallScanner::new(mod_base, image_base, &global_map, config);
@@ -1849,7 +1955,10 @@ mod tests {
     fn test_register_state() {
         let mut state = RegisterState::new();
 
-        state.set(Register::RAX, RegisterValue::GlobalPtr { global_rva: 0x1000 });
+        state.set(
+            Register::RAX,
+            RegisterValue::GlobalPtr { global_rva: 0x1000 },
+        );
 
         if let RegisterValue::GlobalPtr { global_rva } = state.get(Register::RAX) {
             assert_eq!(*global_rva, 0x1000);
@@ -1879,7 +1988,10 @@ mod tests {
         let mut state = RegisterState::new();
 
         // Set RAX to GlobalPtr
-        state.set(Register::RAX, RegisterValue::GlobalPtr { global_rva: 0x2000 });
+        state.set(
+            Register::RAX,
+            RegisterValue::GlobalPtr { global_rva: 0x2000 },
+        );
 
         // Simulate: mov rcx, rax (propagation)
         let rax_val = state.get(Register::RAX).clone();
@@ -1897,18 +2009,98 @@ mod tests {
     fn test_register_state_clobber() {
         let mut state = RegisterState::new();
 
-        state.set(Register::RAX, RegisterValue::GlobalPtr { global_rva: 0x1000 });
+        state.set(
+            Register::RAX,
+            RegisterValue::GlobalPtr { global_rva: 0x1000 },
+        );
         state.clobber(Register::RAX);
 
         assert!(matches!(state.get(Register::RAX), RegisterValue::Unknown));
     }
 
     #[test]
+    fn test_global_vtable_map_includes_secondary_vfptr() {
+        let facts = vec![
+            VtableFact {
+                source_rva: Some(0x3000),
+                heap_addr: 0x1000_0000,
+                stub_rva: 0x8000,
+                vfptr_offset: 0,
+                vtable_rva: 0x5000,
+            },
+            VtableFact {
+                source_rva: Some(0x3000),
+                heap_addr: 0x1000_0000,
+                stub_rva: 0x8000,
+                vfptr_offset: 0x20,
+                vtable_rva: 0x7000,
+            },
+        ];
+
+        let map = GlobalVtableMap::build(&facts, 0x1400_0000);
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.lookup(0x3000, 0).unwrap().vtable_rva, 0x5000);
+        assert_eq!(map.lookup(0x3000, 0x20).unwrap().vtable_rva, 0x7000);
+    }
+
+    #[test]
+    fn test_scanner_resolves_secondary_vfptr_vcall() {
+        let mut module = vec![0u8; 0x1000];
+        let image_base = module.as_mut_ptr() as u64;
+        let section_rva = 0x100u32;
+        let global_rva = 0x300u32;
+        let vtable_rva = 0x500u32;
+        let func_rva = 0x700u32;
+
+        let slot_offset = 0x18usize;
+        module[vtable_rva as usize + slot_offset..vtable_rva as usize + slot_offset + 8]
+            .copy_from_slice(&(image_base + func_rva as u64).to_le_bytes());
+
+        let next_ip_after_global_load = image_base + section_rva as u64 + 7;
+        let global_va = image_base + global_rva as u64;
+        let disp = (global_va as i64 - next_ip_after_global_load as i64) as i32;
+        let mut code = vec![0x48, 0x8B, 0x0D]; // mov rcx, [rip+disp32]
+        code.extend_from_slice(&disp.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0x8B, 0x41, 0x20]); // mov rax, [rcx+0x20]
+        code.extend_from_slice(&[0xFF, 0x50, 0x18]); // call [rax+0x18]
+
+        let facts = vec![VtableFact {
+            source_rva: Some(global_rva),
+            heap_addr: 0x1000_0000,
+            stub_rva: 0x9000,
+            vfptr_offset: 0x20,
+            vtable_rva,
+        }];
+        let map = GlobalVtableMap::build(&facts, image_base);
+        let config = DevirtConfig::default();
+        let scanner = VcallScanner::new(module.as_ptr(), image_base, &map, &config);
+
+        let (sites, stats) = scanner.scan_section(&code, section_rva);
+        assert_eq!(stats.vcalls_detected, 1);
+        assert_eq!(stats.vcalls_resolved, 1);
+        assert_eq!(sites[0].instance_offset, 0x20);
+        assert_eq!(sites[0].vtable_rva, vtable_rva);
+        assert_eq!(sites[0].resolved_target, Some(func_rva));
+    }
+
+    #[test]
     fn test_register_state_reset() {
         let mut state = RegisterState::new();
 
-        state.set(Register::RAX, RegisterValue::GlobalPtr { global_rva: 0x1000 });
-        state.set(Register::RBX, RegisterValue::VtablePtr { global_rva: 0x2000, instance_offset: 0 });
+        state.set(
+            Register::RAX,
+            RegisterValue::GlobalPtr { global_rva: 0x1000 },
+        );
+        state.set(
+            Register::RBX,
+            RegisterValue::VtablePtr {
+                global_rva: 0x2000,
+                instance_offset: 0,
+                vtable_rva: 0x3000,
+                deref_instr_rva: 0,
+                deref_instr_len: 0,
+            },
+        );
         state.reset();
 
         assert!(matches!(state.get(Register::RAX), RegisterValue::Unknown));
@@ -1922,9 +2114,9 @@ mod tests {
         // mov rcx, [rax]         ; deref to vtable
         // call [rcx+0x88]        ; indirect call
         let code: &[u8] = &[
-            0x48, 0x8B, 0x05, 0x00, 0x10, 0x00, 0x00,  // mov rax, [rip+0x1000]
-            0x48, 0x8B, 0x08,                          // mov rcx, [rax]
-            0xFF, 0x51, 0x78,                          // call [rcx+0x78]
+            0x48, 0x8B, 0x05, 0x00, 0x10, 0x00, 0x00, // mov rax, [rip+0x1000]
+            0x48, 0x8B, 0x08, // mov rcx, [rax]
+            0xFF, 0x51, 0x78, // call [rcx+0x78]
         ];
 
         let image_base = 0x140000000u64;
@@ -1994,14 +2186,16 @@ mod tests {
             instruction_rva: call_rva,
             instruction_len: original_len,
             global_rva: 0x10000,
+            instance_offset: 0,
+            vtable_rva: 0x20000,
             vtable_offset: 0x88,
             resolved_target: Some(target_rva),
             kind: VcallKind::IndirectCall,
             dest_register: None,
-                patch_site: None,
+            patch_site: None,
         };
 
-        let patches = gen.generate_patches(&[site]);
+        let (patches, _) = gen.generate_patches(&[site]);
         assert_eq!(patches.len(), 1);
 
         let patch = &patches[0];
@@ -2025,6 +2219,8 @@ mod tests {
             instruction_rva: lea_rva,
             instruction_len: original_len,
             global_rva: 0x10000,
+            instance_offset: 0,
+            vtable_rva: 0x20000,
             vtable_offset: 0x10,
             resolved_target: Some(target_rva),
             kind: VcallKind::LeaVtableSlot,
@@ -2032,7 +2228,7 @@ mod tests {
             patch_site: None,
         };
 
-        let patches = gen.generate_patches(&[site]);
+        let (patches, _) = gen.generate_patches(&[site]);
         assert_eq!(patches.len(), 1);
 
         let patch = &patches[0];
@@ -2045,7 +2241,10 @@ mod tests {
         // 8D is LEA opcode
         assert_eq!(patch.patch_bytes[1], 0x8D, "Expected LEA opcode");
         // ModRM: reg=RAX(0), rm=101 (RIP-relative) => 0x05
-        assert_eq!(patch.patch_bytes[2], 0x05, "Expected ModRM for RAX, RIP-relative");
+        assert_eq!(
+            patch.patch_bytes[2], 0x05,
+            "Expected ModRM for RAX, RIP-relative"
+        );
 
         // Verify the rel32 is correct
         // target_ip = 0x140006000, next_ip = lea_ip + 7 = 0x140002007
@@ -2072,6 +2271,8 @@ mod tests {
             instruction_rva: lea_rva,
             instruction_len: original_len,
             global_rva: 0x10000,
+            instance_offset: 0,
+            vtable_rva: 0x20000,
             vtable_offset: 0x10,
             resolved_target: Some(target_rva),
             kind: VcallKind::LeaVtableSlot,
@@ -2079,7 +2280,7 @@ mod tests {
             patch_site: None,
         };
 
-        let patches = gen.generate_patches(&[site]);
+        let (patches, _) = gen.generate_patches(&[site]);
         // LEA patches may fail if the encoding doesn't fit
         // This test checks the generator doesn't panic
         if !patches.is_empty() {
@@ -2097,17 +2298,21 @@ mod tests {
             instruction_rva: 0x1000,
             instruction_len: 6,
             global_rva: 0x5000,
+            instance_offset: 0,
+            vtable_rva: 0x20000,
             vtable_offset: 0x88,
             resolved_target: Some(0x2000),
             kind: VcallKind::IndirectCall,
             dest_register: None,
-                patch_site: None,
+            patch_site: None,
         };
 
         let lea_site = VcallSite {
             instruction_rva: 0x1000,
             instruction_len: 7,
             global_rva: 0x5000,
+            instance_offset: 0,
+            vtable_rva: 0x20000,
             vtable_offset: 0x10,
             resolved_target: Some(0x2000),
             kind: VcallKind::LeaVtableSlot,
@@ -2132,14 +2337,16 @@ mod tests {
             instruction_rva: jmp_rva,
             instruction_len: original_len,
             global_rva: 0x10000,
+            instance_offset: 0,
+            vtable_rva: 0x20000,
             vtable_offset: 0x88,
             resolved_target: Some(target_rva),
             kind: VcallKind::IndirectJmp,
             dest_register: None,
-                patch_site: None,
+            patch_site: None,
         };
 
-        let patches = gen.generate_patches(&[site]);
+        let (patches, _) = gen.generate_patches(&[site]);
         assert_eq!(patches.len(), 1);
 
         let patch = &patches[0];
@@ -2179,6 +2386,8 @@ mod tests {
             instruction_rva: mov_rva,
             instruction_len: original_len,
             global_rva: 0x10000,
+            instance_offset: 0,
+            vtable_rva: 0x20000,
             vtable_offset: 0x18,
             resolved_target: Some(target_rva),
             kind: VcallKind::MovVtableSlot,
@@ -2186,7 +2395,7 @@ mod tests {
             patch_site: None,
         };
 
-        let patches = gen.generate_patches(&[site]);
+        let (patches, _) = gen.generate_patches(&[site]);
         assert_eq!(patches.len(), 1);
 
         let patch = &patches[0];

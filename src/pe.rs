@@ -263,6 +263,10 @@ pub struct PeParser {
     pub number_of_sections: u16,
     /// Timestamp.
     pub time_date_stamp: u32,
+    /// Original COFF symbol/string table file pointer.
+    pub pointer_to_symbol_table: u32,
+    /// Original COFF symbol count.
+    pub number_of_symbols: u32,
     /// Size of optional header.
     pub size_of_optional_header: u16,
     /// File characteristics.
@@ -281,6 +285,8 @@ pub struct PeParser {
     pub is_64bit: bool,
     /// Raw optional header bytes (for copying to output).
     pub optional_header_raw: Vec<u8>,
+    /// Raw COFF symbol table plus string table, if present in the loaded image.
+    pub coff_symbol_table_raw: Vec<u8>,
     /// Parsed section information.
     pub sections: Vec<SectionInfo>,
 }
@@ -364,6 +370,29 @@ impl PeParser {
         )
         .to_vec();
 
+        // Preserve the COFF symbol/string table if the image has one. MinGW uses
+        // this string table for long section names like `/4`, which some tooling
+        // rejects if the pointer is stripped from the dumped PE.
+        const COFF_SYMBOL_SIZE: usize = 18;
+        let pointer_to_symbol_table = file_header.pointer_to_symbol_table;
+        let number_of_symbols = file_header.number_of_symbols;
+        let symbol_table_offset = pointer_to_symbol_table as usize;
+        let symbol_bytes = number_of_symbols as usize * COFF_SYMBOL_SIZE;
+        let string_table_offset = symbol_table_offset.saturating_add(symbol_bytes);
+        let coff_symbol_table_raw = if pointer_to_symbol_table != 0
+            && string_table_offset + 4 <= size
+        {
+            let string_table_size = *(base.add(string_table_offset) as *const u32) as usize;
+            let total_size = symbol_bytes.saturating_add(string_table_size);
+            if symbol_table_offset + total_size <= size && total_size >= 4 {
+                std::slice::from_raw_parts(base.add(symbol_table_offset), total_size).to_vec()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
         // Parse section headers
         let section_header_start = opt_header_start + size_of_optional_header as usize;
         let number_of_sections = file_header.number_of_sections;
@@ -382,6 +411,8 @@ impl PeParser {
             machine,
             number_of_sections,
             time_date_stamp: file_header.time_date_stamp,
+            pointer_to_symbol_table,
+            number_of_symbols,
             size_of_optional_header,
             characteristics: file_header.characteristics,
             image_base,
@@ -391,6 +422,7 @@ impl PeParser {
             size_of_headers,
             is_64bit,
             optional_header_raw,
+            coff_symbol_table_raw,
             sections,
         })
     }

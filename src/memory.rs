@@ -10,13 +10,13 @@ use std::ptr::null_mut;
 
 #[cfg(target_os = "windows")]
 use windows::Win32::{
+    System::Diagnostics::Debug::ReadProcessMemory,
     System::Memory::{
         VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_IMAGE, MEM_MAPPED, MEM_PRIVATE,
         PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD,
         PAGE_NOACCESS, PAGE_PROTECTION_FLAGS, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
     },
     System::Threading::GetCurrentProcess,
-    System::Diagnostics::Debug::ReadProcessMemory,
 };
 
 /// A cached memory region from VirtualQuery.
@@ -126,7 +126,9 @@ impl MemoryRegionCache {
 
         // Log cache stats
         let heap_regions = self.regions.iter().filter(|r| r.is_heap).count();
-        let total_heap_size: u64 = self.regions.iter()
+        let total_heap_size: u64 = self
+            .regions
+            .iter()
             .filter(|r| r.is_heap)
             .map(|r| r.end_addr - r.base_addr)
             .sum();
@@ -275,6 +277,21 @@ impl MemoryRegionCache {
     pub fn iter_regions(&self) -> impl Iterator<Item = &CachedRegion> {
         self.regions.iter()
     }
+
+    /// Add a synthetic region for unit tests on non-Windows hosts.
+    #[cfg(test)]
+    pub(crate) fn add_test_region(&mut self, base_addr: u64, size: u64, is_heap: bool) {
+        self.regions.push(CachedRegion {
+            base_addr,
+            end_addr: base_addr + size,
+            mem_type: 0,
+            protect: 0,
+            valid: true,
+            is_heap,
+        });
+        self.regions.sort_by_key(|r| r.base_addr);
+        self.initialized = true;
+    }
 }
 
 /// Probe a single byte of memory to verify it's actually readable.
@@ -300,7 +317,13 @@ pub fn probe_memory_byte(addr: *const u8) -> bool {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), test))]
+#[inline]
+pub fn probe_memory_byte(addr: *const u8) -> bool {
+    !addr.is_null()
+}
+
+#[cfg(all(not(target_os = "windows"), not(test)))]
 #[inline]
 pub fn probe_memory_byte(_addr: *const u8) -> bool {
     false
@@ -328,7 +351,22 @@ pub fn safe_read_memory(src: *const u8, dst: &mut [u8]) -> bool {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), test))]
+pub fn safe_read_memory(src: *const u8, dst: &mut [u8]) -> bool {
+    if dst.is_empty() {
+        return true;
+    }
+    if src.is_null() {
+        return false;
+    }
+
+    unsafe {
+        std::ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), dst.len());
+    }
+    true
+}
+
+#[cfg(all(not(target_os = "windows"), not(test)))]
 pub fn safe_read_memory(_src: *const u8, _dst: &mut [u8]) -> bool {
     false
 }
@@ -405,7 +443,7 @@ mod tests {
             base_addr: 0x1000,
             end_addr: 0x2000,
             mem_type: 0x20000, // MEM_PRIVATE
-            protect: 0x04,    // PAGE_READWRITE
+            protect: 0x04,     // PAGE_READWRITE
             valid: true,
             is_heap: true,
         };

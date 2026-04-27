@@ -25,11 +25,11 @@
 //!                        └── *qword_149FEB028 now resolves to vtable in .rdata
 //! ```
 
+use crate::error::Result;
 use crate::memory::{probe_memory_byte, safe_read_memory, MemoryRegionCache};
 use crate::scanner::ScannerConfig;
-use crate::error::Result;
 
-use std::collections::{HashMap, HashSet, BTreeSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 /// Statistics for stub creation debugging.
 #[derive(Default)]
@@ -48,6 +48,21 @@ pub struct VtableRef {
     /// Offset within the stub where this vtable pointer lives.
     pub offset: usize,
     /// RVA of the vtable within the module.
+    pub vtable_rva: u32,
+}
+
+/// A flattened vtable reference discovered while analyzing module and heap data.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct VtableFact {
+    /// Module RVA that held the original heap pointer, if one exists.
+    pub source_rva: Option<u32>,
+    /// Original heap address whose object/subobject contained the vfptr.
+    pub heap_addr: u64,
+    /// RVA of the synthetic stub representing `heap_addr`.
+    pub stub_rva: u32,
+    /// Offset inside the heap object/stub where the vfptr was found.
+    pub vfptr_offset: u32,
+    /// RVA of the final vtable inside the module image.
     pub vtable_rva: u32,
 }
 
@@ -80,6 +95,10 @@ pub struct StubConfig {
     pub max_ptr_value: u64,
     /// Maximum offset to probe for vfptrs (handles multiple inheritance).
     pub max_vfptr_probe: usize,
+    /// Maximum bytes to scan in a heap allocation for embedded heap pointers.
+    pub max_heap_scan_size: usize,
+    /// Maximum recursive heap-pointer scan depth.
+    pub recursive_heap_scan_depth: usize,
 }
 
 impl Default for StubConfig {
@@ -89,6 +108,8 @@ impl Default for StubConfig {
             max_ptr_value: 0x7FFF_FFFF_FFFF,
             // Probe up to 256 bytes for multiple vfptrs (typical MI depth)
             max_vfptr_probe: 256,
+            max_heap_scan_size: 0x1000,
+            recursive_heap_scan_depth: 2,
         }
     }
 }
@@ -154,13 +175,22 @@ impl StubGenerator {
         let mut reasons = Vec::new();
 
         if val < self.config.min_ptr_value {
-            reasons.push(format!("below min_ptr (0x{:X} < 0x{:X})", val, self.config.min_ptr_value));
+            reasons.push(format!(
+                "below min_ptr (0x{:X} < 0x{:X})",
+                val, self.config.min_ptr_value
+            ));
         }
         if val > self.config.max_ptr_value {
-            reasons.push(format!("above max_ptr (0x{:X} > 0x{:X})", val, self.config.max_ptr_value));
+            reasons.push(format!(
+                "above max_ptr (0x{:X} > 0x{:X})",
+                val, self.config.max_ptr_value
+            ));
         }
         if self.is_in_module(val) {
-            reasons.push(format!("in module range (0x{:X} - 0x{:X})", self.mod_base, self.mod_end));
+            reasons.push(format!(
+                "in module range (0x{:X} - 0x{:X})",
+                self.mod_base, self.mod_end
+            ));
         }
         if !self.region_cache.is_valid_heap_region(val) {
             reasons.push("not in valid heap region".to_string());
@@ -230,22 +260,31 @@ impl StubGenerator {
 
         // Scan qwords for vtable pointers
         let num_qwords = read_size / 8;
-        let qwords: &[u64] = unsafe {
-            std::slice::from_raw_parts(buf.as_ptr() as *const u64, num_qwords)
-        };
+        let qwords: &[u64] =
+            unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u64, num_qwords) };
 
         if verbose {
-            eprintln!("        probing {} qwords at heap object:", num_qwords.min(8));
+            eprintln!(
+                "        probing {} qwords at heap object:",
+                num_qwords.min(8)
+            );
         }
 
         for (i, &val) in qwords.iter().enumerate() {
             // Only show first 8 qwords in verbose mode
             if verbose && i < 8 {
                 let in_module = self.is_in_module(val);
-                let likely_vtable = if in_module { self.is_likely_vtable_verbose(val) } else { false };
+                let likely_vtable = if in_module {
+                    self.is_likely_vtable_verbose(val)
+                } else {
+                    false
+                };
                 eprintln!(
                     "          [+0x{:02X}] 0x{:016X} in_module={} likely_vtable={}",
-                    i * 8, val, in_module, likely_vtable
+                    i * 8,
+                    val,
+                    in_module,
+                    likely_vtable
                 );
             }
 
@@ -325,7 +364,10 @@ impl StubGenerator {
             stats.total += 1;
 
             if verbose {
-                eprintln!("  [{}] RVA 0x{:X} -> heap 0x{:X}", stats.total, rva, target_addr);
+                eprintln!(
+                    "  [{}] RVA 0x{:X} -> heap 0x{:X}",
+                    stats.total, rva, target_addr
+                );
             }
 
             // Track why stubs fail to be created
@@ -363,7 +405,10 @@ impl StubGenerator {
             }
 
             // Try to create the stub
-            if self.create_stub_internal(target_addr, vfptr_offsets).is_some() {
+            if self
+                .create_stub_internal(target_addr, vfptr_offsets)
+                .is_some()
+            {
                 stats.created += 1;
                 if verbose {
                     eprintln!("      OK: stub created");
@@ -379,15 +424,95 @@ impl StubGenerator {
         // Log summary
         eprintln!(
             "Stubs: {} created from {} pointers ({} duplicates, {} non-vtable)",
-            stats.created,
-            stats.total,
-            stats.already_visited,
-            stats.no_vfptr_found
+            stats.created, stats.total, stats.already_visited, stats.no_vfptr_found
         );
+
+        if self.config.recursive_heap_scan_depth > 0 {
+            let discovered = self.discover_recursive_stubs(heap_ptr_locs);
+            if discovered > 0 {
+                eprintln!(
+                    "Stubs: {} recursively discovered from heap data",
+                    discovered
+                );
+            }
+        }
+    }
+
+    /// Recursively scan heap allocations for embedded heap pointers and create stubs for
+    /// any referenced heap objects that expose vfptrs. This finds vtables that are only
+    /// reachable through runtime heap-owned structs/containers.
+    fn discover_recursive_stubs(&mut self, heap_ptr_locs: &[(u32, u64)]) -> usize {
+        let mut queue = VecDeque::new();
+        let mut scanned = HashSet::new();
+        let mut discovered = 0usize;
+
+        for &(_, heap_addr) in heap_ptr_locs {
+            queue.push_back((heap_addr, 0usize));
+        }
+
+        while let Some((addr, depth)) = queue.pop_front() {
+            if depth >= self.config.recursive_heap_scan_depth {
+                continue;
+            }
+            if !scanned.insert(addr) {
+                continue;
+            }
+            if !self.is_valid_heap_ptr(addr) {
+                continue;
+            }
+
+            for child in self.scan_heap_object_for_heap_pointers(addr) {
+                let had_stub = self.stubs.contains_key(&child);
+                if self.create_stub(child).is_some() && !had_stub {
+                    discovered += 1;
+                }
+                if !scanned.contains(&child) {
+                    queue.push_back((child, depth + 1));
+                }
+            }
+        }
+
+        discovered
+    }
+
+    /// Scan a bounded prefix of a heap allocation for qword-aligned heap pointers.
+    fn scan_heap_object_for_heap_pointers(&self, addr: u64) -> Vec<u64> {
+        let max_scan = self.config.max_heap_scan_size.max(8);
+        let mut read_size = max_scan;
+        let mut buf = vec![0u8; read_size];
+
+        while read_size >= 8 {
+            if safe_read_memory(addr as *const u8, &mut buf[..read_size]) {
+                break;
+            }
+            read_size /= 2;
+        }
+
+        if read_size < 8 {
+            return Vec::new();
+        }
+
+        let num_qwords = read_size / 8;
+        let qwords: &[u64] =
+            unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u64, num_qwords) };
+
+        let mut results = Vec::new();
+        let mut seen = HashSet::new();
+        for &val in qwords {
+            if seen.insert(val) && self.is_valid_heap_ptr(val) {
+                results.push(val);
+            }
+        }
+
+        results
     }
 
     /// Internal stub creation with pre-computed vfptr offsets.
-    fn create_stub_internal(&mut self, addr: u64, vfptr_offsets: BTreeSet<usize>) -> Option<&VtableStub> {
+    fn create_stub_internal(
+        &mut self,
+        addr: u64,
+        vfptr_offsets: BTreeSet<usize>,
+    ) -> Option<&VtableStub> {
         // Calculate stub size: large enough to hold all vfptrs
         let max_offset = *vfptr_offsets.iter().max().unwrap_or(&0);
         let stub_size = (max_offset + 8).div_ceil(8) * 8; // Align to 8 bytes
@@ -409,10 +534,7 @@ impl StubGenerator {
                     data[offset..offset + 8].copy_from_slice(&vfptr_buf);
 
                     let vtable_rva = (vtable_ptr - self.mod_base) as u32;
-                    vtable_refs.push(VtableRef {
-                        offset,
-                        vtable_rva,
-                    });
+                    vtable_refs.push(VtableRef { offset, vtable_rva });
                 }
             }
         }
@@ -449,28 +571,92 @@ impl StubGenerator {
     }
 
     /// Build the .heap section data.
-    pub fn build_section_data(&self, total_size: usize, file_alignment: u32) -> Vec<u8> {
-        let aligned_size = (total_size + file_alignment as usize - 1)
-            & !(file_alignment as usize - 1);
+    pub fn build_section_data(
+        &self,
+        total_size: usize,
+        file_alignment: u32,
+        image_base: u64,
+    ) -> Vec<u8> {
+        let aligned_size =
+            (total_size + file_alignment as usize - 1) & !(file_alignment as usize - 1);
         let mut data = vec![0u8; aligned_size];
 
         if self.stubs.is_empty() {
             return data;
         }
 
-        let base_rva = self.stubs.values()
-            .map(|s| s.new_rva)
-            .min()
-            .unwrap_or(0);
+        let base_rva = self.stubs.values().map(|s| s.new_rva).min().unwrap_or(0);
 
         for stub in self.stubs.values() {
             let offset = (stub.new_rva - base_rva) as usize;
             if offset + stub.data.len() <= data.len() {
                 data[offset..offset + stub.data.len()].copy_from_slice(&stub.data);
+                for vtable_ref in &stub.vtable_refs {
+                    let vfptr_offset = offset + vtable_ref.offset;
+                    if vfptr_offset + 8 <= data.len() {
+                        let normalized = image_base + vtable_ref.vtable_rva as u64;
+                        data[vfptr_offset..vfptr_offset + 8]
+                            .copy_from_slice(&normalized.to_le_bytes());
+                    }
+                }
             }
         }
 
         data
+    }
+
+    /// Build flattened vtable facts for every discovered stub/vfptr pair.
+    pub fn vtable_facts(&self, heap_ptr_locs: &[(u32, u64)]) -> Vec<VtableFact> {
+        let mut sources_by_heap: HashMap<u64, Vec<u32>> = HashMap::new();
+        for &(source_rva, heap_addr) in heap_ptr_locs {
+            sources_by_heap
+                .entry(heap_addr)
+                .or_default()
+                .push(source_rva);
+        }
+
+        let mut facts = Vec::new();
+        let mut seen = HashSet::new();
+
+        for stub in self.stubs.values() {
+            let sources = sources_by_heap.get(&stub.original_addr);
+            for vtable_ref in &stub.vtable_refs {
+                if let Some(sources) = sources {
+                    for &source_rva in sources {
+                        let fact = VtableFact {
+                            source_rva: Some(source_rva),
+                            heap_addr: stub.original_addr,
+                            stub_rva: stub.new_rva,
+                            vfptr_offset: vtable_ref.offset as u32,
+                            vtable_rva: vtable_ref.vtable_rva,
+                        };
+                        if seen.insert(fact.clone()) {
+                            facts.push(fact);
+                        }
+                    }
+                } else {
+                    let fact = VtableFact {
+                        source_rva: None,
+                        heap_addr: stub.original_addr,
+                        stub_rva: stub.new_rva,
+                        vfptr_offset: vtable_ref.offset as u32,
+                        vtable_rva: vtable_ref.vtable_rva,
+                    };
+                    if seen.insert(fact.clone()) {
+                        facts.push(fact);
+                    }
+                }
+            }
+        }
+
+        facts.sort_by_key(|f| {
+            (
+                f.source_rva.unwrap_or(u32::MAX),
+                f.heap_addr,
+                f.vfptr_offset,
+            )
+        });
+        facts
     }
 
     /// Get the number of stubs.
@@ -521,10 +707,138 @@ mod tests {
             size: 8,
             data: vec![0; 8],
             new_rva: 0x1000,
-            vtable_refs: vec![VtableRef { offset: 0, vtable_rva: 0x500000 }],
+            vtable_refs: vec![VtableRef {
+                offset: 0,
+                vtable_rva: 0x500000,
+            }],
             vfptr_offsets: [0].into_iter().collect(),
         };
         assert_eq!(stub.size, 8);
         assert_eq!(stub.vtable_refs.len(), 1);
+    }
+
+    #[test]
+    fn test_heap_section_data_normalizes_vtable_ptrs() {
+        let runtime_base = 0x7FFF_0000_0000u64;
+        let image_base = 0x1400_0000u64;
+        let vtable_rva = 0x5000u32;
+        let heap_addr = 0x1000_0000u64;
+
+        let mut generator = StubGenerator {
+            mod_base: runtime_base,
+            mod_end: runtime_base + 0x100000,
+            config: StubConfig::default(),
+            region_cache: MemoryRegionCache::new(),
+            stubs: HashMap::new(),
+            visited: HashSet::new(),
+        };
+
+        generator.stubs.insert(
+            heap_addr,
+            VtableStub {
+                original_addr: heap_addr,
+                size: 8,
+                data: (runtime_base + vtable_rva as u64).to_le_bytes().to_vec(),
+                new_rva: 0x3000,
+                vtable_refs: vec![VtableRef {
+                    offset: 0,
+                    vtable_rva,
+                }],
+                vfptr_offsets: [0].into_iter().collect(),
+            },
+        );
+
+        let data = generator.build_section_data(8, 0x200, image_base);
+        let stored = u64::from_le_bytes(data[0..8].try_into().unwrap());
+        assert_eq!(stored, image_base + vtable_rva as u64);
+    }
+
+    #[test]
+    fn test_vtable_facts_include_secondary_and_heap_only_refs() {
+        let mut generator = StubGenerator {
+            mod_base: 0x1400_0000,
+            mod_end: 0x1410_0000,
+            config: StubConfig::default(),
+            region_cache: MemoryRegionCache::new(),
+            stubs: HashMap::new(),
+            visited: HashSet::new(),
+        };
+
+        generator.stubs.insert(
+            0x1000_0000,
+            VtableStub {
+                original_addr: 0x1000_0000,
+                size: 0x28,
+                data: vec![0; 0x28],
+                new_rva: 0x3000,
+                vtable_refs: vec![
+                    VtableRef {
+                        offset: 0,
+                        vtable_rva: 0x5000,
+                    },
+                    VtableRef {
+                        offset: 0x20,
+                        vtable_rva: 0x7000,
+                    },
+                ],
+                vfptr_offsets: [0, 0x20].into_iter().collect(),
+            },
+        );
+        generator.stubs.insert(
+            0x2000_0000,
+            VtableStub {
+                original_addr: 0x2000_0000,
+                size: 8,
+                data: vec![0; 8],
+                new_rva: 0x4000,
+                vtable_refs: vec![VtableRef {
+                    offset: 0,
+                    vtable_rva: 0x9000,
+                }],
+                vfptr_offsets: [0].into_iter().collect(),
+            },
+        );
+
+        let facts = generator.vtable_facts(&[(0xA000, 0x1000_0000)]);
+        assert!(facts.iter().any(|f| f.source_rva == Some(0xA000)
+            && f.vfptr_offset == 0x20
+            && f.vtable_rva == 0x7000));
+        assert!(facts.iter().any(|f| f.source_rva.is_none()
+            && f.heap_addr == 0x2000_0000
+            && f.vtable_rva == 0x9000));
+    }
+
+    #[test]
+    fn test_recursive_heap_scan_discovers_heap_only_vtable_stub() {
+        let mut module = vec![0u8; 0x1000];
+        let mod_base = module.as_mut_ptr() as u64;
+        let child = Box::new([mod_base + 0x100, 0u64]);
+        let parent = Box::new([child.as_ptr() as u64, 0u64]);
+        let child_addr = child.as_ptr() as u64;
+        let parent_addr = parent.as_ptr() as u64;
+
+        let mut cache = MemoryRegionCache::new();
+        cache.add_test_region(child_addr, 16, true);
+        cache.add_test_region(parent_addr, 16, true);
+
+        let mut generator = StubGenerator {
+            mod_base,
+            mod_end: mod_base + module.len() as u64,
+            config: StubConfig {
+                max_heap_scan_size: 16,
+                recursive_heap_scan_depth: 2,
+                ..Default::default()
+            },
+            region_cache: cache,
+            stubs: HashMap::new(),
+            visited: HashSet::new(),
+        };
+
+        let discovered = generator.discover_recursive_stubs(&[(0xA000, parent_addr)]);
+        assert_eq!(discovered, 1);
+        assert!(generator.get_stub(child_addr).is_some());
+
+        drop(parent);
+        drop(child);
     }
 }

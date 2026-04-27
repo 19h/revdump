@@ -7,31 +7,32 @@
 //! 4. Generate fixups
 //! 5. Build and write the output PE
 
+use crate::devirt::{self, DevirtConfig, DevirtStats};
 use crate::error::{Error, Result};
 use crate::fixup::{apply_fixups, generate_fixups, SectionMapping};
-use crate::stub::{StubConfig, StubGenerator};
 use crate::memory::is_memory_readable;
 use crate::pe::{
-    FileHeader, OptionalHeader32, OptionalHeader64, PeParser, SectionHeader,
-    SectionInfo, HEAP_SECTION_CHARACTERISTICS, PE_SIGNATURE,
+    FileHeader, OptionalHeader32, OptionalHeader64, PeParser, SectionHeader, SectionInfo,
+    HEAP_SECTION_CHARACTERISTICS, PE_SIGNATURE,
 };
 use crate::scanner::{PointerScanner, ScanResult};
-use crate::devirt::{self, DevirtConfig, DevirtStats};
+use crate::stub::{StubConfig, StubGenerator, VtableFact};
 
+use std::fmt::Write as FmtWrite;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
 #[cfg(target_os = "windows")]
-use windows::Win32::System::ProcessStatus::{GetModuleInformation, MODULEINFO};
-#[cfg(target_os = "windows")]
-use windows::Win32::System::Threading::GetCurrentProcess;
+use windows::core::PCSTR;
 #[cfg(target_os = "windows")]
 use windows::Win32::Foundation::HMODULE;
 #[cfg(target_os = "windows")]
 use windows::Win32::System::LibraryLoader::GetModuleHandleA;
 #[cfg(target_os = "windows")]
-use windows::core::PCSTR;
+use windows::Win32::System::ProcessStatus::{GetModuleInformation, MODULEINFO};
+#[cfg(target_os = "windows")]
+use windows::Win32::System::Threading::GetCurrentProcess;
 
 /// Progress stage during dump operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,6 +106,79 @@ impl Default for ProgressInfo {
 /// Progress callback type.
 pub type ProgressCallback = Box<dyn Fn(&ProgressInfo) + Send + Sync>;
 
+/// Build an IDA-friendly metadata section that lists every flattened vtable fact.
+pub fn build_revdmp_metadata(facts: &[VtableFact], image_base: u64) -> Vec<u8> {
+    let mut text = String::new();
+    let _ = writeln!(text, "REVDMP_VTABLE_FACTS v1");
+    let _ = writeln!(
+        text,
+        "source_rva,heap_addr,stub_rva,vfptr_offset,vtable_rva,vtable_va"
+    );
+
+    for fact in facts {
+        let source = fact
+            .source_rva
+            .map(|rva| format!("0x{rva:X}"))
+            .unwrap_or_else(|| "heap".to_string());
+        let _ = writeln!(
+            text,
+            "{},0x{:X},0x{:X},0x{:X},0x{:X},0x{:X}",
+            source,
+            fact.heap_addr,
+            fact.stub_rva,
+            fact.vfptr_offset,
+            fact.vtable_rva,
+            image_base + fact.vtable_rva as u64,
+        );
+    }
+
+    text.into_bytes()
+}
+
+/// Build a COFF string table for output. If the original table is unavailable in
+/// the loaded image, synthesize entries for `/N` long section-name references so
+/// PE tooling does not reject the dump as having an empty string table.
+fn build_output_coff_string_table(pe: &PeParser) -> Vec<u8> {
+    if !pe.coff_symbol_table_raw.is_empty() {
+        return pe.coff_symbol_table_raw.clone();
+    }
+
+    let slash_names: Vec<(usize, usize)> = pe
+        .sections
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, section)| {
+            section
+                .name
+                .strip_prefix('/')
+                .and_then(|offset| offset.parse::<usize>().ok())
+                .filter(|&offset| offset >= 4)
+                .map(|offset| (idx + 1, offset))
+        })
+        .collect();
+
+    if slash_names.is_empty() {
+        return Vec::new();
+    }
+
+    let mut table = vec![0u8; 4];
+    for (idx, offset) in slash_names {
+        if table.len() < offset {
+            table.resize(offset, 0);
+        }
+        let name = format!(".sec{idx:02}\0");
+        let bytes = name.as_bytes();
+        if table.len() < offset + bytes.len() {
+            table.resize(offset + bytes.len(), 0);
+        }
+        table[offset..offset + bytes.len()].copy_from_slice(bytes);
+    }
+
+    let size = table.len() as u32;
+    table[0..4].copy_from_slice(&size.to_le_bytes());
+    table
+}
+
 /// Configuration for the dump operation.
 pub struct DumpConfig {
     /// Minimum valid pointer value.
@@ -121,6 +195,10 @@ pub struct DumpConfig {
     pub enable_devirt: bool,
     /// Devirtualization configuration.
     pub devirt_config: DevirtConfig,
+    /// Maximum bytes to scan in each heap allocation for embedded heap pointers.
+    pub max_heap_scan_size: usize,
+    /// Maximum recursive heap-pointer scan depth.
+    pub recursive_heap_scan_depth: usize,
 }
 
 impl std::fmt::Debug for DumpConfig {
@@ -133,6 +211,8 @@ impl std::fmt::Debug for DumpConfig {
             .field("progress_callback", &self.progress_callback.is_some())
             .field("enable_devirt", &self.enable_devirt)
             .field("devirt_config", &self.devirt_config)
+            .field("max_heap_scan_size", &self.max_heap_scan_size)
+            .field("recursive_heap_scan_depth", &self.recursive_heap_scan_depth)
             .finish()
     }
 }
@@ -147,6 +227,8 @@ impl Default for DumpConfig {
             progress_callback: None,
             enable_devirt: false,
             devirt_config: DevirtConfig::default(),
+            max_heap_scan_size: 0x1000,
+            recursive_heap_scan_depth: 2,
         }
     }
 }
@@ -166,6 +248,8 @@ impl DumpConfig {
             min_ptr_value: self.min_ptr_value,
             max_ptr_value: self.max_ptr_value,
             max_vfptr_probe: self.max_vfptr_probe,
+            max_heap_scan_size: self.max_heap_scan_size,
+            recursive_heap_scan_depth: self.recursive_heap_scan_depth,
         }
     }
 }
@@ -260,14 +344,11 @@ impl Dumper {
         // Create stub generator
         progress.stage = ProgressStage::BuildingCache;
         report(&progress);
-        let mut stub_generator = StubGenerator::new(
-            self.base,
-            self.size,
-            config.to_stub_config(),
-        )?;
+        let mut stub_generator = StubGenerator::new(self.base, self.size, config.to_stub_config())?;
 
         // Scan sections for heap pointers
-        let heap_ptr_locs = self.scan_sections(pe, config, &stub_generator, &mut progress, &report)?;
+        let heap_ptr_locs =
+            self.scan_sections(pe, config, &stub_generator, &mut progress, &report)?;
 
         if heap_ptr_locs.is_empty() {
             // No heap pointers found, do standard dump
@@ -293,6 +374,12 @@ impl Dumper {
 
         let heap_section_va = pe.next_section_va();
         let heap_section_size = stub_generator.assign_rvas(heap_section_va);
+        let vtable_facts = stub_generator.vtable_facts(&heap_ptr_locs);
+        let metadata_data = build_revdmp_metadata(&vtable_facts, pe.image_base);
+        let metadata_section_va = PeParser::align_up(
+            heap_section_va as usize + heap_section_size,
+            pe.section_alignment as usize,
+        ) as u32;
 
         // Build output PE
         progress.stage = ProgressStage::BuildingOutput;
@@ -304,6 +391,8 @@ impl Dumper {
             &heap_ptr_locs,
             heap_section_va,
             heap_section_size,
+            metadata_section_va,
+            &metadata_data,
         )?;
 
         // Devirtualize vcalls if enabled
@@ -311,14 +400,8 @@ impl Dumper {
             progress.stage = ProgressStage::Devirtualizing;
             report(&progress);
 
-            let devirt_stats = self.apply_devirt(
-                &mut output,
-                pe,
-                &stub_generator,
-                &heap_ptr_locs,
-                &section_mappings,
-                config,
-            )?;
+            let devirt_stats =
+                self.apply_devirt(&mut output, pe, &vtable_facts, &section_mappings, config)?;
 
             eprintln!(
                 "Devirt: {} vcalls found, {} resolved, {} patched",
@@ -435,9 +518,11 @@ impl Dumper {
         heap_ptr_locs: &[ScanResult],
         heap_section_va: u32,
         heap_section_size: usize,
+        metadata_section_va: u32,
+        metadata_data: &[u8],
     ) -> Result<(Vec<u8>, Vec<SectionMapping>)> {
         // Calculate sizes
-        let num_sections = pe.sections.len() + 1; // +1 for .heap
+        let num_sections = pe.sections.len() + 2; // +.heap and .revdmp
         let headers_size = pe.pe_offset as usize
             + 4  // PE signature
             + std::mem::size_of::<FileHeader>()
@@ -472,10 +557,24 @@ impl Dumper {
         }
 
         // Build heap section data (minimal stubs)
-        let heap_data = stub_generator.build_section_data(heap_section_size, pe.file_alignment);
+        let heap_data =
+            stub_generator.build_section_data(heap_section_size, pe.file_alignment, pe.image_base);
         let heap_raw_size = PeParser::align_up(heap_data.len(), pe.file_alignment as usize);
         let heap_raw_offset = current_raw_offset as u32;
         current_raw_offset += heap_raw_size;
+
+        // Build metadata section data for IDA/Ghidra sidecar consumers.
+        let metadata_raw_size = PeParser::align_up(metadata_data.len(), pe.file_alignment as usize);
+        let metadata_raw_offset = current_raw_offset as u32;
+        current_raw_offset += metadata_raw_size;
+
+        let coff_symbol_table_raw = build_output_coff_string_table(pe);
+        let coff_symbol_table_offset = if coff_symbol_table_raw.is_empty() {
+            0
+        } else {
+            current_raw_offset as u32
+        };
+        current_raw_offset += coff_symbol_table_raw.len();
 
         // Calculate total output size
         let total_size = current_raw_offset;
@@ -485,11 +584,7 @@ impl Dumper {
         // This preserves all metadata up to the PE signature
         let dos_area_size = pe.pe_offset as usize;
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                self.base,
-                output.as_mut_ptr(),
-                dos_area_size,
-            );
+            std::ptr::copy_nonoverlapping(self.base, output.as_mut_ptr(), dos_area_size);
         }
 
         // Write PE signature
@@ -502,8 +597,12 @@ impl Dumper {
             machine: pe.machine,
             number_of_sections: num_sections as u16,
             time_date_stamp: pe.time_date_stamp,
-            pointer_to_symbol_table: 0,
-            number_of_symbols: 0,
+            pointer_to_symbol_table: coff_symbol_table_offset,
+            number_of_symbols: if coff_symbol_table_raw.is_empty() {
+                0
+            } else {
+                pe.number_of_symbols
+            },
             size_of_optional_header: pe.size_of_optional_header,
             characteristics: pe.characteristics,
         };
@@ -518,12 +617,11 @@ impl Dumper {
 
         // Write optional header (copy original and update sizes)
         let new_size_of_image = PeParser::align_up(
-            (heap_section_va + heap_section_size as u32) as usize,
+            (metadata_section_va + metadata_data.len() as u32) as usize,
             pe.section_alignment as usize,
         ) as u32;
 
-        output[pos..pos + pe.optional_header_raw.len()]
-            .copy_from_slice(&pe.optional_header_raw);
+        output[pos..pos + pe.optional_header_raw.len()].copy_from_slice(&pe.optional_header_raw);
 
         // Update SizeOfImage and SizeOfHeaders in optional header
         if pe.is_64bit {
@@ -587,13 +685,34 @@ impl Dumper {
                 std::mem::size_of::<SectionHeader>(),
             );
         }
+        pos += std::mem::size_of::<SectionHeader>();
+
+        // Write .revdmp metadata section header
+        let metadata_header = SectionHeader {
+            name: *b".revdmp\0",
+            virtual_size: metadata_data.len() as u32,
+            virtual_address: metadata_section_va,
+            size_of_raw_data: metadata_raw_size as u32,
+            pointer_to_raw_data: metadata_raw_offset,
+            pointer_to_relocations: 0,
+            pointer_to_linenumbers: 0,
+            number_of_relocations: 0,
+            number_of_linenumbers: 0,
+            characteristics: HEAP_SECTION_CHARACTERISTICS,
+        };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                &metadata_header as *const _ as *const u8,
+                output.as_mut_ptr().add(pos),
+                std::mem::size_of::<SectionHeader>(),
+            );
+        }
 
         // Write section data
         for (i, section) in sections_info.iter().enumerate() {
             if section.new_pointer_to_raw_data > 0 && !section_data[i].is_empty() {
                 let offset = section.new_pointer_to_raw_data as usize;
-                output[offset..offset + section_data[i].len()]
-                    .copy_from_slice(&section_data[i]);
+                output[offset..offset + section_data[i].len()].copy_from_slice(&section_data[i]);
             }
         }
 
@@ -603,6 +722,20 @@ impl Dumper {
             let mut padded_heap = heap_data;
             padded_heap.resize(heap_raw_size, 0);
             output[offset..offset + padded_heap.len()].copy_from_slice(&padded_heap);
+        }
+
+        // Write metadata section data.
+        {
+            let offset = metadata_raw_offset as usize;
+            let mut padded_metadata = metadata_data.to_vec();
+            padded_metadata.resize(metadata_raw_size, 0);
+            output[offset..offset + padded_metadata.len()].copy_from_slice(&padded_metadata);
+        }
+
+        if !coff_symbol_table_raw.is_empty() {
+            let offset = coff_symbol_table_offset as usize;
+            output[offset..offset + coff_symbol_table_raw.len()]
+                .copy_from_slice(&coff_symbol_table_raw);
         }
 
         // Generate and apply fixups
@@ -650,11 +783,7 @@ impl Dumper {
         // Try to read the entire section at once first
         if is_memory_readable(sec_addr, size) {
             unsafe {
-                std::ptr::copy_nonoverlapping(
-                    sec_addr,
-                    result.as_mut_ptr(),
-                    size,
-                );
+                std::ptr::copy_nonoverlapping(sec_addr, result.as_mut_ptr(), size);
             }
         } else {
             // Fallback: read page by page
@@ -666,11 +795,7 @@ impl Dumper {
 
                 if is_memory_readable(src, read_size) {
                     unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            src,
-                            result.as_mut_ptr().add(off),
-                            read_size,
-                        );
+                        std::ptr::copy_nonoverlapping(src, result.as_mut_ptr().add(off), read_size);
                     }
                 }
                 off += PAGE_SIZE;
@@ -685,18 +810,21 @@ impl Dumper {
         &self,
         output: &mut [u8],
         pe: &PeParser,
-        stub_generator: &StubGenerator,
-        heap_ptr_locs: &[ScanResult],
+        vtable_facts: &[VtableFact],
         section_mappings: &[SectionMapping],
         config: &DumpConfig,
     ) -> Result<DevirtStats> {
         // Find .text section (or first code section)
-        let text_section = pe.sections.iter()
+        let text_section = pe
+            .sections
+            .iter()
             .find(|s| s.name == ".text" || (s.characteristics & 0x20) != 0) // IMAGE_SCN_CNT_CODE
-            .ok_or_else(|| Error::SectionNotFound { name: ".text".to_string() })?;
+            .ok_or_else(|| Error::SectionNotFound {
+                name: ".text".to_string(),
+            })?;
 
         // Calculate headers size for protection
-        let num_sections = pe.sections.len() + 1; // +1 for .heap
+        let num_sections = pe.sections.len() + 2; // +.heap and .revdmp
         let headers_size = pe.pe_offset as usize
             + 4  // PE signature
             + std::mem::size_of::<FileHeader>()
@@ -711,8 +839,7 @@ impl Dumper {
             pe.image_base,
             text_section.virtual_address,
             text_section.virtual_size,
-            heap_ptr_locs,
-            stub_generator,
+            vtable_facts,
             &section_mappings,
             aligned_headers,
             &config.devirt_config,
@@ -762,17 +889,21 @@ impl Dumper {
             }
         }
 
+        let coff_symbol_table_raw = build_output_coff_string_table(pe);
+        let coff_symbol_table_offset = if coff_symbol_table_raw.is_empty() {
+            0
+        } else {
+            current_raw_offset as u32
+        };
+        current_raw_offset += coff_symbol_table_raw.len();
+
         let total_size = current_raw_offset;
         let mut output = vec![0u8; total_size];
 
         // Copy entire original DOS header area (includes DOS header, stub, and Rich header)
         let dos_area_size = pe.pe_offset as usize;
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                self.base,
-                output.as_mut_ptr(),
-                dos_area_size,
-            );
+            std::ptr::copy_nonoverlapping(self.base, output.as_mut_ptr(), dos_area_size);
         }
 
         // PE signature
@@ -785,8 +916,12 @@ impl Dumper {
             machine: pe.machine,
             number_of_sections: pe.sections.len() as u16,
             time_date_stamp: pe.time_date_stamp,
-            pointer_to_symbol_table: 0,
-            number_of_symbols: 0,
+            pointer_to_symbol_table: coff_symbol_table_offset,
+            number_of_symbols: if coff_symbol_table_raw.is_empty() {
+                0
+            } else {
+                pe.number_of_symbols
+            },
             size_of_optional_header: pe.size_of_optional_header,
             characteristics: pe.characteristics,
         };
@@ -800,8 +935,7 @@ impl Dumper {
         pos += std::mem::size_of::<FileHeader>();
 
         // Optional header
-        output[pos..pos + pe.optional_header_raw.len()]
-            .copy_from_slice(&pe.optional_header_raw);
+        output[pos..pos + pe.optional_header_raw.len()].copy_from_slice(&pe.optional_header_raw);
         pos += pe.size_of_optional_header as usize;
 
         // Section headers
@@ -838,9 +972,14 @@ impl Dumper {
         for (i, section) in sections_info.iter().enumerate() {
             if section.new_pointer_to_raw_data > 0 && !section_data[i].is_empty() {
                 let offset = section.new_pointer_to_raw_data as usize;
-                output[offset..offset + section_data[i].len()]
-                    .copy_from_slice(&section_data[i]);
+                output[offset..offset + section_data[i].len()].copy_from_slice(&section_data[i]);
             }
+        }
+
+        if !coff_symbol_table_raw.is_empty() {
+            let offset = coff_symbol_table_offset as usize;
+            output[offset..offset + coff_symbol_table_raw.len()]
+                .copy_from_slice(&coff_symbol_table_raw);
         }
 
         self.write_output(output_path, &output)
@@ -848,8 +987,8 @@ impl Dumper {
 
     /// Write output to file.
     fn write_output<P: AsRef<Path>>(&self, path: P, data: &[u8]) -> Result<()> {
-        let mut file = File::create(path.as_ref())
-            .map_err(|e| Error::OutputCreationFailed(e.to_string()))?;
+        let mut file =
+            File::create(path.as_ref()).map_err(|e| Error::OutputCreationFailed(e.to_string()))?;
 
         file.write_all(data)
             .map_err(|e| Error::OutputWriteFailed(e.to_string()))?;
@@ -888,6 +1027,82 @@ mod tests {
     fn test_dump_config_skip_code() {
         let config = DumpConfig::skip_code();
         assert_eq!(config.skip_sections, vec![0]);
+    }
+
+    #[test]
+    fn test_revdmp_metadata_lists_heap_only_and_sourced_facts() {
+        let facts = vec![
+            VtableFact {
+                source_rva: Some(0x2000),
+                heap_addr: 0x1000_0000,
+                stub_rva: 0x8000,
+                vfptr_offset: 0x20,
+                vtable_rva: 0x5000,
+            },
+            VtableFact {
+                source_rva: None,
+                heap_addr: 0x2000_0000,
+                stub_rva: 0x9000,
+                vfptr_offset: 0,
+                vtable_rva: 0x7000,
+            },
+        ];
+
+        let metadata = build_revdmp_metadata(&facts, 0x1400_0000);
+        let text = String::from_utf8(metadata).unwrap();
+        assert!(text.contains("REVDMP_VTABLE_FACTS v1"));
+        assert!(text.contains("0x2000,0x10000000,0x8000,0x20,0x5000,0x14005000"));
+        assert!(text.contains("heap,0x20000000,0x9000,0x0,0x7000,0x14007000"));
+    }
+
+    #[test]
+    fn test_synthesizes_coff_string_table_for_slash_section_names() {
+        let pe = PeParser {
+            base: std::ptr::null(),
+            size: 0,
+            pe_offset: 0,
+            machine: 0x8664,
+            number_of_sections: 2,
+            time_date_stamp: 0,
+            pointer_to_symbol_table: 0,
+            number_of_symbols: 0,
+            size_of_optional_header: 0,
+            characteristics: 0,
+            image_base: 0x1400_0000,
+            section_alignment: 0x1000,
+            file_alignment: 0x200,
+            size_of_image: 0,
+            size_of_headers: 0,
+            is_64bit: true,
+            optional_header_raw: Vec::new(),
+            coff_symbol_table_raw: Vec::new(),
+            sections: vec![
+                SectionInfo {
+                    name: "/4".to_string(),
+                    virtual_size: 0,
+                    virtual_address: 0,
+                    size_of_raw_data: 0,
+                    pointer_to_raw_data: 0,
+                    characteristics: 0,
+                    new_pointer_to_raw_data: 0,
+                    new_size_of_raw_data: 0,
+                },
+                SectionInfo {
+                    name: ".heap".to_string(),
+                    virtual_size: 0,
+                    virtual_address: 0,
+                    size_of_raw_data: 0,
+                    pointer_to_raw_data: 0,
+                    characteristics: 0,
+                    new_pointer_to_raw_data: 0,
+                    new_size_of_raw_data: 0,
+                },
+            ],
+        };
+
+        let table = build_output_coff_string_table(&pe);
+        assert_eq!(u32::from_le_bytes(table[0..4].try_into().unwrap()) as usize, table.len());
+        assert!(table[4..].starts_with(b".sec01\0"));
     }
 
     #[test]

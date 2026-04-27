@@ -13,11 +13,13 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 #[cfg(target_os = "windows")]
+use windows::core::PCSTR;
+#[cfg(target_os = "windows")]
 use windows::Win32::Foundation::HMODULE;
 #[cfg(target_os = "windows")]
 use windows::Win32::System::Console::{
-    AllocConsole, FreeConsole, GetConsoleMode, SetConsoleMode, SetConsoleTitleA,
-    CONSOLE_MODE, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+    AllocConsole, FreeConsole, GetConsoleMode, SetConsoleMode, SetConsoleTitleA, CONSOLE_MODE,
+    ENABLE_VIRTUAL_TERMINAL_PROCESSING,
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::System::LibraryLoader::GetModuleHandleA;
@@ -27,8 +29,6 @@ use windows::Win32::System::ProcessStatus::{
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::System::Threading::GetCurrentProcess;
-#[cfg(target_os = "windows")]
-use windows::core::PCSTR;
 
 #[cfg(target_os = "windows")]
 use crate::dumper::{DumpConfig, Dumper, ProgressInfo, ProgressStage};
@@ -61,13 +61,11 @@ impl Console {
     /// Create a new console instance.
     pub fn new() -> Self {
         // Get temp path for default output
-        let output_path = std::env::temp_dir()
-            .to_string_lossy()
-            .to_string();
+        let output_path = std::env::temp_dir().to_string_lossy().to_string();
 
         // Get main module name as default target
-        let target_module = Self::get_main_module_name()
-            .unwrap_or_else(|| "unknown.exe".to_string());
+        let target_module =
+            Self::get_main_module_name().unwrap_or_else(|| "unknown.exe".to_string());
 
         Self {
             thread: None,
@@ -105,10 +103,7 @@ impl Console {
                     .to_string_lossy();
 
                 // Extract just the filename
-                name_str
-                    .rsplit('\\')
-                    .next()
-                    .map(|s| s.to_string())
+                name_str.rsplit('\\').next().map(|s| s.to_string())
             } else {
                 None
             }
@@ -130,12 +125,12 @@ impl Console {
 
             // Reopen stdio to the new console
             // This is critical for DLL injection where stdio isn't automatically connected
-            use windows::Win32::System::Console::{
-                GetStdHandle, SetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE,
-            };
             use windows::Win32::Storage::FileSystem::{
                 CreateFileA, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
                 FILE_SHARE_WRITE, OPEN_EXISTING,
+            };
+            use windows::Win32::System::Console::{
+                GetStdHandle, SetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
             };
 
             // Open CONIN$ and CONOUT$ explicitly
@@ -355,8 +350,14 @@ impl ConsoleState {
             self.max_region_size,
             self.max_region_size / 1024
         );
-        println!("  Skip Code:        {}", if self.skip_code { "Yes" } else { "No" });
-        println!("  Devirtualize:     {}", if self.devirt { "Yes" } else { "No" });
+        println!(
+            "  Skip Code:        {}",
+            if self.skip_code { "Yes" } else { "No" }
+        );
+        println!(
+            "  Devirtualize:     {}",
+            if self.devirt { "Yes" } else { "No" }
+        );
 
         if !self.skip_sections.is_empty() {
             let sections: Vec<String> = self.skip_sections.iter().map(|s| s.to_string()).collect();
@@ -435,9 +436,7 @@ impl ConsoleState {
             if !new_module.is_empty() {
                 // Verify module exists
                 let name_cstr = std::ffi::CString::new(new_module).unwrap();
-                let result = unsafe {
-                    GetModuleHandleA(PCSTR(name_cstr.as_ptr() as *const u8))
-                };
+                let result = unsafe { GetModuleHandleA(PCSTR(name_cstr.as_ptr() as *const u8)) };
 
                 match result {
                     Ok(h) if !h.is_invalid() => {
@@ -628,17 +627,15 @@ impl ConsoleState {
         println!();
 
         match Dumper::from_module_name(&self.target_module) {
-            Ok(mut dumper) => {
-                match dumper.standard_dump(&out_file, &DumpConfig::default()) {
-                    Ok(()) => {
-                        println!();
-                        println!("[OK] Dump complete: {}", out_file);
-                    }
-                    Err(e) => {
-                        println!("[ERROR] Dump failed: {}", e);
-                    }
+            Ok(mut dumper) => match dumper.standard_dump(&out_file, &DumpConfig::default()) {
+                Ok(()) => {
+                    println!();
+                    println!("[OK] Dump complete: {}", out_file);
                 }
-            }
+                Err(e) => {
+                    println!("[ERROR] Dump failed: {}", e);
+                }
+            },
             Err(e) => {
                 println!("[ERROR] Failed to open module: {}", e);
             }
@@ -669,6 +666,8 @@ impl ConsoleState {
 
         let config = DumpConfig {
             max_vfptr_probe: self.max_depth * 8, // Convert depth to probe size
+            max_heap_scan_size: self.max_region_size,
+            recursive_heap_scan_depth: self.max_depth,
             skip_sections,
             enable_devirt: self.devirt,
             progress_callback: Some(Box::new(|info: &ProgressInfo| {
@@ -705,8 +704,8 @@ impl ConsoleState {
     }
 
     fn cmd_debug_heap_analysis(&mut self) {
-        use crate::stub::{StubConfig, StubGenerator};
         use crate::pe::PeParser;
+        use crate::stub::{StubConfig, StubGenerator};
 
         println!();
         println!("=== Debug Heap Analysis ===");
@@ -750,7 +749,10 @@ impl ConsoleState {
                         .map(|s| s.to_string_lossy().to_string())
                         .unwrap_or_default();
 
-                    if name_str.to_lowercase().contains(&self.target_module.to_lowercase()) {
+                    if name_str
+                        .to_lowercase()
+                        .contains(&self.target_module.to_lowercase())
+                    {
                         found = Some((info.lpBaseOfDll as *const u8, info.SizeOfImage as usize));
                         break;
                     }
@@ -786,6 +788,8 @@ impl ConsoleState {
             min_ptr_value: 0x10000,
             max_ptr_value: 0x7FFF_FFFF_FFFF,
             max_vfptr_probe: self.max_depth * 8,
+            max_heap_scan_size: self.max_region_size,
+            recursive_heap_scan_depth: self.max_depth,
         };
 
         let mut stub_gen = match StubGenerator::new(base, size, stub_config) {
@@ -815,7 +819,7 @@ impl ConsoleState {
 
             // Simple scan for pointers
             for offset in (0..sec_data.len().saturating_sub(8)).step_by(8) {
-                let ptr = u64::from_le_bytes(sec_data[offset..offset+8].try_into().unwrap());
+                let ptr = u64::from_le_bytes(sec_data[offset..offset + 8].try_into().unwrap());
 
                 if ptr >= scanner_config.min_ptr
                     && ptr <= scanner_config.max_ptr
@@ -907,14 +911,15 @@ fn print_progress(info: &ProgressInfo) {
             )
         }
         ProgressStage::CreatingStubs => {
-            format!("{}/{} | {} stubs", info.current, info.total, info.stubs_created)
+            format!(
+                "{}/{} | {} stubs",
+                info.current, info.total, info.stubs_created
+            )
         }
         ProgressStage::ApplyingFixups => {
             format!("{}/{} fixups", info.current, info.total)
         }
-        ProgressStage::Devirtualizing => {
-            "scanning vcalls...".to_string()
-        }
+        ProgressStage::Devirtualizing => "scanning vcalls...".to_string(),
         _ => {
             if info.total > 0 {
                 format!("{}/{}", info.current, info.total)
