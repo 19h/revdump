@@ -53,6 +53,34 @@ enum Commands {
         /// Enable vcall devirtualization (rewrite indirect calls to direct calls)
         #[arg(long)]
         devirt: bool,
+
+        /// Disable IDAPython sidecar generation
+        #[arg(long)]
+        no_ida_script: bool,
+
+        /// Disable embedded .revdmp metadata section
+        #[arg(long)]
+        no_revdmp: bool,
+
+        /// Disable RTTI parsing for type names
+        #[arg(long)]
+        no_rtti: bool,
+
+        /// Maximum heap graph edges to emit after scoring
+        #[arg(long, default_value = "50000")]
+        max_graph_edges: usize,
+
+        /// Minimum graph edge confidence: low, medium, high
+        #[arg(long, default_value = "low")]
+        min_edge_confidence: String,
+
+        /// Disable conservative container detection
+        #[arg(long)]
+        no_containers: bool,
+
+        /// Enable stronger bounded devirtualization patterns
+        #[arg(long)]
+        strong_devirt: bool,
     },
 
     /// Dump a module without heap snapshot (standard dump)
@@ -91,6 +119,13 @@ fn main() -> anyhow::Result<()> {
             skip_code,
             skip_sections,
             devirt,
+            no_ida_script,
+            no_revdmp,
+            no_rtti,
+            max_graph_edges,
+            min_edge_confidence,
+            no_containers,
+            strong_devirt,
         } => {
             dump_with_heap(
                 &module,
@@ -100,6 +135,13 @@ fn main() -> anyhow::Result<()> {
                 skip_code,
                 skip_sections,
                 devirt,
+                no_ida_script,
+                no_revdmp,
+                no_rtti,
+                max_graph_edges,
+                &min_edge_confidence,
+                no_containers,
+                strong_devirt,
             )?;
         }
 
@@ -124,6 +166,13 @@ fn dump_with_heap(
     skip_code: bool,
     mut skip_sections: Vec<usize>,
     devirt: bool,
+    no_ida_script: bool,
+    no_revdmp: bool,
+    no_rtti: bool,
+    max_graph_edges: usize,
+    min_edge_confidence: &str,
+    no_containers: bool,
+    strong_devirt: bool,
 ) -> anyhow::Result<()> {
     use bytesize::ByteSize;
 
@@ -152,6 +201,13 @@ fn dump_with_heap(
         recursive_heap_scan_depth: max_depth,
         skip_sections,
         enable_devirt: devirt,
+        emit_ida_script: !no_ida_script,
+        emit_revdmp: !no_revdmp,
+        parse_rtti: !no_rtti,
+        max_graph_edges,
+        min_edge_confidence: parse_edge_confidence(min_edge_confidence)?,
+        detect_containers: !no_containers,
+        strong_devirt,
         progress_callback: Some(Box::new(move |info: &ProgressInfo| {
             let pct = if info.total > 0 {
                 (info.current as f64 / info.total as f64 * 100.0) as u64
@@ -189,6 +245,9 @@ fn dump_with_heap(
     if devirt {
         println!("Devirtualization: enabled");
     }
+    if strong_devirt {
+        println!("Strong devirtualization analysis: enabled");
+    }
 
     dumper.dump_with_heap(output, &config)?;
 
@@ -196,6 +255,16 @@ fn dump_with_heap(
     println!("\nDump complete: {}", output.display());
 
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn parse_edge_confidence(value: &str) -> anyhow::Result<revdump::stub::EdgeConfidence> {
+    match value.to_ascii_lowercase().as_str() {
+        "low" => Ok(revdump::stub::EdgeConfidence::Low),
+        "medium" | "med" => Ok(revdump::stub::EdgeConfidence::Medium),
+        "high" => Ok(revdump::stub::EdgeConfidence::High),
+        other => anyhow::bail!("invalid min edge confidence: {other}"),
+    }
 }
 
 #[cfg(target_os = "windows")]

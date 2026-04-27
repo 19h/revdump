@@ -19,7 +19,7 @@
 use crate::error::Result;
 use crate::fixup::SectionMapping;
 use crate::memory::safe_read_memory;
-use crate::stub::VtableFact;
+use crate::stub::{HeapPointerEdge, VtableFact};
 
 use iced_x86::{code_asm::*, Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
 use std::collections::HashMap;
@@ -96,6 +96,10 @@ pub struct DevirtStats {
     pub patches_skipped: usize,
     /// Thunks created for indirect patching.
     pub thunks_created: usize,
+    /// Strong-analysis object-field loads tracked.
+    pub strong_field_loads: usize,
+    /// Strong-analysis stack spill/reload aliases tracked.
+    pub strong_stack_aliases: usize,
 }
 
 /// A thunk placed in code padding for vcall redirection.
@@ -317,6 +321,8 @@ pub struct DevirtConfig {
     pub dry_run: bool,
     /// Maximum instructions to scan in a basic block before reset.
     pub max_block_instructions: usize,
+    /// Enable bounded tracking through object fields and simple stack aliases.
+    pub strong_analysis: bool,
 }
 
 impl Default for DevirtConfig {
@@ -324,6 +330,7 @@ impl Default for DevirtConfig {
         Self {
             dry_run: false,
             max_block_instructions: 256,
+            strong_analysis: false,
         }
     }
 }
@@ -342,6 +349,13 @@ pub enum RegisterValue {
     GlobalPtr {
         /// RVA of the global that was loaded.
         global_rva: u32,
+    },
+    /// Holds an object pointer loaded from a field of a global-owned object.
+    ObjectFieldPtr {
+        /// RVA of the original global pointer.
+        global_rva: u32,
+        /// Offset in the global-owned heap object where this pointer was loaded.
+        field_offset: u32,
     },
     /// Holds a vtable pointer (first qword dereferenced from instance).
     VtablePtr {
@@ -397,6 +411,8 @@ pub enum RegisterValue {
 pub struct RegisterState {
     /// State for each general-purpose register (indexed by iced_x86 register number).
     values: HashMap<Register, RegisterValue>,
+    /// Simple stack aliases keyed by (base register, displacement).
+    stack_values: HashMap<(Register, i64), RegisterValue>,
 }
 
 impl Default for RegisterState {
@@ -409,12 +425,14 @@ impl RegisterState {
     pub fn new() -> Self {
         Self {
             values: HashMap::with_capacity(16),
+            stack_values: HashMap::with_capacity(16),
         }
     }
 
     /// Reset all register state (at basic block boundaries).
     pub fn reset(&mut self) {
         self.values.clear();
+        self.stack_values.clear();
     }
 
     /// Get the value held by a register.
@@ -435,6 +453,14 @@ impl RegisterState {
     pub fn clobber(&mut self, reg: Register) {
         let reg64 = to_64bit_reg(reg);
         self.values.remove(&reg64);
+    }
+
+    pub fn set_stack(&mut self, base: Register, disp: i64, value: RegisterValue) {
+        self.stack_values.insert((to_64bit_reg(base), disp), value);
+    }
+
+    pub fn get_stack(&self, base: Register, disp: i64) -> Option<RegisterValue> {
+        self.stack_values.get(&(to_64bit_reg(base), disp)).cloned()
     }
 }
 
@@ -523,6 +549,8 @@ pub struct GlobalVtableMap {
     map: HashMap<(u32, u32), VtableInfo>,
     /// Fast test for whether a global has any vtable facts.
     globals: HashMap<u32, usize>,
+    /// (global_rva, object_field_offset, vfptr_offset) -> VtableInfo.
+    field_map: HashMap<(u32, u32, u32), VtableInfo>,
 }
 
 /// Information about a vtable accessible via a global.
@@ -540,9 +568,14 @@ struct VtableInfo {
 
 impl GlobalVtableMap {
     /// Build the map from flattened vtable facts.
-    pub fn build(vtable_facts: &[VtableFact], _image_base: u64) -> Self {
+    pub fn build(
+        vtable_facts: &[VtableFact],
+        heap_edges: &[HeapPointerEdge],
+        _image_base: u64,
+    ) -> Self {
         let mut map = HashMap::with_capacity(vtable_facts.len());
         let mut globals = HashMap::new();
+        let mut field_map = HashMap::new();
 
         for fact in vtable_facts {
             let Some(global_rva) = fact.source_rva else {
@@ -560,7 +593,33 @@ impl GlobalVtableMap {
             *globals.entry(global_rva).or_insert(0) += 1;
         }
 
-        Self { map, globals }
+        for source_fact in vtable_facts.iter().filter(|fact| fact.source_rva.is_some()) {
+            let global_rva = source_fact.source_rva.unwrap();
+            for edge in heap_edges
+                .iter()
+                .filter(|edge| edge.source_heap_addr == source_fact.heap_addr)
+            {
+                for target_fact in vtable_facts
+                    .iter()
+                    .filter(|fact| fact.heap_addr == edge.target_heap_addr)
+                {
+                    field_map.insert(
+                        (global_rva, edge.field_offset, target_fact.vfptr_offset),
+                        VtableInfo {
+                            heap_addr: target_fact.heap_addr,
+                            vtable_rva: target_fact.vtable_rva,
+                            vfptr_offset: target_fact.vfptr_offset,
+                        },
+                    );
+                }
+            }
+        }
+
+        Self {
+            map,
+            globals,
+            field_map,
+        }
     }
 
     /// Check if a global RVA has any vtable facts.
@@ -571,6 +630,16 @@ impl GlobalVtableMap {
     /// Look up the final vtable for a global and vfptr offset.
     fn lookup(&self, global_rva: u32, vfptr_offset: u32) -> Option<&VtableInfo> {
         self.map.get(&(global_rva, vfptr_offset))
+    }
+
+    fn lookup_field(
+        &self,
+        global_rva: u32,
+        field_offset: u32,
+        vfptr_offset: u32,
+    ) -> Option<&VtableInfo> {
+        self.field_map
+            .get(&(global_rva, field_offset, vfptr_offset))
     }
 
     /// Resolve a vcall: given a final vtable and slot offset, return the function RVA.
@@ -704,6 +773,31 @@ impl<'a> VcallScanner<'a> {
                     reg_state.set(dest, RegisterValue::GlobalPtr { global_rva });
                 }
                 continue;
+            }
+
+            if self.config.strong_analysis {
+                if self.track_stack_store(&instr, &mut reg_state) {
+                    stats.strong_stack_aliases += 1;
+                    continue;
+                }
+                if let Some((dest, value)) = self.check_stack_load(&instr, &reg_state) {
+                    reg_state.set(dest, value);
+                    stats.strong_stack_aliases += 1;
+                    continue;
+                }
+                if let Some((dest, global_rva, field_offset)) =
+                    self.check_object_field_load(&instr, &reg_state)
+                {
+                    reg_state.set(
+                        dest,
+                        RegisterValue::ObjectFieldPtr {
+                            global_rva,
+                            field_offset,
+                        },
+                    );
+                    stats.strong_field_loads += 1;
+                    continue;
+                }
             }
 
             // Pattern 2: mov reg, [reg+offset] - dereference to get vtable
@@ -888,7 +982,98 @@ impl<'a> VcallScanner<'a> {
             return Some((dest, *global_rva, instance_offset, info.vtable_rva));
         }
 
+        if let RegisterValue::ObjectFieldPtr {
+            global_rva,
+            field_offset,
+        } = reg_state.get(base)
+        {
+            let info = self
+                .global_map
+                .lookup_field(*global_rva, *field_offset, instance_offset)?;
+            return Some((dest, *global_rva, instance_offset, info.vtable_rva));
+        }
+
         None
+    }
+
+    fn check_object_field_load(
+        &self,
+        instr: &Instruction,
+        reg_state: &RegisterState,
+    ) -> Option<(Register, u32, u32)> {
+        if instr.mnemonic() != Mnemonic::Mov
+            || instr.op0_kind() != OpKind::Register
+            || instr.op1_kind() != OpKind::Memory
+        {
+            return None;
+        }
+        if instr.memory_index() != Register::None {
+            return None;
+        }
+        let dest = instr.op0_register();
+        let base = instr.memory_base();
+        if base == Register::None || base == Register::RIP {
+            return None;
+        }
+        let field_offset = instr.memory_displacement64() as u32;
+        if let RegisterValue::GlobalPtr { global_rva } = reg_state.get(base) {
+            if self
+                .global_map
+                .field_map
+                .keys()
+                .any(|(mapped_global, mapped_field, _)| {
+                    *mapped_global == *global_rva && *mapped_field == field_offset
+                })
+            {
+                return Some((dest, *global_rva, field_offset));
+            }
+        }
+        None
+    }
+
+    fn track_stack_store(&self, instr: &Instruction, reg_state: &mut RegisterState) -> bool {
+        if instr.mnemonic() != Mnemonic::Mov
+            || instr.op0_kind() != OpKind::Memory
+            || instr.op1_kind() != OpKind::Register
+        {
+            return false;
+        }
+        if instr.memory_index() != Register::None {
+            return false;
+        }
+        let base = to_64bit_reg(instr.memory_base());
+        if base != Register::RSP && base != Register::RBP {
+            return false;
+        }
+        let value = reg_state.get(instr.op1_register()).clone();
+        if matches!(value, RegisterValue::Unknown) {
+            return false;
+        }
+        reg_state.set_stack(base, instr.memory_displacement64() as i64, value);
+        true
+    }
+
+    fn check_stack_load(
+        &self,
+        instr: &Instruction,
+        reg_state: &RegisterState,
+    ) -> Option<(Register, RegisterValue)> {
+        if instr.mnemonic() != Mnemonic::Mov
+            || instr.op0_kind() != OpKind::Register
+            || instr.op1_kind() != OpKind::Memory
+        {
+            return None;
+        }
+        if instr.memory_index() != Register::None {
+            return None;
+        }
+        let base = to_64bit_reg(instr.memory_base());
+        if base != Register::RSP && base != Register::RBP {
+            return None;
+        }
+        reg_state
+            .get_stack(base, instr.memory_displacement64() as i64)
+            .map(|value| (instr.op0_register(), value))
     }
 
     /// Check for `call [reg+offset]` pattern where reg holds a VtablePtr.
@@ -1887,12 +2072,13 @@ pub fn devirtualize(
     text_section_rva: u32,
     text_section_size: u32,
     vtable_facts: &[VtableFact],
+    heap_edges: &[HeapPointerEdge],
     section_mappings: &[SectionMapping],
     headers_size: usize,
     config: &DevirtConfig,
 ) -> Result<DevirtStats> {
     // Build global-to-vtable mapping
-    let global_map = GlobalVtableMap::build(vtable_facts, image_base);
+    let global_map = GlobalVtableMap::build(vtable_facts, heap_edges, image_base);
 
     if global_map.is_empty() {
         return Ok(DevirtStats::default());
@@ -2037,10 +2223,45 @@ mod tests {
             },
         ];
 
-        let map = GlobalVtableMap::build(&facts, 0x1400_0000);
+        let map = GlobalVtableMap::build(&facts, &[], 0x1400_0000);
         assert_eq!(map.len(), 2);
         assert_eq!(map.lookup(0x3000, 0).unwrap().vtable_rva, 0x5000);
         assert_eq!(map.lookup(0x3000, 0x20).unwrap().vtable_rva, 0x7000);
+    }
+
+    #[test]
+    fn test_global_vtable_map_includes_heap_field_targets() {
+        let facts = vec![
+            VtableFact {
+                source_rva: Some(0x3000),
+                heap_addr: 0x1000_0000,
+                stub_rva: 0x8000,
+                vfptr_offset: 0,
+                vtable_rva: 0x5000,
+            },
+            VtableFact {
+                source_rva: None,
+                heap_addr: 0x2000_0000,
+                stub_rva: 0x9000,
+                vfptr_offset: 0,
+                vtable_rva: 0x7000,
+            },
+        ];
+        let edges = vec![HeapPointerEdge {
+            source_heap_addr: 0x1000_0000,
+            field_offset: 0x18,
+            target_heap_addr: 0x2000_0000,
+            confidence: crate::stub::EdgeConfidence::High,
+            reason: "target_has_vtable",
+            target_has_vtable: true,
+        }];
+
+        let map = GlobalVtableMap::build(&facts, &edges, 0x1400_0000);
+
+        assert_eq!(
+            map.lookup_field(0x3000, 0x18, 0).unwrap().vtable_rva,
+            0x7000
+        );
     }
 
     #[test]
@@ -2071,7 +2292,7 @@ mod tests {
             vfptr_offset: 0x20,
             vtable_rva,
         }];
-        let map = GlobalVtableMap::build(&facts, image_base);
+        let map = GlobalVtableMap::build(&facts, &[], image_base);
         let config = DevirtConfig::default();
         let scanner = VcallScanner::new(module.as_ptr(), image_base, &map, &config);
 

@@ -29,7 +29,7 @@ use crate::error::Result;
 use crate::memory::{probe_memory_byte, safe_read_memory, MemoryRegionCache};
 use crate::scanner::ScannerConfig;
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 /// Statistics for stub creation debugging.
 #[derive(Default)]
@@ -75,6 +75,46 @@ pub struct HeapPointerEdge {
     pub field_offset: u32,
     /// Heap object pointed to by the source field.
     pub target_heap_addr: u64,
+    /// Confidence assigned after graph deduplication/scoring.
+    pub confidence: EdgeConfidence,
+    /// Short machine-readable reason for the score.
+    pub reason: &'static str,
+    /// Whether the target has a synthetic vtable stub.
+    pub target_has_vtable: bool,
+}
+
+/// Confidence assigned to a heap graph edge.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum EdgeConfidence {
+    #[default]
+    Low,
+    Medium,
+    High,
+}
+
+impl EdgeConfidence {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
+/// Conservative container-like heap pattern found during recursive scanning.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContainerFact {
+    /// Heap object that owns the container field/pointer array.
+    pub source_heap_addr: u64,
+    /// Offset in the source heap object where the pattern starts.
+    pub field_offset: u32,
+    /// Pattern kind, e.g. `pointer_array` or `vector_triple`.
+    pub kind: &'static str,
+    /// Number of recognized heap object elements.
+    pub element_count: usize,
+    /// Heap addresses of recognized element objects.
+    pub targets: Vec<u64>,
 }
 
 /// A minimal stub for a heap-allocated class instance.
@@ -110,6 +150,12 @@ pub struct StubConfig {
     pub max_heap_scan_size: usize,
     /// Maximum recursive heap-pointer scan depth.
     pub recursive_heap_scan_depth: usize,
+    /// Maximum heap graph edges to retain after scoring.
+    pub max_graph_edges: usize,
+    /// Minimum confidence required for retained graph edges.
+    pub min_edge_confidence: EdgeConfidence,
+    /// Detect conservative container-like heap patterns.
+    pub detect_containers: bool,
 }
 
 impl Default for StubConfig {
@@ -121,6 +167,9 @@ impl Default for StubConfig {
             max_vfptr_probe: 256,
             max_heap_scan_size: 0x1000,
             recursive_heap_scan_depth: 2,
+            max_graph_edges: 50_000,
+            min_edge_confidence: EdgeConfidence::Low,
+            detect_containers: true,
         }
     }
 }
@@ -141,6 +190,8 @@ pub struct StubGenerator {
     visited: HashSet<u64>,
     /// Heap-to-heap pointer edges found during recursive scanning.
     heap_edges: Vec<HeapPointerEdge>,
+    /// Container-like heap patterns found during recursive scanning.
+    containers: Vec<ContainerFact>,
 }
 
 impl StubGenerator {
@@ -159,6 +210,7 @@ impl StubGenerator {
             stubs: HashMap::with_capacity(8192),
             visited: HashSet::with_capacity(16384),
             heap_edges: Vec::new(),
+            containers: Vec::new(),
         })
     }
 
@@ -176,6 +228,7 @@ impl StubGenerator {
             stubs: map,
             visited: HashSet::new(),
             heap_edges: Vec::new(),
+            containers: Vec::new(),
         }
     }
 
@@ -497,6 +550,9 @@ impl StubGenerator {
                     source_heap_addr: addr,
                     field_offset,
                     target_heap_addr: child,
+                    confidence: EdgeConfidence::Low,
+                    reason: "raw_heap_pointer",
+                    target_has_vtable: false,
                 });
                 let had_stub = self.stubs.contains_key(&child);
                 if self.create_stub(child).is_some() && !had_stub {
@@ -508,7 +564,205 @@ impl StubGenerator {
             }
         }
 
+        self.finalize_heap_graph();
+
         discovered
+    }
+
+    /// Deduplicate heap graph edges, score them, apply config limits, and derive
+    /// conservative container facts from the retained high-confidence graph.
+    fn finalize_heap_graph(&mut self) {
+        let mut unique: BTreeMap<(u64, u32, u64), HeapPointerEdge> = BTreeMap::new();
+        for edge in self.heap_edges.drain(..) {
+            unique
+                .entry((
+                    edge.source_heap_addr,
+                    edge.field_offset,
+                    edge.target_heap_addr,
+                ))
+                .or_insert(edge);
+        }
+
+        let graph_sources: HashSet<u64> = unique.keys().map(|(source, _, _)| *source).collect();
+        let mut scored = Vec::with_capacity(unique.len());
+        for (_, mut edge) in unique {
+            edge.target_has_vtable = self.stubs.contains_key(&edge.target_heap_addr);
+            if edge.target_has_vtable {
+                edge.confidence = EdgeConfidence::High;
+                edge.reason = "target_has_vtable";
+            } else if graph_sources.contains(&edge.target_heap_addr) {
+                edge.confidence = EdgeConfidence::Medium;
+                edge.reason = "target_points_to_heap";
+            } else {
+                edge.confidence = EdgeConfidence::Low;
+                edge.reason = "raw_heap_pointer";
+            }
+            scored.push(edge);
+        }
+
+        scored.sort_by_key(|edge| {
+            (
+                std::cmp::Reverse(edge.confidence),
+                edge.source_heap_addr,
+                edge.field_offset,
+                edge.target_heap_addr,
+            )
+        });
+        scored.retain(|edge| edge.confidence >= self.config.min_edge_confidence);
+        if self.config.max_graph_edges > 0 && scored.len() > self.config.max_graph_edges {
+            scored.truncate(self.config.max_graph_edges);
+        }
+
+        self.heap_edges = scored;
+        if self.config.detect_containers {
+            self.containers = self.detect_container_facts();
+            let mut existing = self
+                .heap_edges
+                .iter()
+                .map(|edge| {
+                    (
+                        edge.source_heap_addr,
+                        edge.field_offset,
+                        edge.target_heap_addr,
+                    )
+                })
+                .collect::<HashSet<_>>();
+            for container in &self.containers {
+                if container.kind != "vector_triple" {
+                    continue;
+                }
+                for &target in &container.targets {
+                    if existing.insert((container.source_heap_addr, container.field_offset, target))
+                    {
+                        self.heap_edges.push(HeapPointerEdge {
+                            source_heap_addr: container.source_heap_addr,
+                            field_offset: container.field_offset,
+                            target_heap_addr: target,
+                            confidence: EdgeConfidence::High,
+                            reason: "container_element_has_vtable",
+                            target_has_vtable: true,
+                        });
+                    }
+                }
+            }
+            self.heap_edges.sort_by_key(|edge| {
+                (
+                    std::cmp::Reverse(edge.confidence),
+                    edge.source_heap_addr,
+                    edge.field_offset,
+                    edge.target_heap_addr,
+                )
+            });
+            if self.config.max_graph_edges > 0
+                && self.heap_edges.len() > self.config.max_graph_edges
+            {
+                self.heap_edges.truncate(self.config.max_graph_edges);
+            }
+        }
+    }
+
+    fn detect_container_facts(&self) -> Vec<ContainerFact> {
+        let mut containers = Vec::new();
+        let mut by_source: BTreeMap<u64, Vec<&HeapPointerEdge>> = BTreeMap::new();
+        for edge in &self.heap_edges {
+            if edge.target_has_vtable {
+                by_source
+                    .entry(edge.source_heap_addr)
+                    .or_default()
+                    .push(edge);
+            }
+        }
+
+        for (source_heap_addr, mut edges) in by_source {
+            edges.sort_by_key(|edge| edge.field_offset);
+
+            let mut run_start = 0usize;
+            while run_start < edges.len() {
+                let mut run_end = run_start + 1;
+                while run_end < edges.len()
+                    && edges[run_end].field_offset == edges[run_end - 1].field_offset + 8
+                {
+                    run_end += 1;
+                }
+
+                if run_end - run_start >= 2 {
+                    containers.push(ContainerFact {
+                        source_heap_addr,
+                        field_offset: edges[run_start].field_offset,
+                        kind: "pointer_array",
+                        element_count: run_end - run_start,
+                        targets: edges[run_start..run_end]
+                            .iter()
+                            .map(|edge| edge.target_heap_addr)
+                            .collect(),
+                    });
+                }
+
+                run_start = run_end;
+            }
+
+            containers.extend(self.detect_vector_triples(source_heap_addr));
+        }
+
+        containers.sort_by_key(|c| (c.source_heap_addr, c.field_offset, c.kind));
+        containers
+    }
+
+    fn detect_vector_triples(&self, source_heap_addr: u64) -> Vec<ContainerFact> {
+        let mut facts = Vec::new();
+        let region_remaining = self
+            .region_cache
+            .get_region(source_heap_addr)
+            .map(|r| (r.end_addr - source_heap_addr) as usize)
+            .unwrap_or(self.config.max_heap_scan_size);
+        let max_scan = self.config.max_heap_scan_size.max(24).min(region_remaining) & !7usize;
+        if max_scan < 24 {
+            return facts;
+        }
+
+        let mut buf = vec![0u8; max_scan];
+        if !safe_read_memory(source_heap_addr as *const u8, &mut buf) {
+            return facts;
+        }
+
+        for off in (0..=max_scan - 24).step_by(8) {
+            let begin = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+            let end = u64::from_le_bytes(buf[off + 8..off + 16].try_into().unwrap());
+            let cap = u64::from_le_bytes(buf[off + 16..off + 24].try_into().unwrap());
+            if begin == 0
+                || end < begin
+                || cap < end
+                || end - begin > self.config.max_heap_scan_size as u64
+            {
+                continue;
+            }
+            let byte_len = (end - begin) as usize;
+            if byte_len < 16 || byte_len % 8 != 0 || !self.is_valid_heap_ptr(begin) {
+                continue;
+            }
+
+            let mut elements = vec![0u8; byte_len.min(self.config.max_heap_scan_size)];
+            if !safe_read_memory(begin as *const u8, &mut elements) {
+                continue;
+            }
+
+            let targets = elements
+                .chunks_exact(8)
+                .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
+                .filter(|addr| self.stubs.contains_key(addr))
+                .collect::<Vec<_>>();
+            if targets.len() >= 2 {
+                facts.push(ContainerFact {
+                    source_heap_addr,
+                    field_offset: off as u32,
+                    kind: "vector_triple",
+                    element_count: targets.len(),
+                    targets,
+                });
+            }
+        }
+
+        facts
     }
 
     /// Scan a bounded prefix of a heap allocation for qword-aligned heap pointers.
@@ -723,6 +977,11 @@ impl StubGenerator {
         &self.heap_edges
     }
 
+    /// Get container-like heap patterns found during recursive scanning.
+    pub fn containers(&self) -> &[ContainerFact] {
+        &self.containers
+    }
+
     /// Get scanner config.
     pub fn scanner_config(&self) -> ScannerConfig {
         ScannerConfig {
@@ -781,6 +1040,7 @@ mod tests {
             stubs: HashMap::new(),
             visited: HashSet::new(),
             heap_edges: Vec::new(),
+            containers: Vec::new(),
         };
 
         generator.stubs.insert(
@@ -813,6 +1073,7 @@ mod tests {
             stubs: HashMap::new(),
             visited: HashSet::new(),
             heap_edges: Vec::new(),
+            containers: Vec::new(),
         };
 
         generator.stubs.insert(
@@ -884,6 +1145,7 @@ mod tests {
             stubs: HashMap::new(),
             visited: HashSet::new(),
             heap_edges: Vec::new(),
+            containers: Vec::new(),
         };
 
         let discovered = generator.discover_recursive_stubs(&[(0xA000, parent_addr)]);
@@ -897,5 +1159,70 @@ mod tests {
 
         drop(parent);
         drop(child);
+    }
+
+    #[test]
+    fn test_heap_edges_are_deduped_scored_and_limited() {
+        let mut generator = StubGenerator {
+            mod_base: 0x1400_0000,
+            mod_end: 0x1410_0000,
+            config: StubConfig {
+                max_graph_edges: 1,
+                min_edge_confidence: EdgeConfidence::Medium,
+                detect_containers: false,
+                ..Default::default()
+            },
+            region_cache: MemoryRegionCache::new(),
+            stubs: HashMap::new(),
+            visited: HashSet::new(),
+            heap_edges: vec![
+                HeapPointerEdge {
+                    source_heap_addr: 0x1000,
+                    field_offset: 0x8,
+                    target_heap_addr: 0x2000,
+                    confidence: EdgeConfidence::Low,
+                    reason: "raw_heap_pointer",
+                    target_has_vtable: false,
+                },
+                HeapPointerEdge {
+                    source_heap_addr: 0x1000,
+                    field_offset: 0x8,
+                    target_heap_addr: 0x2000,
+                    confidence: EdgeConfidence::Low,
+                    reason: "raw_heap_pointer",
+                    target_has_vtable: false,
+                },
+                HeapPointerEdge {
+                    source_heap_addr: 0x1000,
+                    field_offset: 0x10,
+                    target_heap_addr: 0x3000,
+                    confidence: EdgeConfidence::Low,
+                    reason: "raw_heap_pointer",
+                    target_has_vtable: false,
+                },
+            ],
+            containers: Vec::new(),
+        };
+        generator.stubs.insert(
+            0x2000,
+            VtableStub {
+                original_addr: 0x2000,
+                size: 8,
+                data: vec![0; 8],
+                new_rva: 0x8000,
+                vtable_refs: vec![VtableRef {
+                    offset: 0,
+                    vtable_rva: 0x5000,
+                }],
+                vfptr_offsets: [0].into_iter().collect(),
+            },
+        );
+
+        generator.finalize_heap_graph();
+
+        assert_eq!(generator.heap_edges.len(), 1);
+        assert_eq!(generator.heap_edges[0].target_heap_addr, 0x2000);
+        assert_eq!(generator.heap_edges[0].confidence, EdgeConfidence::High);
+        assert_eq!(generator.heap_edges[0].reason, "target_has_vtable");
     }
 }

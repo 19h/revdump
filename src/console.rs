@@ -32,6 +32,8 @@ use windows::Win32::System::Threading::GetCurrentProcess;
 
 #[cfg(target_os = "windows")]
 use crate::dumper::{DumpConfig, Dumper, ProgressInfo, ProgressStage};
+#[cfg(target_os = "windows")]
+use crate::stub::EdgeConfidence;
 
 /// Console state and settings.
 #[cfg(target_os = "windows")]
@@ -54,6 +56,13 @@ pub struct Console {
     skip_sections: Vec<usize>,
     /// Enable devirtualization.
     devirt: bool,
+    emit_ida_script: bool,
+    emit_revdmp: bool,
+    parse_rtti: bool,
+    max_graph_edges: usize,
+    min_edge_confidence: EdgeConfidence,
+    detect_containers: bool,
+    strong_devirt: bool,
 }
 
 #[cfg(target_os = "windows")]
@@ -77,6 +86,13 @@ impl Console {
             skip_code: false,
             skip_sections: Vec::new(),
             devirt: false,
+            emit_ida_script: true,
+            emit_revdmp: true,
+            parse_rtti: true,
+            max_graph_edges: 50_000,
+            min_edge_confidence: EdgeConfidence::Low,
+            detect_containers: true,
+            strong_devirt: false,
         }
     }
 
@@ -178,6 +194,13 @@ impl Console {
         let skip_code = self.skip_code;
         let skip_sections = self.skip_sections.clone();
         let devirt = self.devirt;
+        let emit_ida_script = self.emit_ida_script;
+        let emit_revdmp = self.emit_revdmp;
+        let parse_rtti = self.parse_rtti;
+        let max_graph_edges = self.max_graph_edges;
+        let min_edge_confidence = self.min_edge_confidence;
+        let detect_containers = self.detect_containers;
+        let strong_devirt = self.strong_devirt;
 
         let handle = thread::spawn(move || {
             let mut state = ConsoleState {
@@ -189,6 +212,13 @@ impl Console {
                 skip_code,
                 skip_sections,
                 devirt,
+                emit_ida_script,
+                emit_revdmp,
+                parse_rtti,
+                max_graph_edges,
+                min_edge_confidence,
+                detect_containers,
+                strong_devirt,
             };
             state.run();
         });
@@ -236,6 +266,13 @@ struct ConsoleState {
     skip_code: bool,
     skip_sections: Vec<usize>,
     devirt: bool,
+    emit_ida_script: bool,
+    emit_revdmp: bool,
+    parse_rtti: bool,
+    max_graph_edges: usize,
+    min_edge_confidence: EdgeConfidence,
+    detect_containers: bool,
+    strong_devirt: bool,
 }
 
 #[cfg(target_os = "windows")]
@@ -274,6 +311,13 @@ impl ConsoleState {
                 "skipcode" | "sc" => self.cmd_toggle_skip_code(),
                 "skipsections" | "ss" => self.cmd_set_skip_sections(),
                 "devirt" | "dv" => self.cmd_toggle_devirt(),
+                "ida" => self.cmd_toggle_ida_script(),
+                "revdmp" => self.cmd_toggle_revdmp(),
+                "rtti" => self.cmd_toggle_rtti(),
+                "containers" | "ct" => self.cmd_toggle_containers(),
+                "strongdevirt" | "sdv" => self.cmd_toggle_strong_devirt(),
+                "edges" => self.cmd_set_max_graph_edges(),
+                "edgeconf" => self.cmd_set_min_edge_confidence(),
                 "dump" | "dumpheap" | "dh" => self.cmd_dump_with_heap(),
                 "dumpstd" | "ds" | "standard" => self.cmd_dump_standard(),
                 "go" | "run" | "!" => self.cmd_dump_now(),
@@ -321,6 +365,13 @@ impl ConsoleState {
         println!("    skipcode, sc         - Toggle skip code section");
         println!("    skipsections, ss     - Set sections to skip");
         println!("    devirt, dv           - Toggle vcall devirtualization");
+        println!("    strongdevirt, sdv    - Toggle stronger devirt analysis");
+        println!("    ida                  - Toggle IDA sidecar script");
+        println!("    revdmp               - Toggle .revdmp metadata");
+        println!("    rtti                 - Toggle RTTI parsing");
+        println!("    containers, ct       - Toggle container detection");
+        println!("    edges                - Set max graph edges");
+        println!("    edgeconf             - Set min edge confidence");
         println!();
         println!("  [Dumping]");
         println!("    dump, dumpheap, dh   - Dump with heap (interactive)");
@@ -358,6 +409,28 @@ impl ConsoleState {
             "  Devirtualize:     {}",
             if self.devirt { "Yes" } else { "No" }
         );
+        println!(
+            "  Strong Devirt:    {}",
+            if self.strong_devirt { "Yes" } else { "No" }
+        );
+        println!(
+            "  IDA Script:       {}",
+            if self.emit_ida_script { "Yes" } else { "No" }
+        );
+        println!(
+            "  .revdmp:          {}",
+            if self.emit_revdmp { "Yes" } else { "No" }
+        );
+        println!(
+            "  RTTI Parse:       {}",
+            if self.parse_rtti { "Yes" } else { "No" }
+        );
+        println!(
+            "  Containers:       {}",
+            if self.detect_containers { "Yes" } else { "No" }
+        );
+        println!("  Max Graph Edges:  {}", self.max_graph_edges);
+        println!("  Min Edge Conf:    {}", self.min_edge_confidence.as_str());
 
         if !self.skip_sections.is_empty() {
             let sections: Vec<String> = self.skip_sections.iter().map(|s| s.to_string()).collect();
@@ -517,6 +590,100 @@ impl ConsoleState {
         );
     }
 
+    fn cmd_toggle_ida_script(&mut self) {
+        self.emit_ida_script = !self.emit_ida_script;
+        println!(
+            "[OK] IDA script: {}",
+            if self.emit_ida_script {
+                "Enabled"
+            } else {
+                "Disabled"
+            }
+        );
+    }
+
+    fn cmd_toggle_revdmp(&mut self) {
+        self.emit_revdmp = !self.emit_revdmp;
+        println!(
+            "[OK] .revdmp metadata: {}",
+            if self.emit_revdmp {
+                "Enabled"
+            } else {
+                "Disabled"
+            }
+        );
+    }
+
+    fn cmd_toggle_rtti(&mut self) {
+        self.parse_rtti = !self.parse_rtti;
+        println!(
+            "[OK] RTTI parsing: {}",
+            if self.parse_rtti {
+                "Enabled"
+            } else {
+                "Disabled"
+            }
+        );
+    }
+
+    fn cmd_toggle_containers(&mut self) {
+        self.detect_containers = !self.detect_containers;
+        println!(
+            "[OK] Container detection: {}",
+            if self.detect_containers {
+                "Enabled"
+            } else {
+                "Disabled"
+            }
+        );
+    }
+
+    fn cmd_toggle_strong_devirt(&mut self) {
+        self.strong_devirt = !self.strong_devirt;
+        println!(
+            "[OK] Strong devirt analysis: {}",
+            if self.strong_devirt {
+                "Enabled"
+            } else {
+                "Disabled"
+            }
+        );
+    }
+
+    fn cmd_set_max_graph_edges(&mut self) {
+        print!("Max graph edges [{}]: ", self.max_graph_edges);
+        let _ = io::stdout().flush();
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input).is_ok() {
+            if let Ok(value) = input.trim().parse::<usize>() {
+                self.max_graph_edges = value;
+            }
+        }
+        println!("[OK] Max graph edges: {}", self.max_graph_edges);
+    }
+
+    fn cmd_set_min_edge_confidence(&mut self) {
+        print!(
+            "Minimum edge confidence (low/medium/high) [{}]: ",
+            self.min_edge_confidence.as_str()
+        );
+        let _ = io::stdout().flush();
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input).is_ok() {
+            match input.trim().to_ascii_lowercase().as_str() {
+                "low" => self.min_edge_confidence = EdgeConfidence::Low,
+                "medium" | "med" => self.min_edge_confidence = EdgeConfidence::Medium,
+                "high" => self.min_edge_confidence = EdgeConfidence::High,
+                "" => {}
+                other => println!("[ERROR] Invalid confidence: {}", other),
+            }
+        }
+        println!(
+            "[OK] Min edge confidence: {}",
+            self.min_edge_confidence.as_str()
+        );
+    }
+
     fn cmd_set_skip_sections(&mut self) {
         println!("Enter section indices to skip (comma-separated), or 'clear' to clear:");
         print!("Sections: ");
@@ -591,6 +758,20 @@ impl ConsoleState {
         println!("  Max Region Size: 0x{:X}", self.max_region_size);
         println!("  Skip Code: {}", if self.skip_code { "Yes" } else { "No" });
         println!("  Devirtualize: {}", if self.devirt { "Yes" } else { "No" });
+        println!(
+            "  Strong Devirt: {}",
+            if self.strong_devirt { "Yes" } else { "No" }
+        );
+        println!(
+            "  IDA Script: {}",
+            if self.emit_ida_script { "Yes" } else { "No" }
+        );
+        println!("  .revdmp: {}", if self.emit_revdmp { "Yes" } else { "No" });
+        println!("  RTTI: {}", if self.parse_rtti { "Yes" } else { "No" });
+        println!(
+            "  Containers: {}",
+            if self.detect_containers { "Yes" } else { "No" }
+        );
 
         if !self.confirm("\nProceed with dump?") {
             println!("Cancelled.");
@@ -670,6 +851,13 @@ impl ConsoleState {
             recursive_heap_scan_depth: self.max_depth,
             skip_sections,
             enable_devirt: self.devirt,
+            emit_ida_script: self.emit_ida_script,
+            emit_revdmp: self.emit_revdmp,
+            parse_rtti: self.parse_rtti,
+            max_graph_edges: self.max_graph_edges,
+            min_edge_confidence: self.min_edge_confidence,
+            detect_containers: self.detect_containers,
+            strong_devirt: self.strong_devirt,
             progress_callback: Some(Box::new(|info: &ProgressInfo| {
                 print_progress(info);
             })),
@@ -790,6 +978,9 @@ impl ConsoleState {
             max_vfptr_probe: self.max_depth * 8,
             max_heap_scan_size: self.max_region_size,
             recursive_heap_scan_depth: self.max_depth,
+            max_graph_edges: self.max_graph_edges,
+            min_edge_confidence: self.min_edge_confidence,
+            detect_containers: self.detect_containers,
         };
 
         let mut stub_gen = match StubGenerator::new(base, size, stub_config) {

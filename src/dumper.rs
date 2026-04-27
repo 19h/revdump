@@ -16,12 +16,16 @@ use crate::pe::{
     HEAP_SECTION_CHARACTERISTICS, PE_SIGNATURE,
 };
 use crate::scanner::{PointerScanner, ScanResult};
-use crate::stub::{HeapPointerEdge, StubConfig, StubGenerator, VtableFact};
+use crate::stub::{
+    ContainerFact, EdgeConfidence, HeapPointerEdge, StubConfig, StubGenerator, VtableFact,
+};
 
+use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 #[derive(Clone, Debug)]
 pub struct EnrichedVtableFact {
@@ -117,6 +121,7 @@ pub fn build_revdmp_metadata(
     facts: &[EnrichedVtableFact],
     heap_ptr_locs: &[(u32, u64)],
     heap_edges: &[HeapPointerEdge],
+    containers: &[ContainerFact],
     image_base: u64,
     stub_generator: &StubGenerator,
 ) -> Vec<u8> {
@@ -150,18 +155,26 @@ pub fn build_revdmp_metadata(
     let _ = writeln!(text, "REVDMP_OBJECT_GRAPH v1");
     let _ = writeln!(
         text,
-        "source_kind,source_rva,source_heap_addr,source_stub_rva,field_offset,target_heap_addr,target_stub_rva"
+        "source_kind,source_rva,source_heap_addr,source_stub_rva,field_offset,target_heap_addr,target_stub_rva,confidence,reason,target_has_vtable"
     );
     for &(source_rva, target_heap_addr) in heap_ptr_locs {
         let target_stub = stub_generator.get_stub(target_heap_addr).map(|s| s.new_rva);
+        let (confidence, reason, target_has_vtable) = if target_stub.is_some() {
+            ("high", "target_has_vtable", true)
+        } else {
+            ("low", "raw_heap_pointer", false)
+        };
         let _ = writeln!(
             text,
-            "global,0x{:X},,,0x0,0x{:X},{}",
+            "global,0x{:X},,,0x0,0x{:X},{},{},{},{}",
             source_rva,
             target_heap_addr,
             target_stub
                 .map(|rva| format!("0x{rva:X}"))
                 .unwrap_or_default(),
+            confidence,
+            reason,
+            target_has_vtable,
         );
     }
     for edge in heap_edges {
@@ -173,7 +186,7 @@ pub fn build_revdmp_metadata(
             .map(|s| s.new_rva);
         let _ = writeln!(
             text,
-            "heap,,0x{:X},{},0x{:X},0x{:X},{}",
+            "heap,,0x{:X},{},0x{:X},0x{:X},{},{},{},{}",
             edge.source_heap_addr,
             source_stub
                 .map(|rva| format!("0x{rva:X}"))
@@ -183,6 +196,39 @@ pub fn build_revdmp_metadata(
             target_stub
                 .map(|rva| format!("0x{rva:X}"))
                 .unwrap_or_default(),
+            edge.confidence.as_str(),
+            edge.reason,
+            edge.target_has_vtable,
+        );
+    }
+
+    let _ = writeln!(text);
+    let _ = writeln!(text, "REVDMP_CONTAINERS v1");
+    let _ = writeln!(
+        text,
+        "source_heap_addr,source_stub_rva,field_offset,kind,element_count,target_heap_addrs"
+    );
+    for container in containers {
+        let source_stub = stub_generator
+            .get_stub(container.source_heap_addr)
+            .map(|s| s.new_rva);
+        let targets = container
+            .targets
+            .iter()
+            .map(|addr| format!("0x{addr:X}"))
+            .collect::<Vec<_>>()
+            .join(";");
+        let _ = writeln!(
+            text,
+            "0x{:X},{},0x{:X},{},{},{}",
+            container.source_heap_addr,
+            source_stub
+                .map(|rva| format!("0x{rva:X}"))
+                .unwrap_or_default(),
+            container.field_offset,
+            container.kind,
+            container.element_count,
+            targets,
         );
     }
 
@@ -266,6 +312,20 @@ fn ida_script_path(output_path: &Path) -> PathBuf {
     output_path.with_file_name(format!("{file_name}.ida.py"))
 }
 
+fn find_ida_executable() -> Option<String> {
+    if let Ok(path) = std::env::var("IDA_PATH") {
+        if !path.trim().is_empty() {
+            return Some(path);
+        }
+    }
+    for candidate in ["idat64", "ida64"] {
+        if Command::new(candidate).arg("-h").output().is_ok() {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
 fn sanitize_ida_name(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for ch in name.chars() {
@@ -302,6 +362,12 @@ fn read_u64_at_rva(pe: &PeParser, rva: u32) -> Option<u64> {
     let ptr = unsafe { pe.base.add(off) };
     let bytes = unsafe { std::slice::from_raw_parts(ptr, 8) };
     Some(u64::from_le_bytes(bytes.try_into().ok()?))
+}
+
+fn rva_in_image(pe: &PeParser, rva: u32, len: usize) -> bool {
+    (rva as usize)
+        .checked_add(len)
+        .is_some_and(|end| end <= pe.size)
 }
 
 fn read_c_string_at_rva(pe: &PeParser, rva: u32, max_len: usize) -> Option<String> {
@@ -357,13 +423,18 @@ fn demangle_msvc_type_name(name: &str) -> String {
 }
 
 fn demangle_itanium_type_name(name: &str) -> String {
+    let name = name.trim_start_matches("_ZTI");
+    let name = name
+        .strip_prefix('N')
+        .and_then(|nested| nested.strip_suffix('E'))
+        .unwrap_or(name);
     let bytes = name.as_bytes();
     let mut idx = 0usize;
     let mut parts = Vec::new();
 
     while idx < bytes.len() {
         if !bytes[idx].is_ascii_digit() {
-            return name.trim_start_matches("_ZTI").to_string();
+            return name.to_string();
         }
         let start = idx;
         while idx < bytes.len() && bytes[idx].is_ascii_digit() {
@@ -386,9 +457,14 @@ fn demangle_itanium_type_name(name: &str) -> String {
     }
 }
 
-fn resolve_vtable_type_name(pe: &PeParser, vtable_rva: u32) -> Option<String> {
+fn resolve_vtable_type_name(
+    pe: &PeParser,
+    vtable_rva: u32,
+    symbol_names: &HashMap<u32, String>,
+) -> Option<String> {
     resolve_msvc_rtti_type_name(pe, vtable_rva)
         .or_else(|| resolve_itanium_rtti_type_name(pe, vtable_rva))
+        .or_else(|| symbol_names.get(&vtable_rva).cloned())
 }
 
 fn resolve_msvc_rtti_type_name(pe: &PeParser, vtable_rva: u32) -> Option<String> {
@@ -397,6 +473,9 @@ fn resolve_msvc_rtti_type_name(pe: &PeParser, vtable_rva: u32) -> Option<String>
     }
     let col_ptr = read_u64_at_rva(pe, vtable_rva - 8)?;
     let col_rva = ptr_to_rva(pe, col_ptr)?;
+    if !rva_in_image(pe, col_rva, 24) {
+        return None;
+    }
     let signature = read_u32_at_rva(pe, col_rva)?;
     if signature > 1 {
         return None;
@@ -404,9 +483,20 @@ fn resolve_msvc_rtti_type_name(pe: &PeParser, vtable_rva: u32) -> Option<String>
     let type_descriptor_rva = if signature == 1 {
         read_u32_at_rva(pe, col_rva + 12)?
     } else {
-        let ptr = read_u32_at_rva(pe, col_rva + 12)? as u64;
+        let ptr = read_u64_at_rva(pe, col_rva + 12)?;
         ptr_to_rva(pe, ptr)?
     };
+    if !rva_in_image(pe, type_descriptor_rva, 24) {
+        return None;
+    }
+    let hierarchy = if signature == 1 {
+        read_u32_at_rva(pe, col_rva + 16)
+    } else {
+        read_u64_at_rva(pe, col_rva + 16).and_then(|ptr| ptr_to_rva(pe, ptr))
+    };
+    if let Some(hierarchy_rva) = hierarchy {
+        let _ = read_u32_at_rva(pe, hierarchy_rva + 8); // base class count when present
+    }
     let raw = read_c_string_at_rva(pe, type_descriptor_rva + 16, 256)?;
     Some(demangle_msvc_type_name(&raw))
 }
@@ -417,19 +507,96 @@ fn resolve_itanium_rtti_type_name(pe: &PeParser, vtable_rva: u32) -> Option<Stri
     }
     let typeinfo_ptr = read_u64_at_rva(pe, vtable_rva - 8)?;
     let typeinfo_rva = ptr_to_rva(pe, typeinfo_ptr)?;
+    if !rva_in_image(pe, typeinfo_rva, 16) {
+        return None;
+    }
     let name_ptr = read_u64_at_rva(pe, typeinfo_rva + 8)?;
     let name_rva = ptr_to_rva(pe, name_ptr)?;
     let raw = read_c_string_at_rva(pe, name_rva, 256)?;
     Some(demangle_itanium_type_name(&raw))
 }
 
-fn enrich_vtable_facts(pe: &PeParser, facts: &[VtableFact]) -> Vec<EnrichedVtableFact> {
+fn parse_coff_vtable_symbols(pe: &PeParser) -> HashMap<u32, String> {
+    const COFF_SYMBOL_SIZE: usize = 18;
+    let mut out = HashMap::new();
+    let raw = &pe.coff_symbol_table_raw;
+    let symbol_bytes = pe.number_of_symbols as usize * COFF_SYMBOL_SIZE;
+    if raw.len() < symbol_bytes + 4 {
+        return out;
+    }
+    let strings = &raw[symbol_bytes..];
+
+    let mut idx = 0usize;
+    while idx < pe.number_of_symbols as usize {
+        let off = idx * COFF_SYMBOL_SIZE;
+        if off + COFF_SYMBOL_SIZE > raw.len() {
+            break;
+        }
+
+        let name = if raw[off..off + 4] == [0, 0, 0, 0] {
+            let string_off = u32::from_le_bytes(raw[off + 4..off + 8].try_into().unwrap()) as usize;
+            if string_off >= 4 && string_off < strings.len() {
+                let bytes = &strings[string_off..];
+                let nul = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+                String::from_utf8_lossy(&bytes[..nul]).to_string()
+            } else {
+                String::new()
+            }
+        } else {
+            let nul = raw[off..off + 8].iter().position(|&b| b == 0).unwrap_or(8);
+            String::from_utf8_lossy(&raw[off..off + nul]).to_string()
+        };
+
+        let value = u32::from_le_bytes(raw[off + 8..off + 12].try_into().unwrap());
+        let section_number = i16::from_le_bytes(raw[off + 12..off + 14].try_into().unwrap());
+        let aux_count = raw[off + 17] as usize;
+        if section_number > 0 {
+            if let Some(section) = pe.sections.get(section_number as usize - 1) {
+                let rva = section.virtual_address.saturating_add(value);
+                let lower = name.to_ascii_lowercase();
+                if lower.contains("vftable") || lower.contains("vtable") {
+                    out.insert(rva, demangle_symbol_type_name(&name));
+                }
+            }
+        }
+        idx += 1 + aux_count;
+    }
+
+    out
+}
+
+fn demangle_symbol_type_name(name: &str) -> String {
+    let trimmed = name.trim_start_matches("_ZTV");
+    if trimmed != name {
+        return demangle_itanium_type_name(trimmed);
+    }
+    name.replace("::`vftable'", "")
+        .replace("vftable", "")
+        .replace("vtable", "")
+        .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != ':' && ch != '_')
+        .to_string()
+}
+
+fn enrich_vtable_facts(
+    pe: &PeParser,
+    facts: &[VtableFact],
+    parse_rtti: bool,
+) -> Vec<EnrichedVtableFact> {
+    let symbol_names = parse_coff_vtable_symbols(pe);
+    let mut cache = HashMap::new();
     facts
         .iter()
         .cloned()
-        .map(|fact| EnrichedVtableFact {
-            type_name: resolve_vtable_type_name(pe, fact.vtable_rva),
-            fact,
+        .map(|fact| {
+            let type_name = if parse_rtti {
+                cache
+                    .entry(fact.vtable_rva)
+                    .or_insert_with(|| resolve_vtable_type_name(pe, fact.vtable_rva, &symbol_names))
+                    .clone()
+            } else {
+                symbol_names.get(&fact.vtable_rva).cloned()
+            };
+            EnrichedVtableFact { type_name, fact }
         })
         .collect()
 }
@@ -438,6 +605,7 @@ pub fn build_ida_script(
     facts: &[EnrichedVtableFact],
     heap_ptr_locs: &[(u32, u64)],
     heap_edges: &[HeapPointerEdge],
+    containers: &[ContainerFact],
     image_base: u64,
     stub_generator: &StubGenerator,
 ) -> String {
@@ -452,16 +620,27 @@ pub fn build_ida_script(
     let _ = writeln!(script, "import ida_struct");
     let _ = writeln!(script, "import idc");
     let _ = writeln!(script, "BADADDR = 0xFFFFFFFFFFFFFFFF");
+    let _ = writeln!(script, "revdump_selfcheck = []");
+    let _ = writeln!(
+        script,
+        "revdump_counts = {{'offsets': 0, 'names': 0, 'structs': 0, 'comments': 0}}"
+    );
+    let _ = writeln!(script, "def check(ok, text):");
+    let _ = writeln!(script, "    revdump_selfcheck.append((bool(ok), text))");
     let _ = writeln!(script, "def qword_off(ea, target=0):");
     let _ = writeln!(script, "    ida_bytes.create_qword(ea, 8)");
     let _ = writeln!(script, "    ida_offset.op_plain_offset(ea, 0, 0)");
+    let _ = writeln!(script, "    revdump_counts['offsets'] += 1");
     let _ = writeln!(script, "def set_name(ea, name):");
     let _ = writeln!(
         script,
-        "    ida_name.set_name(ea, name, ida_name.SN_CHECK | ida_name.SN_FORCE)"
+        "    if ida_name.set_name(ea, name, ida_name.SN_CHECK | ida_name.SN_FORCE) or ida_name.get_name(ea):"
     );
+    let _ = writeln!(script, "        revdump_counts['names'] += 1");
     let _ = writeln!(script, "def cmt(ea, text):");
     let _ = writeln!(script, "    ida_bytes.set_cmt(ea, text, False)");
+    let _ = writeln!(script, "    if ida_bytes.get_cmt(ea, False):");
+    let _ = writeln!(script, "        revdump_counts['comments'] += 1");
     let _ = writeln!(script, "def make_struct(name, members):");
     let _ = writeln!(script, "    sid = ida_struct.get_struc_id(name)");
     let _ = writeln!(script, "    if sid == BADADDR:");
@@ -473,6 +652,7 @@ pub fn build_ida_script(
     let _ = writeln!(script, "    if sptr:");
     let _ = writeln!(script, "        for off, mname in members:");
     let _ = writeln!(script, "            ida_struct.add_struc_member(sptr, mname, off, ida_bytes.FF_QWORD | ida_bytes.FF_DATA, None, 8)");
+    let _ = writeln!(script, "        revdump_counts['structs'] += 1");
     let _ = writeln!(script, "");
 
     for stub in stub_generator.stubs() {
@@ -552,12 +732,67 @@ pub fn build_ida_script(
             let target_va = image_base + target.new_rva as u64;
             let _ = writeln!(
                 script,
-                "cmt(0x{field_va:X}, 'heap edge +0x{:X} -> stub 0x{:X} (heap 0x{:X})')",
-                edge.field_offset, target.new_rva, edge.target_heap_addr
+                "cmt(0x{field_va:X}, 'heap edge +0x{:X} -> stub 0x{:X} (heap 0x{:X}); confidence={}; reason={}')",
+                edge.field_offset,
+                target.new_rva,
+                edge.target_heap_addr,
+                edge.confidence.as_str(),
+                edge.reason,
             );
             let _ = writeln!(script, "qword_off(0x{field_va:X}, 0x{target_va:X})");
         }
     }
+
+    for container in containers {
+        if let Some(source) = stub_generator.get_stub(container.source_heap_addr) {
+            let field_va = image_base + source.new_rva as u64 + container.field_offset as u64;
+            let _ = writeln!(
+                script,
+                "cmt(0x{field_va:X}, 'container {}; elements={}; targets={}')",
+                container.kind,
+                container.element_count,
+                container
+                    .targets
+                    .iter()
+                    .map(|addr| format!("0x{addr:X}"))
+                    .collect::<Vec<_>>()
+                    .join(";")
+            );
+        }
+    }
+
+    let expected_structs = stub_generator.stub_count();
+    let expected_offsets = facts.len() + heap_ptr_locs.len() + heap_edges.len();
+    let expected_names = stub_generator.stub_count() + facts.len() * 2;
+    let expected_comments =
+        stub_generator.stub_count() + facts.len() + heap_ptr_locs.len() + heap_edges.len();
+    let _ = writeln!(
+        script,
+        "check(revdump_counts['structs'] >= {expected_structs}, 'expected structs applied')"
+    );
+    let _ = writeln!(
+        script,
+        "check(revdump_counts['offsets'] >= {expected_offsets}, 'expected offsets applied')"
+    );
+    let _ = writeln!(
+        script,
+        "check(revdump_counts['names'] >= {expected_names}, 'expected names applied')"
+    );
+    let _ = writeln!(
+        script,
+        "check(revdump_counts['comments'] >= {expected_comments}, 'expected comments applied')"
+    );
+    let _ = writeln!(
+        script,
+        "failed = [text for ok, text in revdump_selfcheck if not ok]"
+    );
+    let _ = writeln!(script, "if failed:");
+    let _ = writeln!(
+        script,
+        "    print('revdump IDA self-check failed: ' + '; '.join(failed))"
+    );
+    let _ = writeln!(script, "else:");
+    let _ = writeln!(script, "    print('revdump IDA self-check passed')");
 
     let _ = writeln!(script, "print('revdump IDA annotations applied')");
     script
@@ -583,6 +818,20 @@ pub struct DumpConfig {
     pub max_heap_scan_size: usize,
     /// Maximum recursive heap-pointer scan depth.
     pub recursive_heap_scan_depth: usize,
+    /// Emit IDAPython sidecar script.
+    pub emit_ida_script: bool,
+    /// Emit `.revdmp` metadata section.
+    pub emit_revdmp: bool,
+    /// Parse RTTI/type names for metadata and IDA annotations.
+    pub parse_rtti: bool,
+    /// Maximum heap graph edges to retain after scoring.
+    pub max_graph_edges: usize,
+    /// Minimum confidence required for retained heap graph edges.
+    pub min_edge_confidence: EdgeConfidence,
+    /// Detect conservative container-like heap patterns.
+    pub detect_containers: bool,
+    /// Enable stronger but still bounded devirtualization analysis.
+    pub strong_devirt: bool,
 }
 
 impl std::fmt::Debug for DumpConfig {
@@ -597,6 +846,13 @@ impl std::fmt::Debug for DumpConfig {
             .field("devirt_config", &self.devirt_config)
             .field("max_heap_scan_size", &self.max_heap_scan_size)
             .field("recursive_heap_scan_depth", &self.recursive_heap_scan_depth)
+            .field("emit_ida_script", &self.emit_ida_script)
+            .field("emit_revdmp", &self.emit_revdmp)
+            .field("parse_rtti", &self.parse_rtti)
+            .field("max_graph_edges", &self.max_graph_edges)
+            .field("min_edge_confidence", &self.min_edge_confidence)
+            .field("detect_containers", &self.detect_containers)
+            .field("strong_devirt", &self.strong_devirt)
             .finish()
     }
 }
@@ -613,6 +869,13 @@ impl Default for DumpConfig {
             devirt_config: DevirtConfig::default(),
             max_heap_scan_size: 0x1000,
             recursive_heap_scan_depth: 2,
+            emit_ida_script: true,
+            emit_revdmp: true,
+            parse_rtti: true,
+            max_graph_edges: 50_000,
+            min_edge_confidence: EdgeConfidence::Low,
+            detect_containers: true,
+            strong_devirt: false,
         }
     }
 }
@@ -634,7 +897,16 @@ impl DumpConfig {
             max_vfptr_probe: self.max_vfptr_probe,
             max_heap_scan_size: self.max_heap_scan_size,
             recursive_heap_scan_depth: self.recursive_heap_scan_depth,
+            max_graph_edges: self.max_graph_edges,
+            min_edge_confidence: self.min_edge_confidence,
+            detect_containers: self.detect_containers,
         }
+    }
+
+    fn effective_devirt_config(&self) -> DevirtConfig {
+        let mut config = self.devirt_config.clone();
+        config.strong_analysis = self.strong_devirt;
+        config
     }
 }
 
@@ -759,21 +1031,31 @@ impl Dumper {
         let heap_section_va = pe.next_section_va();
         let heap_section_size = stub_generator.assign_rvas(heap_section_va);
         let vtable_facts = stub_generator.vtable_facts(&heap_ptr_locs);
-        let enriched_facts = enrich_vtable_facts(pe, &vtable_facts);
-        let metadata_data = build_revdmp_metadata(
-            &enriched_facts,
-            &heap_ptr_locs,
-            stub_generator.heap_edges(),
-            pe.image_base,
-            &stub_generator,
-        );
-        let ida_script = build_ida_script(
-            &enriched_facts,
-            &heap_ptr_locs,
-            stub_generator.heap_edges(),
-            pe.image_base,
-            &stub_generator,
-        );
+        let enriched_facts = enrich_vtable_facts(pe, &vtable_facts, config.parse_rtti);
+        let metadata_data = if config.emit_revdmp {
+            build_revdmp_metadata(
+                &enriched_facts,
+                &heap_ptr_locs,
+                stub_generator.heap_edges(),
+                stub_generator.containers(),
+                pe.image_base,
+                &stub_generator,
+            )
+        } else {
+            Vec::new()
+        };
+        let ida_script = if config.emit_ida_script {
+            Some(build_ida_script(
+                &enriched_facts,
+                &heap_ptr_locs,
+                stub_generator.heap_edges(),
+                stub_generator.containers(),
+                pe.image_base,
+                &stub_generator,
+            ))
+        } else {
+            None
+        };
         let metadata_section_va = PeParser::align_up(
             heap_section_va as usize + heap_section_size,
             pe.section_alignment as usize,
@@ -790,7 +1072,7 @@ impl Dumper {
             heap_section_va,
             heap_section_size,
             metadata_section_va,
-            &metadata_data,
+            config.emit_revdmp.then_some(metadata_data.as_slice()),
         )?;
 
         // Devirtualize vcalls if enabled
@@ -798,8 +1080,14 @@ impl Dumper {
             progress.stage = ProgressStage::Devirtualizing;
             report(&progress);
 
-            let devirt_stats =
-                self.apply_devirt(&mut output, pe, &vtable_facts, &section_mappings, config)?;
+            let devirt_stats = self.apply_devirt(
+                &mut output,
+                pe,
+                &vtable_facts,
+                stub_generator.heap_edges(),
+                &section_mappings,
+                config,
+            )?;
 
             eprintln!(
                 "Devirt: {} vcalls found, {} resolved, {} patched",
@@ -815,7 +1103,9 @@ impl Dumper {
         report(&progress);
 
         self.write_output(output_path.as_ref(), &output)?;
-        self.write_ida_script(output_path.as_ref(), &ida_script)?;
+        if let Some(ida_script) = ida_script {
+            self.write_ida_script(output_path.as_ref(), &ida_script)?;
+        }
 
         progress.stage = ProgressStage::Complete;
         progress.current = progress.total;
@@ -918,10 +1208,12 @@ impl Dumper {
         heap_section_va: u32,
         heap_section_size: usize,
         metadata_section_va: u32,
-        metadata_data: &[u8],
+        metadata_data: Option<&[u8]>,
     ) -> Result<(Vec<u8>, Vec<SectionMapping>)> {
         // Calculate sizes
-        let num_sections = pe.sections.len() + 2; // +.heap and .revdmp
+        let has_metadata = metadata_data.is_some();
+        let metadata_data = metadata_data.unwrap_or(&[]);
+        let num_sections = pe.sections.len() + 1 + usize::from(has_metadata); // +.heap, optional .revdmp
         let headers_size = pe.pe_offset as usize
             + 4  // PE signature
             + std::mem::size_of::<FileHeader>()
@@ -963,9 +1255,18 @@ impl Dumper {
         current_raw_offset += heap_raw_size;
 
         // Build metadata section data for IDA/Ghidra sidecar consumers.
-        let metadata_raw_size = PeParser::align_up(metadata_data.len(), pe.file_alignment as usize);
-        let metadata_raw_offset = current_raw_offset as u32;
-        current_raw_offset += metadata_raw_size;
+        let metadata_raw_size = if has_metadata {
+            PeParser::align_up(metadata_data.len(), pe.file_alignment as usize)
+        } else {
+            0
+        };
+        let metadata_raw_offset = if has_metadata {
+            let offset = current_raw_offset as u32;
+            current_raw_offset += metadata_raw_size;
+            offset
+        } else {
+            0
+        };
 
         let coff_symbol_table_raw = build_output_coff_string_table(pe);
         let coff_symbol_table_offset = if coff_symbol_table_raw.is_empty() {
@@ -1015,10 +1316,13 @@ impl Dumper {
         pos += std::mem::size_of::<FileHeader>();
 
         // Write optional header (copy original and update sizes)
-        let new_size_of_image = PeParser::align_up(
-            (metadata_section_va + metadata_data.len() as u32) as usize,
-            pe.section_alignment as usize,
-        ) as u32;
+        let image_end = if has_metadata {
+            metadata_section_va + metadata_data.len() as u32
+        } else {
+            heap_section_va + heap_section_size as u32
+        };
+        let new_size_of_image =
+            PeParser::align_up(image_end as usize, pe.section_alignment as usize) as u32;
 
         output[pos..pos + pe.optional_header_raw.len()].copy_from_slice(&pe.optional_header_raw);
 
@@ -1087,24 +1391,26 @@ impl Dumper {
         pos += std::mem::size_of::<SectionHeader>();
 
         // Write .revdmp metadata section header
-        let metadata_header = SectionHeader {
-            name: *b".revdmp\0",
-            virtual_size: metadata_data.len() as u32,
-            virtual_address: metadata_section_va,
-            size_of_raw_data: metadata_raw_size as u32,
-            pointer_to_raw_data: metadata_raw_offset,
-            pointer_to_relocations: 0,
-            pointer_to_linenumbers: 0,
-            number_of_relocations: 0,
-            number_of_linenumbers: 0,
-            characteristics: HEAP_SECTION_CHARACTERISTICS,
-        };
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                &metadata_header as *const _ as *const u8,
-                output.as_mut_ptr().add(pos),
-                std::mem::size_of::<SectionHeader>(),
-            );
+        if has_metadata {
+            let metadata_header = SectionHeader {
+                name: *b".revdmp\0",
+                virtual_size: metadata_data.len() as u32,
+                virtual_address: metadata_section_va,
+                size_of_raw_data: metadata_raw_size as u32,
+                pointer_to_raw_data: metadata_raw_offset,
+                pointer_to_relocations: 0,
+                pointer_to_linenumbers: 0,
+                number_of_relocations: 0,
+                number_of_linenumbers: 0,
+                characteristics: HEAP_SECTION_CHARACTERISTICS,
+            };
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    &metadata_header as *const _ as *const u8,
+                    output.as_mut_ptr().add(pos),
+                    std::mem::size_of::<SectionHeader>(),
+                );
+            }
         }
 
         // Write section data
@@ -1124,7 +1430,7 @@ impl Dumper {
         }
 
         // Write metadata section data.
-        {
+        if has_metadata {
             let offset = metadata_raw_offset as usize;
             let mut padded_metadata = metadata_data.to_vec();
             padded_metadata.resize(metadata_raw_size, 0);
@@ -1210,6 +1516,7 @@ impl Dumper {
         output: &mut [u8],
         pe: &PeParser,
         vtable_facts: &[VtableFact],
+        heap_edges: &[HeapPointerEdge],
         section_mappings: &[SectionMapping],
         config: &DumpConfig,
     ) -> Result<DevirtStats> {
@@ -1223,7 +1530,7 @@ impl Dumper {
             })?;
 
         // Calculate headers size for protection
-        let num_sections = pe.sections.len() + 2; // +.heap and .revdmp
+        let num_sections = pe.sections.len() + 1 + usize::from(config.emit_revdmp);
         let headers_size = pe.pe_offset as usize
             + 4  // PE signature
             + std::mem::size_of::<FileHeader>()
@@ -1239,9 +1546,10 @@ impl Dumper {
             text_section.virtual_address,
             text_section.virtual_size,
             vtable_facts,
+            heap_edges,
             &section_mappings,
             aligned_headers,
-            &config.devirt_config,
+            &config.effective_devirt_config(),
         )
     }
 
@@ -1401,6 +1709,21 @@ impl Dumper {
             File::create(&script_path).map_err(|e| Error::OutputCreationFailed(e.to_string()))?;
         file.write_all(script.as_bytes())
             .map_err(|e| Error::OutputWriteFailed(e.to_string()))?;
+        eprintln!("IDA script: {}", script_path.display());
+        if let Some(ida) = find_ida_executable() {
+            eprintln!(
+                "IDA smoke command: {} -A -S{} {}",
+                ida,
+                script_path.display(),
+                output_path.display()
+            );
+        } else {
+            eprintln!(
+                "IDA smoke command: idat64 -A -S{} {} (set IDA_PATH or add idat64/ida64 to PATH)",
+                script_path.display(),
+                output_path.display()
+            );
+        }
         Ok(())
     }
 
@@ -1485,7 +1808,11 @@ mod tests {
                 source_heap_addr: 0x1000_0000,
                 field_offset: 0x18,
                 target_heap_addr: 0x2000_0000,
+                confidence: EdgeConfidence::Low,
+                reason: "raw_heap_pointer",
+                target_has_vtable: false,
             }],
+            &[],
             0x1400_0000,
             &stub_generator,
         );
@@ -1496,6 +1823,7 @@ mod tests {
         assert!(text.contains("REVDMP_OBJECT_GRAPH v1"));
         assert!(text.contains("global,0x2000,,,0x0,0x10000000,0x8000"));
         assert!(text.contains("heap,,0x10000000,0x8000,0x18,0x20000000,"));
+        assert!(text.contains("REVDMP_CONTAINERS v1"));
         assert!(text.contains("REVDMP_SYNTHETIC_STRUCTS v1"));
     }
 
@@ -1536,7 +1864,7 @@ mod tests {
         };
 
         assert_eq!(
-            resolve_vtable_type_name(&pe, vtable_rva).as_deref(),
+            resolve_vtable_type_name(&pe, vtable_rva, &HashMap::new()).as_deref(),
             Some("AudioService")
         );
     }
@@ -1572,6 +1900,7 @@ mod tests {
         let script = build_ida_script(
             &facts,
             &[(0x2000, 0x1000_0000)],
+            &[],
             &[],
             0x1400_0000,
             &stub_generator,

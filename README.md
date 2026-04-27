@@ -44,6 +44,9 @@ Now decompilers can resolve the virtual call chain statically.
 ### Core Dumping
 - **Heap snapshot with vtable stubs** - Preserves virtual call resolution
 - **Multiple inheritance support** - Handles objects with multiple vtables (probes up to 256 bytes for vfptrs)
+- **Recursive heap discovery** - Finds heap-only objects reachable through scanned heap pointers
+- **Heap graph metadata** - Deduplicates and scores heap-to-heap edges by confidence
+- **Container recognition** - Conservatively detects pointer arrays and vector-like triples
 - **Standard PE dump** - Simple copy without heap processing
 - **Chunked scanning** - Processes large modules in 4MB chunks
 
@@ -51,7 +54,16 @@ Now decompilers can resolve the virtual call chain statically.
 - **Pattern detection** - Identifies `call [rax+offset]`, `jmp [rax+offset]`, and related patterns
 - **Direct call patching** - Rewrites indirect vtable calls to direct `call target` instructions
 - **Thunk generation** - Places call thunks in code padding for space-constrained patches
+- **Secondary vfptr support** - Resolves vcalls through nonzero object vfptr offsets
+- **Strong analysis mode** - Optional bounded tracking through object fields and simple stack aliases
 - **Multi-byte NOP detection** - Finds padding regions for thunk placement
+
+### Analysis Metadata
+- **Embedded `.revdmp` section** - Stores vtable facts, object graph edges, containers, and synthetic structs
+- **IDA sidecar script** - Generates `*.ida.py` annotations for names, offsets, structs, comments, and graph edges
+- **IDA self-check** - Generated script records whether expected annotations were applied
+- **RTTI recovery** - Resolves MSVC and Itanium-style type names where metadata is available
+- **COFF symbol fallback** - Uses vtable-like COFF symbols when RTTI is unavailable
 
 ### Performance
 - **SIMD-optimized scanning** - AVX2, SSE4.2, and scalar paths with runtime detection
@@ -85,6 +97,7 @@ cargo build --release --target x86_64-pc-windows-gnu
 - Rust 1.70+ with `x86_64-pc-windows-gnu` target
 - MinGW-w64 toolchain for cross-compilation
 - Windows target (runs on Windows or via Wine)
+- Optional: IDA Pro `idat64`/`ida64` in `PATH`, or `IDA_PATH`, for headless sidecar smoke testing
 
 ## Usage
 
@@ -107,8 +120,24 @@ revdump dump \
   --max-depth 16 \
   --max-region-size 131072 \
   --skip-sections 0,1 \
-  --devirt
+  --devirt \
+  --strong-devirt \
+  --max-graph-edges 50000 \
+  --min-edge-confidence medium
 ```
+
+Useful toggles:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--devirt` | off | Rewrite resolved virtual calls to direct calls |
+| `--strong-devirt` | off | Track object field loads and simple stack aliases during devirt |
+| `--no-ida-script` | off | Disable `*.ida.py` sidecar generation |
+| `--no-revdmp` | off | Disable embedded `.revdmp` metadata section |
+| `--no-rtti` | off | Disable RTTI parsing for type names |
+| `--max-graph-edges <n>` | `50000` | Limit retained heap graph edges after scoring |
+| `--min-edge-confidence <low|medium|high>` | `low` | Drop lower-confidence heap graph edges |
+| `--no-containers` | off | Disable conservative container detection |
 
 ### DLL Injection Mode
 
@@ -117,9 +146,10 @@ revdump dump \
 3. Use commands to configure and execute dumps:
 
 ```
-revdump> target game.exe          # Set target module
-revdump> output dumped.exe        # Set output file
-revdump> devirt on                # Enable devirtualization
+revdump> target                   # Prompt for target module
+revdump> output                   # Prompt for output path
+revdump> devirt                   # Toggle devirtualization
+revdump> strongdevirt             # Toggle stronger devirtualization analysis
 revdump> dump                     # Execute dump
 
 # Or quick dump with defaults:
@@ -139,6 +169,8 @@ set REVDUMP_AUTO=1
 REVDUMP_AUTO=1 wine target.exe  # If target loads revdump.dll
 ```
 
+Auto-dump uses `DumpConfig::default()` plus devirtualization enabled by the library entry point. It emits `autodump.exe`, `autodump.exe.ida.py`, and an embedded `.revdmp` section by default.
+
 ## Console Commands
 
 | Command | Aliases | Description |
@@ -149,7 +181,14 @@ REVDUMP_AUTO=1 wine target.exe  # If target loads revdump.dll
 | `regionsize <kb>` | `region`, `r` | Set max region size in KB (default: 64) |
 | `skipcode` | `sc` | Toggle skip .text section |
 | `skipsections <n,n>` | `ss` | Set section indices to skip |
-| `devirt [on\|off]` | `dv` | Toggle vcall devirtualization |
+| `devirt` | `dv` | Toggle vcall devirtualization |
+| `strongdevirt` | `sdv` | Toggle stronger devirtualization analysis |
+| `ida` | | Toggle IDA sidecar script generation |
+| `revdmp` | | Toggle embedded `.revdmp` metadata |
+| `rtti` | | Toggle RTTI parsing |
+| `containers` | `ct` | Toggle conservative container detection |
+| `edges` | | Set max retained graph edges |
+| `edgeconf` | | Set minimum edge confidence (`low`, `medium`, `high`) |
 | `dump` | `dumpheap`, `dh` | Interactive heap dump |
 | `dumpstd` | `ds`, `standard` | Standard dump (no heap) |
 | `go` | `run`, `!` | Quick dump with current settings |
@@ -182,6 +221,7 @@ For each heap pointer found:
 2. Verify it points back into the module's `.rdata` section (where vtables live)
 3. Probe for additional vtable pointers (multiple inheritance)
 4. Create a minimal stub containing only the vtable pointer(s)
+5. Recursively scan bounded heap prefixes for child heap objects with vfptrs
 
 **Single inheritance:** 8-byte stub
 ```
@@ -198,8 +238,19 @@ For each heap pointer found:
 
 1. Copy original PE sections
 2. Add new `.heap` section with all vtable stubs
-3. Rewrite global pointers: `old_heap_addr` → `stub_rva + image_base`
-4. Update PE headers (SizeOfImage, section count)
+3. Optionally add `.revdmp` metadata with vtable facts, heap graph edges, containers, and synthetic structs
+4. Rewrite global pointers: `old_heap_addr` → `stub_rva + image_base`
+5. Update PE headers (SizeOfImage, section count)
+
+Heap graph edges are deduplicated by `(source_heap_addr, field_offset, target_heap_addr)` and scored:
+
+| Confidence | Reason |
+|------------|--------|
+| `high` | Target has a synthetic vtable stub |
+| `medium` | Target is a heap object that points to another known heap object |
+| `low` | Raw heap pointer only |
+
+Container recognition is intentionally conservative. It currently emits metadata for consecutive heap pointer arrays and vector-like `begin/end/end_cap` triples only when recognized elements resolve to heap objects with vtable stubs.
 
 ### Phase 5: Devirtualization (Optional)
 
@@ -230,6 +281,33 @@ call 0x140002710          ; 5-byte direct call
 jmp  short return_site    ; 2-byte jump back
 ```
 
+With `strong_devirt` enabled, the scanner also tracks simple patterns such as:
+
+```asm
+mov rcx, [global]
+mov rcx, [rcx+field]
+mov rax, [rcx+vfptr]
+call qword ptr [rax+slot]
+```
+
+It also tracks simple stack aliases such as `mov [rsp+X], rcx` followed by `mov rcx, [rsp+X]`. This mode is bounded by `max_block_instructions` and is off by default from the CLI because it is more aggressive than direct global-vfptr tracking.
+
+### Phase 6: IDA Annotation (Optional)
+
+When `emit_ida_script` is enabled, revdump writes `<dump>.ida.py` next to the dumped PE. The script:
+
+- Creates synthetic struct members for vfptr offsets
+- Names synthetic heap instances and vtables
+- Converts vfptr/global/heap-edge qwords to offsets
+- Adds comments for original heap addresses, sources, confidence, and container facts
+- Runs a lightweight self-check and prints pass/fail status
+
+If `idat64`, `ida64`, or `IDA_PATH` is available, revdump prints a ready-to-run headless smoke command:
+
+```bash
+idat64 -A -Sautodump.exe.ida.py autodump.exe
+```
+
 ## Architecture
 
 ```
@@ -258,12 +336,41 @@ src/
 | `max_vfptr_probe` | `256` | Max bytes to probe for multiple vtables |
 | `skip_sections` | `[]` | Section indices to skip during scanning |
 | `enable_devirt` | `false` | Enable vcall devirtualization |
+| `max_heap_scan_size` | `0x1000` | Max bytes to scan per heap allocation for embedded heap pointers |
+| `recursive_heap_scan_depth` | `2` | Max recursive heap-pointer scan depth |
+| `emit_ida_script` | `true` | Emit `<dump>.ida.py` sidecar script |
+| `emit_revdmp` | `true` | Embed `.revdmp` metadata section |
+| `parse_rtti` | `true` | Parse RTTI/type names for metadata and IDA annotations |
+| `max_graph_edges` | `50000` | Max retained heap graph edges after dedup/scoring |
+| `min_edge_confidence` | `Low` | Minimum retained heap graph confidence |
+| `detect_containers` | `true` | Enable conservative container detection |
+| `strong_devirt` | `false` | Enable stronger bounded devirt tracking |
 
 ### DevirtConfig
 
 | Field | Default | Description |
 |-------|---------|-------------|
 | `dry_run` | `false` | Analyze only, don't patch |
+| `max_block_instructions` | `256` | Reset analysis state after this many instructions |
+| `strong_analysis` | `false` | Track object fields and simple stack aliases |
+
+## Output Artifacts
+
+For a heap dump to `autodump.exe`, revdump normally produces:
+
+| Artifact | Description |
+|----------|-------------|
+| `autodump.exe` | Rebuilt PE with original sections, `.heap`, and optional `.revdmp` |
+| `.heap` section | Synthetic minimal heap objects containing normalized vfptrs |
+| `.revdmp` section | Text metadata for vtable facts, object graph, containers, and synthetic structs |
+| `autodump.exe.ida.py` | IDAPython sidecar for names, offsets, structs, comments, and self-checks |
+
+`.revdmp` sections currently include:
+
+- `REVDMP_VTABLE_FACTS v1`
+- `REVDMP_OBJECT_GRAPH v1`
+- `REVDMP_CONTAINERS v1`
+- `REVDMP_SYNTHETIC_STRUCTS v1`
 
 ## Limitations
 
@@ -271,7 +378,9 @@ src/
 
 - **3-byte vcalls without nearby padding** - Cannot patch `call [rax+N]` (3 bytes) if no code padding exists within ±127 bytes for thunk placement
 - **x86-64 only** - Devirtualization patterns are 64-bit specific
-- **Direct vtable access only** - Resolves calls through globals pointing directly to heap objects with vtables
+- **Conservative propagation** - Default mode resolves direct global/object vfptr patterns; `strong_devirt` adds bounded field and stack-alias tracking but still avoids full data-flow analysis
+- **RTTI-dependent names** - Type names require usable RTTI or symbol fallback; stripped targets may still produce unnamed vtables
+- **Container heuristics** - Container recognition intentionally prefers fewer false positives over broad coverage
 
 ### General Limitations
 
@@ -283,9 +392,12 @@ src/
 
 ```
 [revdump] Module base: 0x140000000, size: 0x57000
-Memory cache: 3494 regions, 31 heap (12 MB)
+Memory cache: 7998 regions, 30 heap (12 MB)
 Stubs: 9 created from 15 pointers (4 duplicates, 2 non-vtable)
-Devirt: 18 vcalls found, 18 resolved, 14 patched
+Stubs: 6 recursively discovered from heap data
+Devirt: 18 vcalls found, 18 resolved, 19 patched
+IDA script: autodump.exe.ida.py
+IDA smoke command: idat64 -A -Sautodump.exe.ida.py autodump.exe (set IDA_PATH or add idat64/ida64 to PATH)
 [revdump] Dump complete: autodump.exe
 ```
 
@@ -312,6 +424,11 @@ REVDUMP_AUTO=1 wine ./test_vtable.exe
 # Verify output
 file autodump.exe
 # autodump.exe: PE32+ executable (console) x86-64, for MS Windows
+
+# Verify PE sections and IDA script syntax
+x86_64-w64-mingw32-objdump -h autodump.exe
+llvm-readobj --sections autodump.exe
+python3 -m py_compile autodump.exe.ida.py
 ```
 
 The test program creates multiple inheritance hierarchies with global interface pointers - the exact patterns revdump is designed to handle.
