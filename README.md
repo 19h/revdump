@@ -1,10 +1,10 @@
 # revdump
 
-A PE process dumper that resolves virtual calls through heap-allocated class instances by creating synthetic vtable stubs.
+A PE process dumper that turns runtime C++ heap objects into static-analysis-friendly PE data. revdump preserves just enough object/vtable state for IDA, Ghidra, and similar tools to recover virtual call targets that normal dumps lose.
 
 ## The Problem
 
-When you dump a running process, global pointers to heap-allocated C++ objects become useless. The heap doesn't exist in the static image, so decompilers see:
+When you dump a running process, global pointers to heap-allocated C++ objects often become useless. The heap does not exist in the static image, so decompilers see:
 
 ```c
 // In IDA/Ghidra after a normal dump:
@@ -21,7 +21,7 @@ call qword ptr [rax+20h]      ; Which function? Nobody knows.
 
 ## The Solution
 
-revdump creates a synthetic `.heap` section containing minimal **vtable stubs** - tiny structures that preserve only the vtable pointers at their correct offsets. Global pointers are rewritten to point to these stubs.
+revdump creates a synthetic `.heap` section containing minimal **vtable stubs**: tiny structures that preserve only the vtable pointers at their correct offsets. Global pointers are rewritten to point to these stubs, so the dumped PE contains a compact static representation of the runtime object graph.
 
 **Before (runtime):**
 ```
@@ -37,7 +37,20 @@ g_audioEngine → [8-byte stub in .heap] → vtable → AudioService::setVolume
               (vtable pointer preserved!)
 ```
 
-Now decompilers can resolve the virtual call chain statically.
+Now decompilers can resolve the virtual call chain statically, without importing the whole heap or hand-rebuilding object layouts.
+
+## Why It Is Different
+
+Most dumpers copy module memory and leave runtime heap relationships behind. Most vtable scanners find candidate tables but do not reconnect them to the global pointers and object fields that code actually uses.
+
+revdump bridges that gap:
+
+- It reconstructs C++ object references into a valid PE instead of producing a separate notes file only.
+- It emits minimal synthetic objects, avoiding noisy full-heap dumps while keeping vfptr offsets intact.
+- It supports secondary vfptrs and multiple inheritance, not just `object+0` vtables.
+- It recursively follows heap-owned object references and records a scored object graph.
+- It can patch resolved virtual calls into direct calls for better decompiler output.
+- It generates `.revdmp` metadata and IDAPython annotations so the recovered runtime context is immediately usable in reverse-engineering tools.
 
 ## Features
 
