@@ -16,12 +16,18 @@ use crate::pe::{
     HEAP_SECTION_CHARACTERISTICS, PE_SIGNATURE,
 };
 use crate::scanner::{PointerScanner, ScanResult};
-use crate::stub::{StubConfig, StubGenerator, VtableFact};
+use crate::stub::{HeapPointerEdge, StubConfig, StubGenerator, VtableFact};
 
 use std::fmt::Write as FmtWrite;
 use std::fs::File;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+#[derive(Clone, Debug)]
+pub struct EnrichedVtableFact {
+    pub fact: VtableFact,
+    pub type_name: Option<String>,
+}
 
 #[cfg(target_os = "windows")]
 use windows::core::PCSTR;
@@ -107,28 +113,97 @@ impl Default for ProgressInfo {
 pub type ProgressCallback = Box<dyn Fn(&ProgressInfo) + Send + Sync>;
 
 /// Build an IDA-friendly metadata section that lists every flattened vtable fact.
-pub fn build_revdmp_metadata(facts: &[VtableFact], image_base: u64) -> Vec<u8> {
+pub fn build_revdmp_metadata(
+    facts: &[EnrichedVtableFact],
+    heap_ptr_locs: &[(u32, u64)],
+    heap_edges: &[HeapPointerEdge],
+    image_base: u64,
+    stub_generator: &StubGenerator,
+) -> Vec<u8> {
     let mut text = String::new();
     let _ = writeln!(text, "REVDMP_VTABLE_FACTS v1");
     let _ = writeln!(
         text,
-        "source_rva,heap_addr,stub_rva,vfptr_offset,vtable_rva,vtable_va"
+        "source_rva,heap_addr,stub_rva,vfptr_offset,vtable_rva,vtable_va,type_name"
     );
 
-    for fact in facts {
+    for enriched in facts {
+        let fact = &enriched.fact;
         let source = fact
             .source_rva
             .map(|rva| format!("0x{rva:X}"))
             .unwrap_or_else(|| "heap".to_string());
         let _ = writeln!(
             text,
-            "{},0x{:X},0x{:X},0x{:X},0x{:X},0x{:X}",
+            "{},0x{:X},0x{:X},0x{:X},0x{:X},0x{:X},{}",
             source,
             fact.heap_addr,
             fact.stub_rva,
             fact.vfptr_offset,
             fact.vtable_rva,
             image_base + fact.vtable_rva as u64,
+            enriched.type_name.as_deref().unwrap_or(""),
+        );
+    }
+
+    let _ = writeln!(text);
+    let _ = writeln!(text, "REVDMP_OBJECT_GRAPH v1");
+    let _ = writeln!(
+        text,
+        "source_kind,source_rva,source_heap_addr,source_stub_rva,field_offset,target_heap_addr,target_stub_rva"
+    );
+    for &(source_rva, target_heap_addr) in heap_ptr_locs {
+        let target_stub = stub_generator.get_stub(target_heap_addr).map(|s| s.new_rva);
+        let _ = writeln!(
+            text,
+            "global,0x{:X},,,0x0,0x{:X},{}",
+            source_rva,
+            target_heap_addr,
+            target_stub
+                .map(|rva| format!("0x{rva:X}"))
+                .unwrap_or_default(),
+        );
+    }
+    for edge in heap_edges {
+        let source_stub = stub_generator
+            .get_stub(edge.source_heap_addr)
+            .map(|s| s.new_rva);
+        let target_stub = stub_generator
+            .get_stub(edge.target_heap_addr)
+            .map(|s| s.new_rva);
+        let _ = writeln!(
+            text,
+            "heap,,0x{:X},{},0x{:X},0x{:X},{}",
+            edge.source_heap_addr,
+            source_stub
+                .map(|rva| format!("0x{rva:X}"))
+                .unwrap_or_default(),
+            edge.field_offset,
+            edge.target_heap_addr,
+            target_stub
+                .map(|rva| format!("0x{rva:X}"))
+                .unwrap_or_default(),
+        );
+    }
+
+    let _ = writeln!(text);
+    let _ = writeln!(text, "REVDMP_SYNTHETIC_STRUCTS v1");
+    let _ = writeln!(text, "stub_rva,heap_addr,struct_name,size,vfptr_offsets");
+    for stub in stub_generator.stubs() {
+        let offsets = stub
+            .vtable_refs
+            .iter()
+            .map(|r| format!("0x{:X}", r.offset))
+            .collect::<Vec<_>>()
+            .join(";");
+        let _ = writeln!(
+            text,
+            "0x{:X},0x{:X},{},0x{:X},{}",
+            stub.new_rva,
+            stub.original_addr,
+            synthetic_struct_name(stub.new_rva),
+            stub.size,
+            offsets,
         );
     }
 
@@ -177,6 +252,315 @@ fn build_output_coff_string_table(pe: &PeParser) -> Vec<u8> {
     let size = table.len() as u32;
     table[0..4].copy_from_slice(&size.to_le_bytes());
     table
+}
+
+fn synthetic_struct_name(stub_rva: u32) -> String {
+    format!("revdump_obj_{stub_rva:X}")
+}
+
+fn ida_script_path(output_path: &Path) -> PathBuf {
+    let file_name = output_path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "dump.exe".to_string());
+    output_path.with_file_name(format!("{file_name}.ida.py"))
+}
+
+fn sanitize_ida_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            out.push(ch);
+        } else if ch == ':' {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "unknown".to_string()
+    } else if out.as_bytes()[0].is_ascii_digit() {
+        format!("_{out}")
+    } else {
+        out
+    }
+}
+
+fn read_u32_at_rva(pe: &PeParser, rva: u32) -> Option<u32> {
+    let off = rva as usize;
+    if off + 4 > pe.size {
+        return None;
+    }
+    let ptr = unsafe { pe.base.add(off) };
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, 4) };
+    Some(u32::from_le_bytes(bytes.try_into().ok()?))
+}
+
+fn read_u64_at_rva(pe: &PeParser, rva: u32) -> Option<u64> {
+    let off = rva as usize;
+    if off + 8 > pe.size {
+        return None;
+    }
+    let ptr = unsafe { pe.base.add(off) };
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, 8) };
+    Some(u64::from_le_bytes(bytes.try_into().ok()?))
+}
+
+fn read_c_string_at_rva(pe: &PeParser, rva: u32, max_len: usize) -> Option<String> {
+    let off = rva as usize;
+    if off >= pe.size {
+        return None;
+    }
+    let len = max_len.min(pe.size - off);
+    let ptr = unsafe { pe.base.add(off) };
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    let nul = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    if nul == 0
+        || !bytes[..nul]
+            .iter()
+            .all(|b| b.is_ascii_graphic() || *b == b' ')
+    {
+        return None;
+    }
+    String::from_utf8(bytes[..nul].to_vec()).ok()
+}
+
+fn ptr_to_rva(pe: &PeParser, ptr: u64) -> Option<u32> {
+    let runtime_base = pe.base as u64;
+    let image_end = pe.image_base.checked_add(pe.size as u64)?;
+    let runtime_end = runtime_base.checked_add(pe.size as u64)?;
+
+    if ptr >= pe.image_base && ptr < image_end {
+        Some((ptr - pe.image_base) as u32)
+    } else if ptr >= runtime_base && ptr < runtime_end {
+        Some((ptr - runtime_base) as u32)
+    } else {
+        None
+    }
+}
+
+fn demangle_msvc_type_name(name: &str) -> String {
+    let mut s = name.trim_start_matches('.');
+    for prefix in ["?AV", "?AU", "?AW", "?A"] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            s = rest;
+            break;
+        }
+    }
+    if let Some(rest) = s.strip_suffix("@@") {
+        s = rest;
+    }
+    let parts: Vec<&str> = s.split('@').filter(|part| !part.is_empty()).collect();
+    if parts.is_empty() {
+        name.to_string()
+    } else {
+        parts.into_iter().rev().collect::<Vec<_>>().join("::")
+    }
+}
+
+fn demangle_itanium_type_name(name: &str) -> String {
+    let bytes = name.as_bytes();
+    let mut idx = 0usize;
+    let mut parts = Vec::new();
+
+    while idx < bytes.len() {
+        if !bytes[idx].is_ascii_digit() {
+            return name.trim_start_matches("_ZTI").to_string();
+        }
+        let start = idx;
+        while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+            idx += 1;
+        }
+        let Ok(len) = name[start..idx].parse::<usize>() else {
+            return name.to_string();
+        };
+        if idx + len > bytes.len() {
+            return name.to_string();
+        }
+        parts.push(&name[idx..idx + len]);
+        idx += len;
+    }
+
+    if parts.is_empty() {
+        name.to_string()
+    } else {
+        parts.join("::")
+    }
+}
+
+fn resolve_vtable_type_name(pe: &PeParser, vtable_rva: u32) -> Option<String> {
+    resolve_msvc_rtti_type_name(pe, vtable_rva)
+        .or_else(|| resolve_itanium_rtti_type_name(pe, vtable_rva))
+}
+
+fn resolve_msvc_rtti_type_name(pe: &PeParser, vtable_rva: u32) -> Option<String> {
+    if vtable_rva < 8 {
+        return None;
+    }
+    let col_ptr = read_u64_at_rva(pe, vtable_rva - 8)?;
+    let col_rva = ptr_to_rva(pe, col_ptr)?;
+    let signature = read_u32_at_rva(pe, col_rva)?;
+    if signature > 1 {
+        return None;
+    }
+    let type_descriptor_rva = if signature == 1 {
+        read_u32_at_rva(pe, col_rva + 12)?
+    } else {
+        let ptr = read_u32_at_rva(pe, col_rva + 12)? as u64;
+        ptr_to_rva(pe, ptr)?
+    };
+    let raw = read_c_string_at_rva(pe, type_descriptor_rva + 16, 256)?;
+    Some(demangle_msvc_type_name(&raw))
+}
+
+fn resolve_itanium_rtti_type_name(pe: &PeParser, vtable_rva: u32) -> Option<String> {
+    if vtable_rva < 8 {
+        return None;
+    }
+    let typeinfo_ptr = read_u64_at_rva(pe, vtable_rva - 8)?;
+    let typeinfo_rva = ptr_to_rva(pe, typeinfo_ptr)?;
+    let name_ptr = read_u64_at_rva(pe, typeinfo_rva + 8)?;
+    let name_rva = ptr_to_rva(pe, name_ptr)?;
+    let raw = read_c_string_at_rva(pe, name_rva, 256)?;
+    Some(demangle_itanium_type_name(&raw))
+}
+
+fn enrich_vtable_facts(pe: &PeParser, facts: &[VtableFact]) -> Vec<EnrichedVtableFact> {
+    facts
+        .iter()
+        .cloned()
+        .map(|fact| EnrichedVtableFact {
+            type_name: resolve_vtable_type_name(pe, fact.vtable_rva),
+            fact,
+        })
+        .collect()
+}
+
+pub fn build_ida_script(
+    facts: &[EnrichedVtableFact],
+    heap_ptr_locs: &[(u32, u64)],
+    heap_edges: &[HeapPointerEdge],
+    image_base: u64,
+    stub_generator: &StubGenerator,
+) -> String {
+    let mut script = String::new();
+    let _ = writeln!(
+        script,
+        "# Auto-generated by revdump. Load after opening the dumped PE in IDA."
+    );
+    let _ = writeln!(script, "import ida_bytes");
+    let _ = writeln!(script, "import ida_name");
+    let _ = writeln!(script, "import ida_offset");
+    let _ = writeln!(script, "import ida_struct");
+    let _ = writeln!(script, "import idc");
+    let _ = writeln!(script, "BADADDR = 0xFFFFFFFFFFFFFFFF");
+    let _ = writeln!(script, "def qword_off(ea, target=0):");
+    let _ = writeln!(script, "    ida_bytes.create_qword(ea, 8)");
+    let _ = writeln!(script, "    ida_offset.op_plain_offset(ea, 0, 0)");
+    let _ = writeln!(script, "def set_name(ea, name):");
+    let _ = writeln!(
+        script,
+        "    ida_name.set_name(ea, name, ida_name.SN_CHECK | ida_name.SN_FORCE)"
+    );
+    let _ = writeln!(script, "def cmt(ea, text):");
+    let _ = writeln!(script, "    ida_bytes.set_cmt(ea, text, False)");
+    let _ = writeln!(script, "def make_struct(name, members):");
+    let _ = writeln!(script, "    sid = ida_struct.get_struc_id(name)");
+    let _ = writeln!(script, "    if sid == BADADDR:");
+    let _ = writeln!(
+        script,
+        "        sid = ida_struct.add_struc(BADADDR, name, False)"
+    );
+    let _ = writeln!(script, "    sptr = ida_struct.get_struc(sid)");
+    let _ = writeln!(script, "    if sptr:");
+    let _ = writeln!(script, "        for off, mname in members:");
+    let _ = writeln!(script, "            ida_struct.add_struc_member(sptr, mname, off, ida_bytes.FF_QWORD | ida_bytes.FF_DATA, None, 8)");
+    let _ = writeln!(script, "");
+
+    for stub in stub_generator.stubs() {
+        let struct_name = synthetic_struct_name(stub.new_rva);
+        let members = stub
+            .vtable_refs
+            .iter()
+            .map(|r| format!("(0x{:X}, 'vfptr_{:X}')", r.offset, r.offset))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(script, "make_struct('{}', [{}])", struct_name, members);
+        let _ = writeln!(
+            script,
+            "set_name(0x{:X}, '{}_instance')",
+            image_base + stub.new_rva as u64,
+            struct_name
+        );
+        let _ = writeln!(
+            script,
+            "cmt(0x{:X}, 'original heap object 0x{:X}, synthetic size 0x{:X}')",
+            image_base + stub.new_rva as u64,
+            stub.original_addr,
+            stub.size
+        );
+    }
+
+    for enriched in facts {
+        let fact = &enriched.fact;
+        let vfptr_va = image_base + fact.stub_rva as u64 + fact.vfptr_offset as u64;
+        let vtable_va = image_base + fact.vtable_rva as u64;
+        let type_suffix = enriched
+            .type_name
+            .as_deref()
+            .map(sanitize_ida_name)
+            .unwrap_or_else(|| format!("{:X}", fact.vtable_rva));
+        let _ = writeln!(script, "qword_off(0x{vfptr_va:X}, 0x{vtable_va:X})");
+        let _ = writeln!(
+            script,
+            "set_name(0x{vfptr_va:X}, 'vfptr_{}_off_{:X}')",
+            type_suffix, fact.vfptr_offset
+        );
+        let _ = writeln!(
+            script,
+            "set_name(0x{vtable_va:X}, 'vftable_{}')",
+            type_suffix
+        );
+        let _ = writeln!(
+            script,
+            "cmt(0x{vfptr_va:X}, 'vfptr -> vtable 0x{:X}; heap=0x{:X}; source={}')",
+            fact.vtable_rva,
+            fact.heap_addr,
+            fact.source_rva
+                .map(|rva| format!("0x{rva:X}"))
+                .unwrap_or_else(|| "heap-only".to_string())
+        );
+    }
+
+    for &(source_rva, heap_addr) in heap_ptr_locs {
+        let source_va = image_base + source_rva as u64;
+        if let Some(stub) = stub_generator.get_stub(heap_addr) {
+            let stub_va = image_base + stub.new_rva as u64;
+            let _ = writeln!(script, "qword_off(0x{source_va:X}, 0x{stub_va:X})");
+            let _ = writeln!(
+                script,
+                "cmt(0x{source_va:X}, 'revdump global -> stub 0x{:X}; original heap 0x{:X}')",
+                stub.new_rva, heap_addr
+            );
+        }
+    }
+
+    for edge in heap_edges {
+        if let (Some(source), Some(target)) = (
+            stub_generator.get_stub(edge.source_heap_addr),
+            stub_generator.get_stub(edge.target_heap_addr),
+        ) {
+            let field_va = image_base + source.new_rva as u64 + edge.field_offset as u64;
+            let target_va = image_base + target.new_rva as u64;
+            let _ = writeln!(
+                script,
+                "cmt(0x{field_va:X}, 'heap edge +0x{:X} -> stub 0x{:X} (heap 0x{:X})')",
+                edge.field_offset, target.new_rva, edge.target_heap_addr
+            );
+            let _ = writeln!(script, "qword_off(0x{field_va:X}, 0x{target_va:X})");
+        }
+    }
+
+    let _ = writeln!(script, "print('revdump IDA annotations applied')");
+    script
 }
 
 /// Configuration for the dump operation.
@@ -375,7 +759,21 @@ impl Dumper {
         let heap_section_va = pe.next_section_va();
         let heap_section_size = stub_generator.assign_rvas(heap_section_va);
         let vtable_facts = stub_generator.vtable_facts(&heap_ptr_locs);
-        let metadata_data = build_revdmp_metadata(&vtable_facts, pe.image_base);
+        let enriched_facts = enrich_vtable_facts(pe, &vtable_facts);
+        let metadata_data = build_revdmp_metadata(
+            &enriched_facts,
+            &heap_ptr_locs,
+            stub_generator.heap_edges(),
+            pe.image_base,
+            &stub_generator,
+        );
+        let ida_script = build_ida_script(
+            &enriched_facts,
+            &heap_ptr_locs,
+            stub_generator.heap_edges(),
+            pe.image_base,
+            &stub_generator,
+        );
         let metadata_section_va = PeParser::align_up(
             heap_section_va as usize + heap_section_size,
             pe.section_alignment as usize,
@@ -416,7 +814,8 @@ impl Dumper {
         progress.total = output.len();
         report(&progress);
 
-        self.write_output(output_path, &output)?;
+        self.write_output(output_path.as_ref(), &output)?;
+        self.write_ida_script(output_path.as_ref(), &ida_script)?;
 
         progress.stage = ProgressStage::Complete;
         progress.current = progress.total;
@@ -996,6 +1395,15 @@ impl Dumper {
         Ok(())
     }
 
+    fn write_ida_script(&self, output_path: &Path, script: &str) -> Result<()> {
+        let script_path = ida_script_path(output_path);
+        let mut file =
+            File::create(&script_path).map_err(|e| Error::OutputCreationFailed(e.to_string()))?;
+        file.write_all(script.as_bytes())
+            .map_err(|e| Error::OutputWriteFailed(e.to_string()))?;
+        Ok(())
+    }
+
     /// Get module name.
     pub fn module_name(&self) -> &str {
         &self.module_name
@@ -1015,6 +1423,7 @@ impl Dumper {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stub::{VtableRef, VtableStub};
 
     #[test]
     fn test_dump_config_default() {
@@ -1032,27 +1441,145 @@ mod tests {
     #[test]
     fn test_revdmp_metadata_lists_heap_only_and_sourced_facts() {
         let facts = vec![
-            VtableFact {
+            EnrichedVtableFact {
+                type_name: Some("AudioService".to_string()),
+                fact: VtableFact {
+                    source_rva: Some(0x2000),
+                    heap_addr: 0x1000_0000,
+                    stub_rva: 0x8000,
+                    vfptr_offset: 0x20,
+                    vtable_rva: 0x5000,
+                },
+            },
+            EnrichedVtableFact {
+                type_name: None,
+                fact: VtableFact {
+                    source_rva: None,
+                    heap_addr: 0x2000_0000,
+                    stub_rva: 0x9000,
+                    vfptr_offset: 0,
+                    vtable_rva: 0x7000,
+                },
+            },
+        ];
+        let stub_generator = StubGenerator::from_test_stubs(
+            0x1400_0000,
+            0x100000,
+            vec![VtableStub {
+                original_addr: 0x1000_0000,
+                size: 0x28,
+                data: vec![0; 0x28],
+                new_rva: 0x8000,
+                vtable_refs: vec![VtableRef {
+                    offset: 0x20,
+                    vtable_rva: 0x5000,
+                }],
+                vfptr_offsets: [0x20].into_iter().collect(),
+            }],
+        );
+
+        let metadata = build_revdmp_metadata(
+            &facts,
+            &[(0x2000, 0x1000_0000)],
+            &[HeapPointerEdge {
+                source_heap_addr: 0x1000_0000,
+                field_offset: 0x18,
+                target_heap_addr: 0x2000_0000,
+            }],
+            0x1400_0000,
+            &stub_generator,
+        );
+        let text = String::from_utf8(metadata).unwrap();
+        assert!(text.contains("REVDMP_VTABLE_FACTS v1"));
+        assert!(text.contains("0x2000,0x10000000,0x8000,0x20,0x5000,0x14005000,AudioService"));
+        assert!(text.contains("heap,0x20000000,0x9000,0x0,0x7000,0x14007000,"));
+        assert!(text.contains("REVDMP_OBJECT_GRAPH v1"));
+        assert!(text.contains("global,0x2000,,,0x0,0x10000000,0x8000"));
+        assert!(text.contains("heap,,0x10000000,0x8000,0x18,0x20000000,"));
+        assert!(text.contains("REVDMP_SYNTHETIC_STRUCTS v1"));
+    }
+
+    #[test]
+    fn test_itanium_rtti_type_name_resolution() {
+        let mut module = vec![0u8; 0x1000];
+        let image_base = module.as_ptr() as u64;
+        let vtable_rva = 0x300u32;
+        let typeinfo_rva = 0x500u32;
+        let name_rva = 0x600u32;
+
+        module[vtable_rva as usize - 8..vtable_rva as usize]
+            .copy_from_slice(&(image_base + typeinfo_rva as u64).to_le_bytes());
+        module[typeinfo_rva as usize + 8..typeinfo_rva as usize + 16]
+            .copy_from_slice(&(image_base + name_rva as u64).to_le_bytes());
+        module[name_rva as usize..name_rva as usize + 15].copy_from_slice(b"12AudioService\0");
+
+        let pe = PeParser {
+            base: module.as_ptr(),
+            size: module.len(),
+            pe_offset: 0,
+            machine: 0x8664,
+            number_of_sections: 0,
+            time_date_stamp: 0,
+            pointer_to_symbol_table: 0,
+            number_of_symbols: 0,
+            size_of_optional_header: 0,
+            characteristics: 0,
+            image_base,
+            section_alignment: 0x1000,
+            file_alignment: 0x200,
+            size_of_image: module.len() as u32,
+            size_of_headers: 0,
+            is_64bit: true,
+            optional_header_raw: Vec::new(),
+            coff_symbol_table_raw: Vec::new(),
+            sections: Vec::new(),
+        };
+
+        assert_eq!(
+            resolve_vtable_type_name(&pe, vtable_rva).as_deref(),
+            Some("AudioService")
+        );
+    }
+
+    #[test]
+    fn test_ida_script_contains_offsets_names_structs_and_edges() {
+        let stub_generator = StubGenerator::from_test_stubs(
+            0x1400_0000,
+            0x100000,
+            vec![VtableStub {
+                original_addr: 0x1000_0000,
+                size: 0x28,
+                data: vec![0; 0x28],
+                new_rva: 0x8000,
+                vtable_refs: vec![VtableRef {
+                    offset: 0x20,
+                    vtable_rva: 0x5000,
+                }],
+                vfptr_offsets: [0x20].into_iter().collect(),
+            }],
+        );
+        let facts = vec![EnrichedVtableFact {
+            type_name: Some("AudioService".to_string()),
+            fact: VtableFact {
                 source_rva: Some(0x2000),
                 heap_addr: 0x1000_0000,
                 stub_rva: 0x8000,
                 vfptr_offset: 0x20,
                 vtable_rva: 0x5000,
             },
-            VtableFact {
-                source_rva: None,
-                heap_addr: 0x2000_0000,
-                stub_rva: 0x9000,
-                vfptr_offset: 0,
-                vtable_rva: 0x7000,
-            },
-        ];
+        }];
 
-        let metadata = build_revdmp_metadata(&facts, 0x1400_0000);
-        let text = String::from_utf8(metadata).unwrap();
-        assert!(text.contains("REVDMP_VTABLE_FACTS v1"));
-        assert!(text.contains("0x2000,0x10000000,0x8000,0x20,0x5000,0x14005000"));
-        assert!(text.contains("heap,0x20000000,0x9000,0x0,0x7000,0x14007000"));
+        let script = build_ida_script(
+            &facts,
+            &[(0x2000, 0x1000_0000)],
+            &[],
+            0x1400_0000,
+            &stub_generator,
+        );
+        assert!(script.contains("make_struct('revdump_obj_8000'"));
+        assert!(script.contains("qword_off(0x14008020, 0x14005000)"));
+        assert!(script.contains("vftable_AudioService"));
+        assert!(script.contains("qword_off(0x14002000, 0x14008000)"));
     }
 
     #[test]
@@ -1101,7 +1628,10 @@ mod tests {
         };
 
         let table = build_output_coff_string_table(&pe);
-        assert_eq!(u32::from_le_bytes(table[0..4].try_into().unwrap()) as usize, table.len());
+        assert_eq!(
+            u32::from_le_bytes(table[0..4].try_into().unwrap()) as usize,
+            table.len()
+        );
         assert!(table[4..].starts_with(b".sec01\0"));
     }
 

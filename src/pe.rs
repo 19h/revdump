@@ -21,8 +21,7 @@ pub const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
 
 /// Default characteristics for the synthetic .heap section.
 /// Readable data section (no execute since it's just vtable pointers).
-pub const HEAP_SECTION_CHARACTERISTICS: u32 =
-    IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ;
+pub const HEAP_SECTION_CHARACTERISTICS: u32 = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ;
 
 /// DOS header (64 bytes).
 #[repr(C, packed)]
@@ -379,19 +378,18 @@ impl PeParser {
         let symbol_table_offset = pointer_to_symbol_table as usize;
         let symbol_bytes = number_of_symbols as usize * COFF_SYMBOL_SIZE;
         let string_table_offset = symbol_table_offset.saturating_add(symbol_bytes);
-        let coff_symbol_table_raw = if pointer_to_symbol_table != 0
-            && string_table_offset + 4 <= size
-        {
-            let string_table_size = *(base.add(string_table_offset) as *const u32) as usize;
-            let total_size = symbol_bytes.saturating_add(string_table_size);
-            if symbol_table_offset + total_size <= size && total_size >= 4 {
-                std::slice::from_raw_parts(base.add(symbol_table_offset), total_size).to_vec()
+        let coff_symbol_table_raw =
+            if pointer_to_symbol_table != 0 && string_table_offset + 4 <= size {
+                let string_table_size = *(base.add(string_table_offset) as *const u32) as usize;
+                let total_size = symbol_bytes.saturating_add(string_table_size);
+                if symbol_table_offset + total_size <= size && total_size >= 4 {
+                    std::slice::from_raw_parts(base.add(symbol_table_offset), total_size).to_vec()
+                } else {
+                    Vec::new()
+                }
             } else {
                 Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
+            };
 
         // Parse section headers
         let section_header_start = opt_header_start + size_of_optional_header as usize;
@@ -437,17 +435,17 @@ impl PeParser {
     pub fn last_section_end(&self) -> u32 {
         self.sections
             .iter()
-            .map(|s| {
-                s.virtual_address
-                    + s.virtual_size.max(s.size_of_raw_data)
-            })
+            .map(|s| s.virtual_address + s.virtual_size.max(s.size_of_raw_data))
             .max()
             .unwrap_or(self.size_of_headers)
     }
 
     /// Compute the VA for a new section (aligned to section alignment).
     pub fn next_section_va(&self) -> u32 {
-        Self::align_up(self.last_section_end() as usize, self.section_alignment as usize) as u32
+        Self::align_up(
+            self.last_section_end() as usize,
+            self.section_alignment as usize,
+        ) as u32
     }
 }
 

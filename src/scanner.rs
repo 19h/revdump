@@ -24,8 +24,8 @@ pub struct ScannerConfig {
 impl Default for ScannerConfig {
     fn default() -> Self {
         Self {
-            min_ptr: 0x10000,           // Skip NULL and low addresses
-            max_ptr: 0x7FFF_FFFF_FFFF,  // User-mode address space limit
+            min_ptr: 0x10000,          // Skip NULL and low addresses
+            max_ptr: 0x7FFF_FFFF_FFFF, // User-mode address space limit
             mod_base: 0,
             mod_end: 0,
         }
@@ -108,9 +108,8 @@ impl PointerScanner {
     ) {
         let num_qwords = buffer.len() / 8;
         // SAFETY: We're reinterpreting bytes as u64s, which is safe for aligned data
-        let qwords = unsafe {
-            std::slice::from_raw_parts(buffer.as_ptr() as *const u64, num_qwords)
-        };
+        let qwords =
+            unsafe { std::slice::from_raw_parts(buffer.as_ptr() as *const u64, num_qwords) };
 
         let min_ptr = self.config.min_ptr;
         let max_ptr = self.config.max_ptr;
@@ -227,10 +226,7 @@ impl PointerScanner {
         while v < vec_count {
             // Prefetch ahead (8 vectors = 256 bytes ahead)
             if v + 8 < vec_count {
-                _mm_prefetch(
-                    qwords.add((v + 8) * VEC_SIZE) as *const i8,
-                    _MM_HINT_T0,
-                );
+                _mm_prefetch(qwords.add((v + 8) * VEC_SIZE) as *const i8, _MM_HINT_T0);
             }
 
             // Load 4 qwords
@@ -295,10 +291,7 @@ impl PointerScanner {
         while v < vec_count {
             // Prefetch ahead
             if v + 8 < vec_count {
-                _mm_prefetch(
-                    qwords.add((v + 8) * VEC_SIZE) as *const i8,
-                    _MM_HINT_T0,
-                );
+                _mm_prefetch(qwords.add((v + 8) * VEC_SIZE) as *const i8, _MM_HINT_T0);
             }
 
             // Load 2 qwords

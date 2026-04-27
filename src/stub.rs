@@ -66,6 +66,17 @@ pub struct VtableFact {
     pub vtable_rva: u32,
 }
 
+/// A pointer edge discovered inside a heap object while recursively scanning.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct HeapPointerEdge {
+    /// Heap object that contained the pointer.
+    pub source_heap_addr: u64,
+    /// Offset inside `source_heap_addr` where the pointer was found.
+    pub field_offset: u32,
+    /// Heap object pointed to by the source field.
+    pub target_heap_addr: u64,
+}
+
 /// A minimal stub for a heap-allocated class instance.
 ///
 /// Contains only vtable pointers at the offsets where they're actually needed,
@@ -128,6 +139,8 @@ pub struct StubGenerator {
     stubs: HashMap<u64, VtableStub>,
     /// Visited addresses to avoid cycles.
     visited: HashSet<u64>,
+    /// Heap-to-heap pointer edges found during recursive scanning.
+    heap_edges: Vec<HeapPointerEdge>,
 }
 
 impl StubGenerator {
@@ -145,7 +158,25 @@ impl StubGenerator {
             region_cache,
             stubs: HashMap::with_capacity(8192),
             visited: HashSet::with_capacity(16384),
+            heap_edges: Vec::new(),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_stubs(mod_base: u64, mod_size: usize, stubs: Vec<VtableStub>) -> Self {
+        let mut map = HashMap::new();
+        for stub in stubs {
+            map.insert(stub.original_addr, stub);
+        }
+        Self {
+            mod_base,
+            mod_end: mod_base + mod_size as u64,
+            config: StubConfig::default(),
+            region_cache: MemoryRegionCache::new(),
+            stubs: map,
+            visited: HashSet::new(),
+            heap_edges: Vec::new(),
+        }
     }
 
     /// Check if an address is within the module (potential vtable).
@@ -461,7 +492,12 @@ impl StubGenerator {
                 continue;
             }
 
-            for child in self.scan_heap_object_for_heap_pointers(addr) {
+            for (field_offset, child) in self.scan_heap_object_for_heap_pointers(addr) {
+                self.heap_edges.push(HeapPointerEdge {
+                    source_heap_addr: addr,
+                    field_offset,
+                    target_heap_addr: child,
+                });
                 let had_stub = self.stubs.contains_key(&child);
                 if self.create_stub(child).is_some() && !had_stub {
                     discovered += 1;
@@ -476,8 +512,16 @@ impl StubGenerator {
     }
 
     /// Scan a bounded prefix of a heap allocation for qword-aligned heap pointers.
-    fn scan_heap_object_for_heap_pointers(&self, addr: u64) -> Vec<u64> {
-        let max_scan = self.config.max_heap_scan_size.max(8);
+    fn scan_heap_object_for_heap_pointers(&self, addr: u64) -> Vec<(u32, u64)> {
+        let region_remaining = self
+            .region_cache
+            .get_region(addr)
+            .map(|r| (r.end_addr - addr) as usize)
+            .unwrap_or(self.config.max_heap_scan_size);
+        let max_scan = self.config.max_heap_scan_size.max(8).min(region_remaining) & !7usize;
+        if max_scan < 8 {
+            return Vec::new();
+        }
         let mut read_size = max_scan;
         let mut buf = vec![0u8; read_size];
 
@@ -498,9 +542,9 @@ impl StubGenerator {
 
         let mut results = Vec::new();
         let mut seen = HashSet::new();
-        for &val in qwords {
+        for (idx, &val) in qwords.iter().enumerate() {
             if seen.insert(val) && self.is_valid_heap_ptr(val) {
-                results.push(val);
+                results.push(((idx * 8) as u32, val));
             }
         }
 
@@ -674,6 +718,11 @@ impl StubGenerator {
         self.stubs.get(&addr)
     }
 
+    /// Get heap-to-heap pointer edges found during recursive scanning.
+    pub fn heap_edges(&self) -> &[HeapPointerEdge] {
+        &self.heap_edges
+    }
+
     /// Get scanner config.
     pub fn scanner_config(&self) -> ScannerConfig {
         ScannerConfig {
@@ -731,6 +780,7 @@ mod tests {
             region_cache: MemoryRegionCache::new(),
             stubs: HashMap::new(),
             visited: HashSet::new(),
+            heap_edges: Vec::new(),
         };
 
         generator.stubs.insert(
@@ -762,6 +812,7 @@ mod tests {
             region_cache: MemoryRegionCache::new(),
             stubs: HashMap::new(),
             visited: HashSet::new(),
+            heap_edges: Vec::new(),
         };
 
         generator.stubs.insert(
@@ -832,11 +883,17 @@ mod tests {
             region_cache: cache,
             stubs: HashMap::new(),
             visited: HashSet::new(),
+            heap_edges: Vec::new(),
         };
 
         let discovered = generator.discover_recursive_stubs(&[(0xA000, parent_addr)]);
         assert_eq!(discovered, 1);
         assert!(generator.get_stub(child_addr).is_some());
+        assert!(generator.heap_edges().iter().any(|edge| {
+            edge.source_heap_addr == parent_addr
+                && edge.field_offset == 0
+                && edge.target_heap_addr == child_addr
+        }));
 
         drop(parent);
         drop(child);

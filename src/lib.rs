@@ -30,29 +30,29 @@
 #![warn(rust_2018_idioms)]
 #![allow(clippy::too_many_arguments)]
 
-pub mod error;
-pub mod pe;
-pub mod memory;
-pub mod scanner;
-pub mod stub;
-pub mod dumper;
-pub mod fixup;
 pub mod console;
 pub mod devirt;
+pub mod dumper;
+pub mod error;
+pub mod fixup;
+pub mod memory;
+pub mod pe;
+pub mod scanner;
+pub mod stub;
 
-pub use error::{Error, Result};
-pub use dumper::{DumpConfig, Dumper, ProgressCallback, ProgressInfo, ProgressStage};
-pub use pe::PeParser;
 pub use console::{start_console, stop_console};
 pub use devirt::{DevirtConfig, DevirtStats};
+pub use dumper::{DumpConfig, Dumper, ProgressCallback, ProgressInfo, ProgressStage};
+pub use error::{Error, Result};
+pub use pe::PeParser;
 
 /// Perform an automatic dump of the main executable.
 #[cfg(target_os = "windows")]
 pub fn auto_dump() {
+    use windows::core::PCSTR;
+    use windows::Win32::System::LibraryLoader::GetModuleHandleA;
     use windows::Win32::System::ProcessStatus::{GetModuleInformation, MODULEINFO};
     use windows::Win32::System::Threading::GetCurrentProcess;
-    use windows::Win32::System::LibraryLoader::GetModuleHandleA;
-    use windows::core::PCSTR;
 
     eprintln!("[revdump] Auto-dump mode enabled");
 
@@ -76,7 +76,9 @@ pub fn auto_dump() {
             &mut info,
             std::mem::size_of::<MODULEINFO>() as u32,
         )
-    }.is_err() {
+    }
+    .is_err()
+    {
         eprintln!("[revdump] Failed to get module info");
         return;
     }
@@ -84,7 +86,10 @@ pub fn auto_dump() {
     let base = info.lpBaseOfDll as *const u8;
     let size = info.SizeOfImage as usize;
 
-    eprintln!("[revdump] Module base: 0x{:X}, size: 0x{:X}", base as u64, size);
+    eprintln!(
+        "[revdump] Module base: 0x{:X}, size: 0x{:X}",
+        base as u64, size
+    );
 
     // Configure dump with devirt enabled
     let mut config = DumpConfig::default();
@@ -103,7 +108,9 @@ pub fn auto_dump() {
     // Try reading first bytes
     if readable {
         let mut buf = [0u8; 16];
-        unsafe { std::ptr::copy_nonoverlapping(text_addr, buf.as_mut_ptr(), 16); }
+        unsafe {
+            std::ptr::copy_nonoverlapping(text_addr, buf.as_mut_ptr(), 16);
+        }
         eprintln!("[revdump] .text first 16 bytes: {:02x?}", buf);
     }
 

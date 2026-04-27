@@ -40,7 +40,7 @@ const HEAP_OBJ_B: u64 = 0x7D00_CB27_1000;
 const HEAP_OBJ_MI: u64 = 0x7C80_EA05_A900; // Multiple inheritance object
 
 // Global locations in .data (RVAs)
-const GLOBAL_A_RVA: u32 = DATA_RVA + 0x28;  // qword_149FEB028 equivalent
+const GLOBAL_A_RVA: u32 = DATA_RVA + 0x28; // qword_149FEB028 equivalent
 const GLOBAL_B_RVA: u32 = DATA_RVA + 0x30;
 const GLOBAL_MI_RVA: u32 = DATA_RVA + 0x38;
 
@@ -80,8 +80,10 @@ fn test_stub_creation_logic() {
     let vtable_ptr = heap_obj_a.vtable;
 
     // Verify vtable pointer is in module range
-    assert!(vtable_ptr >= MODULE_BASE && vtable_ptr < MODULE_BASE + MODULE_SIZE as u64,
-        "Vtable pointer should be within module");
+    assert!(
+        vtable_ptr >= MODULE_BASE && vtable_ptr < MODULE_BASE + MODULE_SIZE as u64,
+        "Vtable pointer should be within module"
+    );
 
     // This is what the stub would contain - just the vtable pointer
     let stub_data: [u8; 8] = vtable_ptr.to_le_bytes();
@@ -147,8 +149,14 @@ fn test_multiple_inheritance_stub() {
 
     println!("Multiple inheritance test passed:");
     println!("  Heap object at: 0x{:X}", HEAP_OBJ_MI);
-    println!("  Primary vtable at offset 0: 0x{:X}", heap_obj_mi.vtable_primary);
-    println!("  Secondary vtable at offset 16: 0x{:X}", heap_obj_mi.vtable_secondary);
+    println!(
+        "  Primary vtable at offset 0: 0x{:X}",
+        heap_obj_mi.vtable_primary
+    );
+    println!(
+        "  Secondary vtable at offset 16: 0x{:X}",
+        heap_obj_mi.vtable_secondary
+    );
     println!("  Stub size: {} bytes", stub_size);
 }
 
@@ -181,22 +189,24 @@ fn test_fixup_generation() {
 
     // Write the original heap pointer at the global's offset within .data
     let offset_in_data = (GLOBAL_A_RVA - DATA_RVA) as usize;
-    data_section[offset_in_data..offset_in_data + 8]
-        .copy_from_slice(&HEAP_OBJ_A.to_le_bytes());
+    data_section[offset_in_data..offset_in_data + 8].copy_from_slice(&HEAP_OBJ_A.to_le_bytes());
 
     // Verify original value
     let original = u64::from_le_bytes(
-        data_section[offset_in_data..offset_in_data + 8].try_into().unwrap()
+        data_section[offset_in_data..offset_in_data + 8]
+            .try_into()
+            .unwrap(),
     );
     assert_eq!(original, HEAP_OBJ_A);
 
     // Apply fixup (rewrite to point to stub)
-    data_section[offset_in_data..offset_in_data + 8]
-        .copy_from_slice(&new_value.to_le_bytes());
+    data_section[offset_in_data..offset_in_data + 8].copy_from_slice(&new_value.to_le_bytes());
 
     // Verify fixed value
     let fixed = u64::from_le_bytes(
-        data_section[offset_in_data..offset_in_data + 8].try_into().unwrap()
+        data_section[offset_in_data..offset_in_data + 8]
+            .try_into()
+            .unwrap(),
     );
     assert_eq!(fixed, new_value);
     assert_eq!(fixed, MODULE_BASE + stub_rva as u64);
@@ -229,8 +239,14 @@ fn test_vtable_resolution_simulation() {
     let global_value_runtime = HEAP_OBJ_A;
 
     println!("Runtime state:");
-    println!("  qword_global = 0x{:X} (points to heap)", global_value_runtime);
-    println!("  heap[0x{:X}].vtable = 0x{:X}", HEAP_OBJ_A, heap_obj.vtable);
+    println!(
+        "  qword_global = 0x{:X} (points to heap)",
+        global_value_runtime
+    );
+    println!(
+        "  heap[0x{:X}].vtable = 0x{:X}",
+        HEAP_OBJ_A, heap_obj.vtable
+    );
     println!("  vtable[0x{:X}].func1 = 0x{:X}", VTABLE_A, vtable_a.func1);
 
     // === DUMPER ACTIONS ===
@@ -282,15 +298,23 @@ fn test_vtable_resolution_simulation() {
     println!("  qword_global (after dump) = 0x{:X}", global_value_dumped);
     println!("  *qword_global (stub content) = 0x{:X}", stub_content);
     println!("  *qword_global + 0x10 = 0x{:X}", vtable_entry_addr);
-    println!("  This resolves to vtable entry at 0x{:X}", expected_vtable_entry);
+    println!(
+        "  This resolves to vtable entry at 0x{:X}",
+        expected_vtable_entry
+    );
 
     // The key verification: vtable pointer is in .rdata, resolvable by IDA
     let vtable_rva = (stub_content - MODULE_BASE) as u32;
-    assert!(vtable_rva >= RDATA_RVA && vtable_rva < DATA_RVA,
-        "Vtable should be in .rdata section");
+    assert!(
+        vtable_rva >= RDATA_RVA && vtable_rva < DATA_RVA,
+        "Vtable should be in .rdata section"
+    );
 
     println!("\n=== TEST PASSED ===");
-    println!("Vtable at RVA 0x{:X} is in .rdata, IDA can resolve vcalls!", vtable_rva);
+    println!(
+        "Vtable at RVA 0x{:X} is in .rdata, IDA can resolve vcalls!",
+        vtable_rva
+    );
 }
 
 /// Test that non-vtable heap pointers are filtered out
@@ -300,17 +324,20 @@ fn test_non_vtable_filtering() {
     let not_a_vtable: u64 = 0x4141414141414141; // "AAAAAAAA"
 
     // This should NOT be in module range
-    let is_in_module = not_a_vtable >= MODULE_BASE
-        && not_a_vtable < MODULE_BASE + MODULE_SIZE as u64;
+    let is_in_module =
+        not_a_vtable >= MODULE_BASE && not_a_vtable < MODULE_BASE + MODULE_SIZE as u64;
 
     assert!(!is_in_module, "Random data should not look like vtable");
 
     // A heap pointer to another heap region (not a vtable)
     let heap_to_heap: u64 = 0x7D00_0000_0000;
-    let is_in_module_2 = heap_to_heap >= MODULE_BASE
-        && heap_to_heap < MODULE_BASE + MODULE_SIZE as u64;
+    let is_in_module_2 =
+        heap_to_heap >= MODULE_BASE && heap_to_heap < MODULE_BASE + MODULE_SIZE as u64;
 
-    assert!(!is_in_module_2, "Heap-to-heap pointer should not be treated as vtable");
+    assert!(
+        !is_in_module_2,
+        "Heap-to-heap pointer should not be treated as vtable"
+    );
 
     println!("Non-vtable filtering test passed");
 }
@@ -326,14 +353,23 @@ fn test_stub_size_minimal() {
     let max_offset = *mi_offsets.iter().max().unwrap();
     let mi_stub_size = ((max_offset + 8 + 7) / 8) * 8;
 
-    assert_eq!(single_stub_size, 8, "Single inheritance stub should be 8 bytes");
-    assert_eq!(mi_stub_size, 24, "MI stub should be 24 bytes (0, 8 padding, 16)");
+    assert_eq!(
+        single_stub_size, 8,
+        "Single inheritance stub should be 8 bytes"
+    );
+    assert_eq!(
+        mi_stub_size, 24,
+        "MI stub should be 24 bytes (0, 8 padding, 16)"
+    );
 
     // Compare to full object dump (what we DON'T want)
     let full_object_size = std::mem::size_of::<SimHeapObjectSingle>();
-    assert!(single_stub_size < full_object_size,
+    assert!(
+        single_stub_size < full_object_size,
         "Stub ({} bytes) should be smaller than full object ({} bytes)",
-        single_stub_size, full_object_size);
+        single_stub_size,
+        full_object_size
+    );
 
     println!("Stub size test passed:");
     println!("  Single inheritance stub: {} bytes", single_stub_size);
