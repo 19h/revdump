@@ -179,6 +179,27 @@ impl MemoryRegionCache {
         }
     }
 
+    /// Check if an address is within a heap region already present in the cache.
+    ///
+    /// Unlike `is_valid_heap_region`, this never falls back to `VirtualQuery`. Use it
+    /// in high-volume scans where a cache miss should be treated as a fast reject.
+    #[inline]
+    pub fn is_cached_heap_region(&self, addr: u64) -> bool {
+        if !self.initialized || self.regions.is_empty() {
+            return false;
+        }
+
+        let idx = self.regions.partition_point(|r| r.base_addr <= addr);
+        if idx > 0 {
+            let region = &self.regions[idx - 1];
+            if addr < region.end_addr {
+                return region.valid && region.is_heap;
+            }
+        }
+
+        false
+    }
+
     /// Direct VirtualQuery check for a specific address.
     #[cfg(target_os = "windows")]
     fn query_heap_region_direct(&self, addr: u64) -> bool {

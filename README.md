@@ -130,8 +130,8 @@ revdump list-modules
 revdump dump \
   --module target.exe \
   --output out.exe \
-  --max-depth 16 \
-  --max-region-size 131072 \
+  --max-depth 2 \
+  --max-region-size 4096 \
   --skip-sections 0,1 \
   --devirt \
   --strong-devirt \
@@ -190,8 +190,8 @@ Auto-dump uses `DumpConfig::default()` plus devirtualization enabled by the libr
 |---------|---------|-------------|
 | `target <module>` | `module`, `t` | Set target module to dump |
 | `output <path>` | `out`, `o` | Set output file path |
-| `depth <n>` | `d` | Set max pointer chain depth (default: 8) |
-| `regionsize <kb>` | `region`, `r` | Set max region size in KB (default: 64) |
+| `depth <n>` | `d` | Set recursive heap scan depth (default: 2) |
+| `regionsize <kb>` | `region`, `r` | Set max heap bytes scanned per object in KB (default: 4) |
 | `skipcode` | `sc` | Toggle skip .text section |
 | `skipsections <n,n>` | `ss` | Set section indices to skip |
 | `devirt` | `dv` | Toggle vcall devirtualization |

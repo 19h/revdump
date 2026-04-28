@@ -253,6 +253,14 @@ impl StubGenerator {
         probe_memory_byte(val as *const u8)
     }
 
+    #[inline]
+    fn is_cached_heap_ptr(&self, val: u64) -> bool {
+        val >= self.config.min_ptr_value
+            && val <= self.config.max_ptr_value
+            && !self.is_in_module(val)
+            && self.region_cache.is_cached_heap_region(val)
+    }
+
     /// Debug: Check why a specific pointer might be rejected.
     #[allow(dead_code)]
     pub fn debug_check_pointer(&self, val: u64) -> String {
@@ -530,11 +538,19 @@ impl StubGenerator {
         let mut scanned = HashSet::new();
         let mut discovered = 0usize;
 
+        let mut queued = HashSet::new();
         for &(_, heap_addr) in heap_ptr_locs {
-            queue.push_back((heap_addr, 0usize));
+            if queued.insert(heap_addr) {
+                queue.push_back((heap_addr, 0usize));
+            }
         }
 
         while let Some((addr, depth)) = queue.pop_front() {
+            if self.config.max_graph_edges > 0
+                && self.heap_edges.len() >= self.config.max_graph_edges
+            {
+                break;
+            }
             if depth >= self.config.recursive_heap_scan_depth {
                 continue;
             }
@@ -546,6 +562,11 @@ impl StubGenerator {
             }
 
             for (field_offset, child) in self.scan_heap_object_for_heap_pointers(addr) {
+                if self.config.max_graph_edges > 0
+                    && self.heap_edges.len() >= self.config.max_graph_edges
+                {
+                    break;
+                }
                 self.heap_edges.push(HeapPointerEdge {
                     source_heap_addr: addr,
                     field_offset,
@@ -558,7 +579,7 @@ impl StubGenerator {
                 if self.create_stub(child).is_some() && !had_stub {
                     discovered += 1;
                 }
-                if !scanned.contains(&child) {
+                if !scanned.contains(&child) && queued.insert(child) {
                     queue.push_back((child, depth + 1));
                 }
             }
@@ -797,7 +818,7 @@ impl StubGenerator {
         let mut results = Vec::new();
         let mut seen = HashSet::new();
         for (idx, &val) in qwords.iter().enumerate() {
-            if seen.insert(val) && self.is_valid_heap_ptr(val) {
+            if seen.insert(val) && self.is_cached_heap_ptr(val) {
                 results.push(((idx * 8) as u32, val));
             }
         }

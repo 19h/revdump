@@ -135,7 +135,7 @@ impl PointerScanner {
             for j in 0..4 {
                 let val = qwords[i + j];
                 if Self::is_candidate(val, min_ptr, max_ptr, mod_base, mod_end)
-                    && cache.is_valid_heap_region(val)
+                    && cache.is_cached_heap_region(val)
                 {
                     let rva = base_rva + ((i + j) * 8) as u32;
                     results.push((rva, val));
@@ -148,7 +148,7 @@ impl PointerScanner {
         while i < num_qwords {
             let val = qwords[i];
             if Self::is_candidate(val, min_ptr, max_ptr, mod_base, mod_end)
-                && cache.is_valid_heap_region(val)
+                && cache.is_cached_heap_region(val)
             {
                 let rva = base_rva + (i * 8) as u32;
                 results.push((rva, val));
@@ -239,7 +239,7 @@ impl PointerScanner {
 
             for (j, &val) in extracted.iter().enumerate() {
                 if Self::is_candidate(val, min_ptr, max_ptr, mod_base, mod_end)
-                    && cache.is_valid_heap_region(val)
+                    && cache.is_cached_heap_region(val)
                 {
                     let rva = base_rva + ((v * VEC_SIZE + j) * 8) as u32;
                     results.push((rva, val));
@@ -254,7 +254,7 @@ impl PointerScanner {
         for i in remaining_start..num_qwords {
             let val = *qwords.add(i);
             if Self::is_candidate(val, min_ptr, max_ptr, mod_base, mod_end)
-                && cache.is_valid_heap_region(val)
+                && cache.is_cached_heap_region(val)
             {
                 let rva = base_rva + (i * 8) as u32;
                 results.push((rva, val));
@@ -303,7 +303,7 @@ impl PointerScanner {
 
             for (j, &val) in extracted.iter().enumerate() {
                 if Self::is_candidate(val, min_ptr, max_ptr, mod_base, mod_end)
-                    && cache.is_valid_heap_region(val)
+                    && cache.is_cached_heap_region(val)
                 {
                     let rva = base_rva + ((v * VEC_SIZE + j) * 8) as u32;
                     results.push((rva, val));
@@ -318,7 +318,7 @@ impl PointerScanner {
         for i in remaining_start..num_qwords {
             let val = *qwords.add(i);
             if Self::is_candidate(val, min_ptr, max_ptr, mod_base, mod_end)
-                && cache.is_valid_heap_region(val)
+                && cache.is_cached_heap_region(val)
             {
                 let rva = base_rva + (i * 8) as u32;
                 results.push((rva, val));

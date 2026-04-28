@@ -34,12 +34,12 @@ enum Commands {
         #[arg(short, long)]
         output: PathBuf,
 
-        /// Maximum pointer chain depth
-        #[arg(long, default_value = "8")]
+        /// Maximum recursive heap pointer scan depth
+        #[arg(long, default_value = "2")]
         max_depth: usize,
 
-        /// Maximum region size to dump (in bytes)
-        #[arg(long, default_value = "65536")]
+        /// Maximum bytes to scan per heap object for embedded pointers
+        #[arg(long, default_value = "4096")]
         max_region_size: usize,
 
         /// Skip the code section (.text)
@@ -196,7 +196,6 @@ fn dump_with_heap(
 
     let pb_clone = pb.clone();
     let config = DumpConfig {
-        max_vfptr_probe: max_depth * 8, // Convert depth to probe size
         max_heap_scan_size: max_region_size,
         recursive_heap_scan_depth: max_depth,
         skip_sections,

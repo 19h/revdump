@@ -46,9 +46,9 @@ pub struct Console {
     target_module: String,
     /// Output directory path.
     output_path: String,
-    /// Max pointer chain depth.
+    /// Max recursive heap scan depth.
     max_depth: usize,
-    /// Max region size.
+    /// Max bytes to scan per heap object.
     max_region_size: usize,
     /// Skip code section (.text).
     skip_code: bool,
@@ -81,8 +81,8 @@ impl Console {
             should_exit: Arc::new(AtomicBool::new(false)),
             target_module,
             output_path,
-            max_depth: 8,
-            max_region_size: 0x10000,
+            max_depth: 2,
+            max_region_size: 0x1000,
             skip_code: false,
             skip_sections: Vec::new(),
             devirt: false,
@@ -360,8 +360,8 @@ impl ConsoleState {
         println!("  [Configuration]");
         println!("    module, target, t    - Set target module to dump");
         println!("    output, out, o       - Set output file path");
-        println!("    depth, d             - Set max pointer chain depth");
-        println!("    regionsize, r        - Set max region size");
+        println!("    depth, d             - Set recursive heap scan depth");
+        println!("    regionsize, r        - Set max heap scan size");
         println!("    skipcode, sc         - Toggle skip code section");
         println!("    skipsections, ss     - Set sections to skip");
         println!("    devirt, dv           - Toggle vcall devirtualization");
@@ -395,9 +395,9 @@ impl ConsoleState {
         println!("=== Current Settings ===");
         println!("  Target Module:    {}", self.target_module);
         println!("  Output Path:      {}", self.output_path);
-        println!("  Max Depth:        {}", self.max_depth);
+        println!("  Recursive Depth:  {}", self.max_depth);
         println!(
-            "  Max Region Size:  0x{:X} ({} KB)",
+            "  Heap Scan Size:   0x{:X} ({} KB)",
             self.max_region_size,
             self.max_region_size / 1024
         );
@@ -540,7 +540,7 @@ impl ConsoleState {
     }
 
     fn cmd_set_depth(&mut self) {
-        print!("Max pointer chain depth [{}]: ", self.max_depth);
+        print!("Recursive heap scan depth [{}]: ", self.max_depth);
         let _ = io::stdout().flush();
 
         let mut input = String::new();
@@ -554,11 +554,14 @@ impl ConsoleState {
 
     fn cmd_set_region_size(&mut self) {
         println!(
-            "Current max region size: 0x{:X} ({} KB)",
+            "Current max heap scan size: 0x{:X} ({} KB)",
             self.max_region_size,
             self.max_region_size / 1024
         );
-        print!("Max region size in KB [{}]: ", self.max_region_size / 1024);
+        print!(
+            "Max heap scan size in KB [{}]: ",
+            self.max_region_size / 1024
+        );
         let _ = io::stdout().flush();
 
         let mut input = String::new();
@@ -568,7 +571,7 @@ impl ConsoleState {
             }
         }
         println!(
-            "[OK] Max region size set to: 0x{:X} ({} KB)",
+            "[OK] Max heap scan size set to: 0x{:X} ({} KB)",
             self.max_region_size,
             self.max_region_size / 1024
         );
@@ -754,8 +757,8 @@ impl ConsoleState {
 
         println!();
         println!("Settings:");
-        println!("  Max Depth: {}", self.max_depth);
-        println!("  Max Region Size: 0x{:X}", self.max_region_size);
+        println!("  Recursive Depth: {}", self.max_depth);
+        println!("  Heap Scan Size: 0x{:X}", self.max_region_size);
         println!("  Skip Code: {}", if self.skip_code { "Yes" } else { "No" });
         println!("  Devirtualize: {}", if self.devirt { "Yes" } else { "No" });
         println!(
@@ -846,7 +849,6 @@ impl ConsoleState {
         }
 
         let config = DumpConfig {
-            max_vfptr_probe: self.max_depth * 8, // Convert depth to probe size
             max_heap_scan_size: self.max_region_size,
             recursive_heap_scan_depth: self.max_depth,
             skip_sections,
@@ -975,7 +977,7 @@ impl ConsoleState {
         let stub_config = StubConfig {
             min_ptr_value: 0x10000,
             max_ptr_value: 0x7FFF_FFFF_FFFF,
-            max_vfptr_probe: self.max_depth * 8,
+            max_vfptr_probe: StubConfig::default().max_vfptr_probe,
             max_heap_scan_size: self.max_region_size,
             recursive_heap_scan_depth: self.max_depth,
             max_graph_edges: self.max_graph_edges,
