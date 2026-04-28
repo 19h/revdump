@@ -3,6 +3,7 @@
 //! This module handles creating and applying fixups that rewrite pointers
 //! from their runtime values to their new locations in the dumped PE.
 
+use crate::memory::strip_pointer_tags;
 use crate::stub::StubGenerator;
 
 /// The kind of pointer fixup.
@@ -60,6 +61,7 @@ pub fn generate_fixups(
     // These are the original pointers in module sections that point to heap objects.
     // We rewrite them to point to our minimal vtable stubs.
     for &(rva, target_addr) in heap_ptr_locs {
+        let target_addr = strip_pointer_tags(target_addr);
         if let Some(stub) = stub_generator.get_stub(target_addr) {
             fixups.push(PointerFixup {
                 kind: FixupKind::ModuleToStub,

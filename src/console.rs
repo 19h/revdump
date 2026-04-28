@@ -33,6 +33,8 @@ use windows::Win32::System::Threading::GetCurrentProcess;
 #[cfg(target_os = "windows")]
 use crate::dumper::{DumpConfig, Dumper, ProgressInfo, ProgressStage};
 #[cfg(target_os = "windows")]
+use crate::memory::strip_pointer_tags;
+#[cfg(target_os = "windows")]
 use crate::stub::EdgeConfidence;
 
 /// Console state and settings.
@@ -1012,7 +1014,9 @@ impl ConsoleState {
 
             // Simple scan for pointers
             for offset in (0..sec_data.len().saturating_sub(8)).step_by(8) {
-                let ptr = u64::from_le_bytes(sec_data[offset..offset + 8].try_into().unwrap());
+                let ptr = strip_pointer_tags(u64::from_le_bytes(
+                    sec_data[offset..offset + 8].try_into().unwrap(),
+                ));
 
                 if ptr >= scanner_config.min_ptr
                     && ptr <= scanner_config.max_ptr

@@ -26,7 +26,7 @@
 //! ```
 
 use crate::error::Result;
-use crate::memory::{probe_memory_byte, safe_read_memory, MemoryRegionCache};
+use crate::memory::{probe_memory_byte, safe_read_memory, strip_pointer_tags, MemoryRegionCache};
 use crate::scanner::ScannerConfig;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -235,12 +235,14 @@ impl StubGenerator {
     /// Check if an address is within the module (potential vtable).
     #[inline]
     pub fn is_in_module(&self, addr: u64) -> bool {
+        let addr = strip_pointer_tags(addr);
         addr >= self.mod_base && addr < self.mod_end
     }
 
     /// Check if a value looks like a valid heap pointer.
     #[inline]
     pub fn is_valid_heap_ptr(&self, val: u64) -> bool {
+        let val = strip_pointer_tags(val);
         if val < self.config.min_ptr_value || val > self.config.max_ptr_value {
             return false;
         }
@@ -255,6 +257,7 @@ impl StubGenerator {
 
     #[inline]
     fn is_cached_heap_ptr(&self, val: u64) -> bool {
+        let val = strip_pointer_tags(val);
         val >= self.config.min_ptr_value
             && val <= self.config.max_ptr_value
             && !self.is_in_module(val)
@@ -264,6 +267,8 @@ impl StubGenerator {
     /// Debug: Check why a specific pointer might be rejected.
     #[allow(dead_code)]
     pub fn debug_check_pointer(&self, val: u64) -> String {
+        let raw_val = val;
+        let val = strip_pointer_tags(val);
         let mut reasons = Vec::new();
 
         if val < self.config.min_ptr_value {
@@ -293,6 +298,8 @@ impl StubGenerator {
 
         if reasons.is_empty() {
             "VALID".to_string()
+        } else if raw_val != val {
+            format!("tagged 0x{raw_val:X} -> 0x{val:X}: {}", reasons.join(", "))
         } else {
             reasons.join(", ")
         }
@@ -331,6 +338,7 @@ impl StubGenerator {
     }
 
     fn probe_vfptr_offsets_inner(&self, addr: u64, verbose: bool) -> BTreeSet<usize> {
+        let addr = strip_pointer_tags(addr);
         let mut offsets = BTreeSet::new();
         let max_probe = self.config.max_vfptr_probe;
 
@@ -362,7 +370,8 @@ impl StubGenerator {
             );
         }
 
-        for (i, &val) in qwords.iter().enumerate() {
+        for (i, &raw_val) in qwords.iter().enumerate() {
+            let val = strip_pointer_tags(raw_val);
             // Only show first 8 qwords in verbose mode
             if verbose && i < 8 {
                 let in_module = self.is_in_module(val);
@@ -374,7 +383,7 @@ impl StubGenerator {
                 eprintln!(
                     "          [+0x{:02X}] 0x{:016X} in_module={} likely_vtable={}",
                     i * 8,
-                    val,
+                    raw_val,
                     in_module,
                     likely_vtable
                 );
@@ -390,7 +399,7 @@ impl StubGenerator {
 
         // Always include offset 0 if we found nothing (assume single inheritance)
         if offsets.is_empty() && num_qwords > 0 {
-            let first_qword = qwords[0];
+            let first_qword = strip_pointer_tags(qwords[0]);
             if self.is_in_module(first_qword) {
                 offsets.insert(0);
                 if verbose {
@@ -411,6 +420,8 @@ impl StubGenerator {
     /// The stub is sized to accommodate all vfptr offsets found, with vtable
     /// pointers placed at their original offsets.
     pub fn create_stub(&mut self, addr: u64) -> Option<&VtableStub> {
+        let addr = strip_pointer_tags(addr);
+
         // Check if already processed
         if self.visited.contains(&addr) {
             return self.stubs.get(&addr);
@@ -453,6 +464,7 @@ impl StubGenerator {
         }
 
         for &(rva, target_addr) in heap_ptr_locs {
+            let target_addr = strip_pointer_tags(target_addr);
             stats.total += 1;
 
             if verbose {
@@ -540,6 +552,7 @@ impl StubGenerator {
 
         let mut queued = HashSet::new();
         for &(_, heap_addr) in heap_ptr_locs {
+            let heap_addr = strip_pointer_tags(heap_addr);
             if queued.insert(heap_addr) {
                 queue.push_back((heap_addr, 0usize));
             }
@@ -594,7 +607,9 @@ impl StubGenerator {
     /// conservative container facts from the retained high-confidence graph.
     fn finalize_heap_graph(&mut self) {
         let mut unique: BTreeMap<(u64, u32, u64), HeapPointerEdge> = BTreeMap::new();
-        for edge in self.heap_edges.drain(..) {
+        for mut edge in self.heap_edges.drain(..) {
+            edge.source_heap_addr = strip_pointer_tags(edge.source_heap_addr);
+            edge.target_heap_addr = strip_pointer_tags(edge.target_heap_addr);
             unique
                 .entry((
                     edge.source_heap_addr,
@@ -730,6 +745,7 @@ impl StubGenerator {
     }
 
     fn detect_vector_triples(&self, source_heap_addr: u64) -> Vec<ContainerFact> {
+        let source_heap_addr = strip_pointer_tags(source_heap_addr);
         let mut facts = Vec::new();
         let region_remaining = self
             .region_cache
@@ -747,9 +763,14 @@ impl StubGenerator {
         }
 
         for off in (0..=max_scan - 24).step_by(8) {
-            let begin = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
-            let end = u64::from_le_bytes(buf[off + 8..off + 16].try_into().unwrap());
-            let cap = u64::from_le_bytes(buf[off + 16..off + 24].try_into().unwrap());
+            let begin =
+                strip_pointer_tags(u64::from_le_bytes(buf[off..off + 8].try_into().unwrap()));
+            let end = strip_pointer_tags(u64::from_le_bytes(
+                buf[off + 8..off + 16].try_into().unwrap(),
+            ));
+            let cap = strip_pointer_tags(u64::from_le_bytes(
+                buf[off + 16..off + 24].try_into().unwrap(),
+            ));
             if begin == 0
                 || end < begin
                 || cap < end
@@ -769,7 +790,7 @@ impl StubGenerator {
 
             let targets = elements
                 .chunks_exact(8)
-                .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
+                .map(|chunk| strip_pointer_tags(u64::from_le_bytes(chunk.try_into().unwrap())))
                 .filter(|addr| self.stubs.contains_key(addr))
                 .collect::<Vec<_>>();
             if targets.len() >= 2 {
@@ -788,6 +809,7 @@ impl StubGenerator {
 
     /// Scan a bounded prefix of a heap allocation for qword-aligned heap pointers.
     fn scan_heap_object_for_heap_pointers(&self, addr: u64) -> Vec<(u32, u64)> {
+        let addr = strip_pointer_tags(addr);
         let region_remaining = self
             .region_cache
             .get_region(addr)
@@ -817,7 +839,8 @@ impl StubGenerator {
 
         let mut results = Vec::new();
         let mut seen = HashSet::new();
-        for (idx, &val) in qwords.iter().enumerate() {
+        for (idx, &raw_val) in qwords.iter().enumerate() {
+            let val = strip_pointer_tags(raw_val);
             if seen.insert(val) && self.is_cached_heap_ptr(val) {
                 results.push(((idx * 8) as u32, val));
             }
@@ -832,6 +855,8 @@ impl StubGenerator {
         addr: u64,
         vfptr_offsets: BTreeSet<usize>,
     ) -> Option<&VtableStub> {
+        let addr = strip_pointer_tags(addr);
+
         // Calculate stub size: large enough to hold all vfptrs
         let max_offset = *vfptr_offsets.iter().max().unwrap_or(&0);
         let stub_size = (max_offset + 8).div_ceil(8) * 8; // Align to 8 bytes
@@ -846,11 +871,11 @@ impl StubGenerator {
             let mut vfptr_buf = [0u8; 8];
 
             if safe_read_memory(vfptr_addr as *const u8, &mut vfptr_buf) {
-                let vtable_ptr = u64::from_le_bytes(vfptr_buf);
+                let vtable_ptr = strip_pointer_tags(u64::from_le_bytes(vfptr_buf));
 
                 if self.is_in_module(vtable_ptr) {
                     // Store vtable pointer in stub at same offset
-                    data[offset..offset + 8].copy_from_slice(&vfptr_buf);
+                    data[offset..offset + 8].copy_from_slice(&vtable_ptr.to_le_bytes());
 
                     let vtable_rva = (vtable_ptr - self.mod_base) as u32;
                     vtable_refs.push(VtableRef { offset, vtable_rva });
@@ -928,6 +953,7 @@ impl StubGenerator {
     pub fn vtable_facts(&self, heap_ptr_locs: &[(u32, u64)]) -> Vec<VtableFact> {
         let mut sources_by_heap: HashMap<u64, Vec<u32>> = HashMap::new();
         for &(source_rva, heap_addr) in heap_ptr_locs {
+            let heap_addr = strip_pointer_tags(heap_addr);
             sources_by_heap
                 .entry(heap_addr)
                 .or_default()
@@ -990,6 +1016,7 @@ impl StubGenerator {
 
     /// Get a stub by original address.
     pub fn get_stub(&self, addr: u64) -> Option<&VtableStub> {
+        let addr = strip_pointer_tags(addr);
         self.stubs.get(&addr)
     }
 
@@ -1082,6 +1109,39 @@ mod tests {
         let data = generator.build_section_data(8, 0x200, image_base);
         let stored = u64::from_le_bytes(data[0..8].try_into().unwrap());
         assert_eq!(stored, image_base + vtable_rva as u64);
+    }
+
+    #[test]
+    fn test_create_stub_strips_tagged_vtable_pointer_bits() {
+        let mut module = vec![0u8; 0x1000];
+        let mod_base = module.as_mut_ptr() as u64;
+        let vtable_rva = 0x100u32;
+        let vtable = mod_base + vtable_rva as u64;
+        let tagged_vtable = 0xABCD_0000_0000_0000u64 | vtable;
+        let heap_object = Box::new([tagged_vtable]);
+        let heap_addr = heap_object.as_ptr() as u64;
+
+        let mut cache = MemoryRegionCache::new();
+        cache.add_test_region(heap_addr, 8, true);
+
+        let mut generator = StubGenerator {
+            mod_base,
+            mod_end: mod_base + module.len() as u64,
+            config: StubConfig::default(),
+            region_cache: cache,
+            stubs: HashMap::new(),
+            visited: HashSet::new(),
+            heap_edges: Vec::new(),
+            containers: Vec::new(),
+        };
+
+        let stub = generator.create_stub(heap_addr).unwrap();
+        let stored = u64::from_le_bytes(stub.data[0..8].try_into().unwrap());
+
+        assert_eq!(stored, vtable);
+        assert_eq!(stub.vtable_refs[0].vtable_rva, vtable_rva);
+
+        drop(heap_object);
     }
 
     #[test]

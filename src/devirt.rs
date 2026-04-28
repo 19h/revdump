@@ -18,7 +18,7 @@
 
 use crate::error::Result;
 use crate::fixup::SectionMapping;
-use crate::memory::safe_read_memory;
+use crate::memory::{safe_read_memory, strip_pointer_tags};
 use crate::stub::{HeapPointerEdge, VtableFact};
 
 use iced_x86::{code_asm::*, Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
@@ -661,7 +661,7 @@ impl GlobalVtableMap {
             return None;
         }
 
-        let func_ptr = u64::from_le_bytes(func_ptr_bytes);
+        let func_ptr = strip_pointer_tags(u64::from_le_bytes(func_ptr_bytes));
 
         // Convert to RVA (must be within module)
         let image_base = mod_base as u64;

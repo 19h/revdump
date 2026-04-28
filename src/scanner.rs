@@ -3,7 +3,7 @@
 //! This module provides high-performance scanning of memory buffers for potential
 //! heap pointers using SIMD instructions where available.
 
-use crate::memory::MemoryRegionCache;
+use crate::memory::{strip_pointer_tags, MemoryRegionCache};
 
 /// Result of scanning: (RVA where pointer was found, target address).
 pub type ScanResult = (u32, u64);
@@ -133,7 +133,7 @@ impl PointerScanner {
 
             // Unrolled loop
             for j in 0..4 {
-                let val = qwords[i + j];
+                let val = strip_pointer_tags(qwords[i + j]);
                 if Self::is_candidate(val, min_ptr, max_ptr, mod_base, mod_end)
                     && cache.is_cached_heap_region(val)
                 {
@@ -146,7 +146,7 @@ impl PointerScanner {
 
         // Handle remaining elements
         while i < num_qwords {
-            let val = qwords[i];
+            let val = strip_pointer_tags(qwords[i]);
             if Self::is_candidate(val, min_ptr, max_ptr, mod_base, mod_end)
                 && cache.is_cached_heap_region(val)
             {
@@ -237,7 +237,8 @@ impl PointerScanner {
             let mut extracted: [u64; 4] = [0; 4];
             _mm256_storeu_si256(extracted.as_mut_ptr() as *mut __m256i, vals);
 
-            for (j, &val) in extracted.iter().enumerate() {
+            for (j, &raw_val) in extracted.iter().enumerate() {
+                let val = strip_pointer_tags(raw_val);
                 if Self::is_candidate(val, min_ptr, max_ptr, mod_base, mod_end)
                     && cache.is_cached_heap_region(val)
                 {
@@ -252,7 +253,7 @@ impl PointerScanner {
         // Handle remaining qwords with scalar path
         let remaining_start = vec_count * VEC_SIZE;
         for i in remaining_start..num_qwords {
-            let val = *qwords.add(i);
+            let val = strip_pointer_tags(*qwords.add(i));
             if Self::is_candidate(val, min_ptr, max_ptr, mod_base, mod_end)
                 && cache.is_cached_heap_region(val)
             {
@@ -301,7 +302,8 @@ impl PointerScanner {
             let mut extracted: [u64; 2] = [0; 2];
             _mm_storeu_si128(extracted.as_mut_ptr() as *mut __m128i, vals);
 
-            for (j, &val) in extracted.iter().enumerate() {
+            for (j, &raw_val) in extracted.iter().enumerate() {
+                let val = strip_pointer_tags(raw_val);
                 if Self::is_candidate(val, min_ptr, max_ptr, mod_base, mod_end)
                     && cache.is_cached_heap_region(val)
                 {
@@ -316,7 +318,7 @@ impl PointerScanner {
         // Handle remaining
         let remaining_start = vec_count * VEC_SIZE;
         for i in remaining_start..num_qwords {
-            let val = *qwords.add(i);
+            let val = strip_pointer_tags(*qwords.add(i));
             if Self::is_candidate(val, min_ptr, max_ptr, mod_base, mod_end)
                 && cache.is_cached_heap_region(val)
             {
@@ -370,6 +372,25 @@ mod tests {
             0x1_4000_0000,
             0x1_5000_0000,
         ));
+    }
+
+    #[test]
+    fn test_scanner_strips_tagged_pointer_bits() {
+        let ptr = 0x0000_1234_5678_9000u64;
+        let tagged = 0xABCD_0000_0000_0000u64 | ptr;
+        let config = ScannerConfig {
+            min_ptr: 0x10000,
+            max_ptr: 0x7FFF_FFFF_FFFF,
+            mod_base: 0x1_4000_0000,
+            mod_end: 0x1_5000_0000,
+        };
+        let scanner = PointerScanner::new(config);
+        let mut cache = MemoryRegionCache::new();
+        cache.add_test_region(ptr, 0x1000, true);
+
+        let results = scanner.scan_buffer(&tagged.to_le_bytes(), 0x2000, &cache);
+
+        assert_eq!(results, vec![(0x2000, ptr)]);
     }
 
     #[test]

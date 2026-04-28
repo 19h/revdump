@@ -10,7 +10,7 @@
 use crate::devirt::{self, DevirtConfig, DevirtStats};
 use crate::error::{Error, Result};
 use crate::fixup::{apply_fixups, generate_fixups, SectionMapping};
-use crate::memory::is_memory_readable;
+use crate::memory::{is_memory_readable, strip_pointer_tags};
 use crate::pe::{
     FileHeader, OptionalHeader32, OptionalHeader64, PeParser, SectionHeader, SectionInfo,
     HEAP_SECTION_CHARACTERISTICS, PE_SIGNATURE,
@@ -158,6 +158,7 @@ pub fn build_revdmp_metadata(
         "source_kind,source_rva,source_heap_addr,source_stub_rva,field_offset,target_heap_addr,target_stub_rva,confidence,reason,target_has_vtable"
     );
     for &(source_rva, target_heap_addr) in heap_ptr_locs {
+        let target_heap_addr = strip_pointer_tags(target_heap_addr);
         let target_stub = stub_generator.get_stub(target_heap_addr).map(|s| s.new_rva);
         let (confidence, reason, target_has_vtable) = if target_stub.is_some() {
             ("high", "target_has_vtable", true)
@@ -390,6 +391,7 @@ fn read_c_string_at_rva(pe: &PeParser, rva: u32, max_len: usize) -> Option<Strin
 }
 
 fn ptr_to_rva(pe: &PeParser, ptr: u64) -> Option<u32> {
+    let ptr = strip_pointer_tags(ptr);
     let runtime_base = pe.base as u64;
     let image_end = pe.image_base.checked_add(pe.size as u64)?;
     let runtime_end = runtime_base.checked_add(pe.size as u64)?;
@@ -711,6 +713,7 @@ pub fn build_ida_script(
     }
 
     for &(source_rva, heap_addr) in heap_ptr_locs {
+        let heap_addr = strip_pointer_tags(heap_addr);
         let source_va = image_base + source_rva as u64;
         if let Some(stub) = stub_generator.get_stub(heap_addr) {
             let stub_va = image_base + stub.new_rva as u64;

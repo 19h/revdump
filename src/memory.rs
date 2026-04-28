@@ -5,6 +5,15 @@
 
 use crate::error::Result;
 
+/// Mask for the canonical low 48 bits of x64 pointers.
+pub const POINTER_ADDR_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+
+/// Drop tag bits from pointers before validating or dereferencing them.
+#[inline(always)]
+pub const fn strip_pointer_tags(ptr: u64) -> u64 {
+    ptr & POINTER_ADDR_MASK
+}
+
 #[cfg(target_os = "windows")]
 use std::ptr::null_mut;
 
@@ -156,6 +165,8 @@ impl MemoryRegionCache {
     /// falls back to on-demand VirtualQuery if not found.
     #[inline]
     pub fn is_valid_heap_region(&self, addr: u64) -> bool {
+        let addr = strip_pointer_tags(addr);
+
         // First try the cache (fast path)
         if self.initialized && !self.regions.is_empty() {
             let idx = self.regions.partition_point(|r| r.base_addr <= addr);
@@ -185,6 +196,8 @@ impl MemoryRegionCache {
     /// in high-volume scans where a cache miss should be treated as a fast reject.
     #[inline]
     pub fn is_cached_heap_region(&self, addr: u64) -> bool {
+        let addr = strip_pointer_tags(addr);
+
         if !self.initialized || self.regions.is_empty() {
             return false;
         }
@@ -203,6 +216,7 @@ impl MemoryRegionCache {
     /// Direct VirtualQuery check for a specific address.
     #[cfg(target_os = "windows")]
     fn query_heap_region_direct(&self, addr: u64) -> bool {
+        let addr = strip_pointer_tags(addr);
         let mut mbi = MEMORY_BASIC_INFORMATION::default();
 
         let result = unsafe {
@@ -245,6 +259,8 @@ impl MemoryRegionCache {
     /// Check if an address is within any valid region (heap or image).
     #[inline]
     pub fn is_valid_region(&self, addr: u64) -> bool {
+        let addr = strip_pointer_tags(addr);
+
         if !self.initialized || self.regions.is_empty() {
             return false;
         }
@@ -263,6 +279,8 @@ impl MemoryRegionCache {
 
     /// Get the region containing the given address, if any.
     pub fn get_region(&self, addr: u64) -> Option<&CachedRegion> {
+        let addr = strip_pointer_tags(addr);
+
         if !self.initialized || self.regions.is_empty() {
             return None;
         }
@@ -322,6 +340,7 @@ impl MemoryRegionCache {
 #[cfg(target_os = "windows")]
 #[inline]
 pub fn probe_memory_byte(addr: *const u8) -> bool {
+    let addr = strip_pointer_tags(addr as u64) as *const u8;
     let mut buf: u8 = 0;
     let mut bytes_read: usize = 0;
 
@@ -341,6 +360,7 @@ pub fn probe_memory_byte(addr: *const u8) -> bool {
 #[cfg(all(not(target_os = "windows"), test))]
 #[inline]
 pub fn probe_memory_byte(addr: *const u8) -> bool {
+    let addr = strip_pointer_tags(addr as u64) as *const u8;
     !addr.is_null()
 }
 
@@ -353,6 +373,7 @@ pub fn probe_memory_byte(_addr: *const u8) -> bool {
 /// Safely read memory from the current process.
 #[cfg(target_os = "windows")]
 pub fn safe_read_memory(src: *const u8, dst: &mut [u8]) -> bool {
+    let src = strip_pointer_tags(src as u64) as *const u8;
     if dst.is_empty() {
         return true;
     }
@@ -374,6 +395,7 @@ pub fn safe_read_memory(src: *const u8, dst: &mut [u8]) -> bool {
 
 #[cfg(all(not(target_os = "windows"), test))]
 pub fn safe_read_memory(src: *const u8, dst: &mut [u8]) -> bool {
+    let src = strip_pointer_tags(src as u64) as *const u8;
     if dst.is_empty() {
         return true;
     }
@@ -395,6 +417,7 @@ pub fn safe_read_memory(_src: *const u8, _dst: &mut [u8]) -> bool {
 /// Check if a memory range is readable.
 #[cfg(target_os = "windows")]
 pub fn is_memory_readable(addr: *const u8, size: usize) -> bool {
+    let addr = strip_pointer_tags(addr as u64) as *const u8;
     if size == 0 {
         return true;
     }
