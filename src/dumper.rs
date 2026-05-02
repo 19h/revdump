@@ -31,6 +31,31 @@ use std::process::Command;
 pub struct EnrichedVtableFact {
     pub fact: VtableFact,
     pub type_name: Option<String>,
+    msvc_rtti: Option<MsvcRttiFact>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MsvcBaseClassFact {
+    type_name: String,
+    type_descriptor_rva: u32,
+    num_contained_bases: u32,
+    mdisp: i32,
+    pdisp: i32,
+    vdisp: i32,
+    attributes: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MsvcRttiFact {
+    vtable_rva: u32,
+    col_rva: u32,
+    object_offset: u32,
+    constructor_displacement: u32,
+    type_descriptor_rva: u32,
+    type_name: String,
+    hierarchy_rva: Option<u32>,
+    hierarchy_attributes: u32,
+    base_classes: Vec<MsvcBaseClassFact>,
 }
 
 #[derive(Clone, Debug)]
@@ -293,6 +318,14 @@ pub fn build_revdmp_metadata(
         stub_generator,
     );
     let object_ids = object_id_map(stub_generator);
+    let mut msvc_rtti_by_vtable = BTreeMap::new();
+    for enriched in facts {
+        if let Some(rtti) = &enriched.msvc_rtti {
+            msvc_rtti_by_vtable
+                .entry(rtti.vtable_rva)
+                .or_insert_with(|| rtti.clone());
+        }
+    }
 
     let _ = writeln!(text, "REVDMP_SCHEMA v3");
     let _ = writeln!(text, "key,value");
@@ -353,6 +386,33 @@ pub fn build_revdmp_metadata(
             fact.vtable_rva,
             image_base + fact.vtable_rva as u64,
             enriched.type_name.as_deref().unwrap_or(""),
+        );
+    }
+
+    let _ = writeln!(text);
+    let _ = writeln!(text, "REVDMP_MSVC_RTTI v1");
+    let _ = writeln!(
+        text,
+        "vtable_rva,col_rva,object_offset,constructor_displacement,type_descriptor_rva,type_name,hierarchy_rva,hierarchy_attributes,base_count,bases"
+    );
+    for rtti in msvc_rtti_by_vtable.values() {
+        let hierarchy_rva = rtti
+            .hierarchy_rva
+            .map(|rva| format!("0x{rva:X}"))
+            .unwrap_or_default();
+        let _ = writeln!(
+            text,
+            "0x{:X},0x{:X},0x{:X},0x{:X},0x{:X},{},{},0x{:X},{},{}",
+            rtti.vtable_rva,
+            rtti.col_rva,
+            rtti.object_offset,
+            rtti.constructor_displacement,
+            rtti.type_descriptor_rva,
+            rtti.type_name,
+            hierarchy_rva,
+            rtti.hierarchy_attributes,
+            rtti.base_classes.len(),
+            format_msvc_base_classes(&rtti.base_classes),
         );
     }
 
@@ -617,6 +677,24 @@ pub fn build_revdmp_metadata(
             call.reason,
         );
     }
+    for rtti in msvc_rtti_by_vtable.values() {
+        for base in &rtti.base_classes {
+            if base.type_descriptor_rva == rtti.type_descriptor_rva {
+                continue;
+            }
+            relationship_id += 1;
+            let _ = writeln!(
+                text,
+                "{},msvc_inheritance,{},{},type,0x{:X},,,{},type,0x{:X},,,,high,msvc_base_class_descriptor,msvc_rtti",
+                relationship_id,
+                type_graph_id(&rtti.type_name),
+                type_graph_id(&base.type_name),
+                rtti.vtable_rva,
+                base.mdisp,
+                base.type_descriptor_rva,
+            );
+        }
+    }
 
     let _ = writeln!(text);
     let _ = writeln!(text, "REVDMP_SYNTHETIC_STRUCTS v1");
@@ -698,6 +776,29 @@ fn indirect_call_kind_name(kind: VcallKind) -> &'static str {
     }
 }
 
+fn type_graph_id(type_name: &str) -> String {
+    format!("type_{}", sanitize_ida_name(type_name))
+}
+
+fn format_msvc_base_classes(base_classes: &[MsvcBaseClassFact]) -> String {
+    base_classes
+        .iter()
+        .map(|base| {
+            format!(
+                "{}@td=0x{:X}:contained={}:mdisp={}:pdisp={}:vdisp={}:attrs=0x{:X}",
+                base.type_name,
+                base.type_descriptor_rva,
+                base.num_contained_bases,
+                base.mdisp,
+                base.pdisp,
+                base.vdisp,
+                base.attributes,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
 fn ida_script_path(output_path: &Path) -> PathBuf {
     let file_name = output_path
         .file_name()
@@ -746,6 +847,10 @@ fn read_u32_at_rva(pe: &PeParser, rva: u32) -> Option<u32> {
     let ptr = unsafe { pe.base.add(off) };
     let bytes = unsafe { std::slice::from_raw_parts(ptr, 4) };
     Some(u32::from_le_bytes(bytes.try_into().ok()?))
+}
+
+fn read_i32_at_rva(pe: &PeParser, rva: u32) -> Option<i32> {
+    Some(read_u32_at_rva(pe, rva)? as i32)
 }
 
 fn read_u64_at_rva(pe: &PeParser, rva: u32) -> Option<u64> {
@@ -852,21 +957,48 @@ fn demangle_itanium_type_name(name: &str) -> String {
     }
 }
 
+#[cfg(test)]
 fn resolve_vtable_type_name(
     pe: &PeParser,
     vtable_rva: u32,
     symbol_names: &HashMap<u32, String>,
 ) -> Option<String> {
-    resolve_msvc_rtti_type_name(pe, vtable_rva)
+    resolve_msvc_rtti_fact(pe, vtable_rva)
+        .map(|fact| fact.type_name)
         .or_else(|| resolve_itanium_rtti_type_name(pe, vtable_rva))
         .or_else(|| symbol_names.get(&vtable_rva).cloned())
 }
 
-fn resolve_msvc_rtti_type_name(pe: &PeParser, vtable_rva: u32) -> Option<String> {
-    if vtable_rva < 8 {
+fn read_msvc_rtti_ref(pe: &PeParser, rva: u32, image_relative: bool) -> Option<u32> {
+    if image_relative {
+        read_u32_at_rva(pe, rva)
+    } else if pe.is_64bit {
+        read_u64_at_rva(pe, rva).and_then(|ptr| ptr_to_rva(pe, ptr))
+    } else {
+        read_u32_at_rva(pe, rva).and_then(|ptr| ptr_to_rva(pe, ptr as u64))
+    }
+}
+
+fn read_msvc_type_descriptor_name(pe: &PeParser, type_descriptor_rva: u32) -> Option<String> {
+    let name_offset = if pe.is_64bit { 16 } else { 8 };
+    if !rva_in_image(pe, type_descriptor_rva, name_offset + 1) {
         return None;
     }
-    let col_ptr = read_u64_at_rva(pe, vtable_rva - 8)?;
+    let raw = read_c_string_at_rva(pe, type_descriptor_rva + name_offset as u32, 256)?;
+    Some(demangle_msvc_type_name(&raw))
+}
+
+fn resolve_msvc_rtti_fact(pe: &PeParser, vtable_rva: u32) -> Option<MsvcRttiFact> {
+    let col_slot_rva = if pe.is_64bit {
+        vtable_rva.checked_sub(8)?
+    } else {
+        vtable_rva.checked_sub(4)?
+    };
+    let col_ptr = if pe.is_64bit {
+        read_u64_at_rva(pe, col_slot_rva)?
+    } else {
+        read_u32_at_rva(pe, col_slot_rva)? as u64
+    };
     let col_rva = ptr_to_rva(pe, col_ptr)?;
     if !rva_in_image(pe, col_rva, 24) {
         return None;
@@ -875,25 +1007,65 @@ fn resolve_msvc_rtti_type_name(pe: &PeParser, vtable_rva: u32) -> Option<String>
     if signature > 1 {
         return None;
     }
-    let type_descriptor_rva = if signature == 1 {
-        read_u32_at_rva(pe, col_rva + 12)?
-    } else {
-        let ptr = read_u64_at_rva(pe, col_rva + 12)?;
-        ptr_to_rva(pe, ptr)?
-    };
-    if !rva_in_image(pe, type_descriptor_rva, 24) {
-        return None;
+    let image_relative = signature == 1;
+    let object_offset = read_u32_at_rva(pe, col_rva + 4)?;
+    let constructor_displacement = read_u32_at_rva(pe, col_rva + 8)?;
+    let type_descriptor_rva = read_msvc_rtti_ref(pe, col_rva + 12, image_relative)?;
+    let type_name = read_msvc_type_descriptor_name(pe, type_descriptor_rva)?;
+    let hierarchy_rva = read_msvc_rtti_ref(pe, col_rva + 16, image_relative);
+
+    let mut hierarchy_attributes = 0;
+    let mut base_classes = Vec::new();
+    if let Some(hierarchy_rva) = hierarchy_rva.filter(|&rva| rva_in_image(pe, rva, 16)) {
+        hierarchy_attributes = read_u32_at_rva(pe, hierarchy_rva + 4).unwrap_or_default();
+        let base_count = read_u32_at_rva(pe, hierarchy_rva + 8).unwrap_or_default();
+        if let Some(base_array_rva) = read_msvc_rtti_ref(pe, hierarchy_rva + 12, image_relative) {
+            let entry_size = if image_relative || !pe.is_64bit { 4 } else { 8 };
+            for idx in 0..base_count.min(128) {
+                let entry_rva = base_array_rva.saturating_add(idx * entry_size);
+                let Some(base_descriptor_rva) = read_msvc_rtti_ref(pe, entry_rva, image_relative)
+                else {
+                    continue;
+                };
+                if !rva_in_image(pe, base_descriptor_rva, 24) {
+                    continue;
+                }
+                let Some(base_type_descriptor_rva) =
+                    read_msvc_rtti_ref(pe, base_descriptor_rva, image_relative)
+                else {
+                    continue;
+                };
+                let Some(base_type_name) =
+                    read_msvc_type_descriptor_name(pe, base_type_descriptor_rva)
+                else {
+                    continue;
+                };
+
+                base_classes.push(MsvcBaseClassFact {
+                    type_name: base_type_name,
+                    type_descriptor_rva: base_type_descriptor_rva,
+                    num_contained_bases: read_u32_at_rva(pe, base_descriptor_rva + 4)
+                        .unwrap_or_default(),
+                    mdisp: read_i32_at_rva(pe, base_descriptor_rva + 8).unwrap_or_default(),
+                    pdisp: read_i32_at_rva(pe, base_descriptor_rva + 12).unwrap_or_default(),
+                    vdisp: read_i32_at_rva(pe, base_descriptor_rva + 16).unwrap_or_default(),
+                    attributes: read_u32_at_rva(pe, base_descriptor_rva + 20).unwrap_or_default(),
+                });
+            }
+        }
     }
-    let hierarchy = if signature == 1 {
-        read_u32_at_rva(pe, col_rva + 16)
-    } else {
-        read_u64_at_rva(pe, col_rva + 16).and_then(|ptr| ptr_to_rva(pe, ptr))
-    };
-    if let Some(hierarchy_rva) = hierarchy {
-        let _ = read_u32_at_rva(pe, hierarchy_rva + 8); // base class count when present
-    }
-    let raw = read_c_string_at_rva(pe, type_descriptor_rva + 16, 256)?;
-    Some(demangle_msvc_type_name(&raw))
+
+    Some(MsvcRttiFact {
+        vtable_rva,
+        col_rva,
+        object_offset,
+        constructor_displacement,
+        type_descriptor_rva,
+        type_name,
+        hierarchy_rva,
+        hierarchy_attributes,
+        base_classes,
+    })
 }
 
 fn resolve_itanium_rtti_type_name(pe: &PeParser, vtable_rva: u32) -> Option<String> {
@@ -978,20 +1150,38 @@ fn enrich_vtable_facts(
     parse_rtti: bool,
 ) -> Vec<EnrichedVtableFact> {
     let symbol_names = parse_coff_vtable_symbols(pe);
-    let mut cache = HashMap::new();
+    let mut fallback_type_cache = HashMap::new();
+    let mut msvc_rtti_cache = HashMap::new();
     facts
         .iter()
         .cloned()
         .map(|fact| {
-            let type_name = if parse_rtti {
-                cache
+            let msvc_rtti = if parse_rtti {
+                msvc_rtti_cache
                     .entry(fact.vtable_rva)
-                    .or_insert_with(|| resolve_vtable_type_name(pe, fact.vtable_rva, &symbol_names))
+                    .or_insert_with(|| resolve_msvc_rtti_fact(pe, fact.vtable_rva))
+                    .clone()
+            } else {
+                None
+            };
+            let type_name = if let Some(rtti) = &msvc_rtti {
+                Some(rtti.type_name.clone())
+            } else if parse_rtti {
+                fallback_type_cache
+                    .entry(fact.vtable_rva)
+                    .or_insert_with(|| {
+                        resolve_itanium_rtti_type_name(pe, fact.vtable_rva)
+                            .or_else(|| symbol_names.get(&fact.vtable_rva).cloned())
+                    })
                     .clone()
             } else {
                 symbol_names.get(&fact.vtable_rva).cloned()
             };
-            EnrichedVtableFact { type_name, fact }
+            EnrichedVtableFact {
+                type_name,
+                msvc_rtti,
+                fact,
+            }
         })
         .collect()
 }
@@ -2184,6 +2374,25 @@ mod tests {
         let facts = vec![
             EnrichedVtableFact {
                 type_name: Some("AudioService".to_string()),
+                msvc_rtti: Some(MsvcRttiFact {
+                    vtable_rva: 0x5000,
+                    col_rva: 0x4800,
+                    object_offset: 0,
+                    constructor_displacement: 0,
+                    type_descriptor_rva: 0x4900,
+                    type_name: "AudioService".to_string(),
+                    hierarchy_rva: Some(0x4A00),
+                    hierarchy_attributes: 3,
+                    base_classes: vec![MsvcBaseClassFact {
+                        type_name: "IService".to_string(),
+                        type_descriptor_rva: 0x4B00,
+                        num_contained_bases: 1,
+                        mdisp: 0,
+                        pdisp: -1,
+                        vdisp: 0,
+                        attributes: 0x40,
+                    }],
+                }),
                 fact: VtableFact {
                     source_rva: Some(0x2000),
                     heap_addr: 0x1000_0000,
@@ -2194,6 +2403,7 @@ mod tests {
             },
             EnrichedVtableFact {
                 type_name: None,
+                msvc_rtti: None,
                 fact: VtableFact {
                     source_rva: None,
                     heap_addr: 0x2000_0000,
@@ -2256,6 +2466,10 @@ mod tests {
         assert!(text.contains("REVDMP_VTABLE_FACTS v1"));
         assert!(text.contains("0x2000,0x10000000,0x8000,0x20,0x5000,0x14005000,AudioService"));
         assert!(text.contains("heap,0x20000000,0x9000,0x0,0x7000,0x14007000,"));
+        assert!(text.contains("REVDMP_MSVC_RTTI v1"));
+        assert!(text.contains(
+            "0x5000,0x4800,0x0,0x0,0x4900,AudioService,0x4A00,0x3,1,IService@td=0x4B00:contained=1:mdisp=0:pdisp=-1:vdisp=0:attrs=0x40"
+        ));
         assert!(text.contains("REVDMP_OBJECT_GRAPH v1"));
         assert!(text.contains("global,0x2000,,,0x0,0x10000000,0x8000"));
         assert!(text.contains("heap,,0x10000000,0x8000,0x18,0x20000000,"));
@@ -2264,6 +2478,7 @@ mod tests {
         assert!(text.contains("0x1234,0x6,call,0x3000,0x4560,0x14004560,false,high"));
         assert!(text.contains("REVDMP_RUNTIME_RELATIONSHIPS v3"));
         assert!(text.contains("vfptr_to_vtable,obj_00008000,vtable_00005000"));
+        assert!(text.contains("msvc_inheritance,type_AudioService,type_IService"));
         assert!(
             text.contains("global_indirect_call,call_00001234,func_00004560,instruction,0x1234")
         );
@@ -2313,6 +2528,95 @@ mod tests {
     }
 
     #[test]
+    fn test_msvc_rtti_hierarchy_resolution() {
+        let mut module = vec![0u8; 0x1000];
+        let image_base = module.as_ptr() as u64;
+        let vtable_rva = 0x300u32;
+        let col_rva = 0x400u32;
+        let derived_type_rva = 0x500u32;
+        let hierarchy_rva = 0x620u32;
+        let base_array_rva = 0x660u32;
+        let derived_base_rva = 0x680u32;
+        let base_base_rva = 0x6A0u32;
+        let base_type_rva = 0x700u32;
+
+        fn write_u32(buf: &mut [u8], rva: u32, value: u32) {
+            buf[rva as usize..rva as usize + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        fn write_i32(buf: &mut [u8], rva: u32, value: i32) {
+            buf[rva as usize..rva as usize + 4].copy_from_slice(&value.to_le_bytes());
+        }
+
+        module[vtable_rva as usize - 8..vtable_rva as usize]
+            .copy_from_slice(&(image_base + col_rva as u64).to_le_bytes());
+
+        write_u32(&mut module, col_rva, 1); // image-relative COL
+        write_u32(&mut module, col_rva + 4, 0);
+        write_u32(&mut module, col_rva + 8, 0);
+        write_u32(&mut module, col_rva + 12, derived_type_rva);
+        write_u32(&mut module, col_rva + 16, hierarchy_rva);
+        write_u32(&mut module, col_rva + 20, col_rva);
+
+        module[derived_type_rva as usize + 16..derived_type_rva as usize + 30]
+            .copy_from_slice(b".?AVDerived@@\0");
+        module[base_type_rva as usize + 16..base_type_rva as usize + 27]
+            .copy_from_slice(b".?AVBase@@\0");
+
+        write_u32(&mut module, hierarchy_rva, 0);
+        write_u32(&mut module, hierarchy_rva + 4, 3);
+        write_u32(&mut module, hierarchy_rva + 8, 2);
+        write_u32(&mut module, hierarchy_rva + 12, base_array_rva);
+
+        write_u32(&mut module, base_array_rva, derived_base_rva);
+        write_u32(&mut module, base_array_rva + 4, base_base_rva);
+
+        write_u32(&mut module, derived_base_rva, derived_type_rva);
+        write_u32(&mut module, derived_base_rva + 4, 2);
+        write_i32(&mut module, derived_base_rva + 8, 0);
+        write_i32(&mut module, derived_base_rva + 12, -1);
+        write_i32(&mut module, derived_base_rva + 16, 0);
+        write_u32(&mut module, derived_base_rva + 20, 0);
+
+        write_u32(&mut module, base_base_rva, base_type_rva);
+        write_u32(&mut module, base_base_rva + 4, 1);
+        write_i32(&mut module, base_base_rva + 8, 0x10);
+        write_i32(&mut module, base_base_rva + 12, -1);
+        write_i32(&mut module, base_base_rva + 16, 0);
+        write_u32(&mut module, base_base_rva + 20, 0x40);
+
+        let pe = PeParser {
+            base: module.as_ptr(),
+            size: module.len(),
+            pe_offset: 0,
+            machine: 0x8664,
+            number_of_sections: 0,
+            time_date_stamp: 0,
+            pointer_to_symbol_table: 0,
+            number_of_symbols: 0,
+            size_of_optional_header: 0,
+            characteristics: 0,
+            image_base,
+            section_alignment: 0x1000,
+            file_alignment: 0x200,
+            size_of_image: module.len() as u32,
+            size_of_headers: 0,
+            is_64bit: true,
+            optional_header_raw: Vec::new(),
+            coff_symbol_table_raw: Vec::new(),
+            sections: Vec::new(),
+        };
+
+        let rtti = resolve_msvc_rtti_fact(&pe, vtable_rva).unwrap();
+        assert_eq!(rtti.type_name, "Derived");
+        assert_eq!(rtti.hierarchy_rva, Some(hierarchy_rva));
+        assert_eq!(rtti.hierarchy_attributes, 3);
+        assert_eq!(rtti.base_classes.len(), 2);
+        assert_eq!(rtti.base_classes[1].type_name, "Base");
+        assert_eq!(rtti.base_classes[1].mdisp, 0x10);
+        assert_eq!(rtti.base_classes[1].attributes, 0x40);
+    }
+
+    #[test]
     fn test_ida_script_contains_offsets_names_structs_and_edges() {
         let stub_generator = StubGenerator::from_test_stubs(
             0x1400_0000,
@@ -2331,6 +2635,7 @@ mod tests {
         );
         let facts = vec![EnrichedVtableFact {
             type_name: Some("AudioService".to_string()),
+            msvc_rtti: None,
             fact: VtableFact {
                 source_rva: Some(0x2000),
                 heap_addr: 0x1000_0000,
