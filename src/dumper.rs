@@ -20,7 +20,7 @@ use crate::stub::{
     ContainerFact, EdgeConfidence, HeapPointerEdge, StubConfig, StubGenerator, VtableFact,
 };
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as FmtWrite;
 use std::fs::File;
 use std::io::Write;
@@ -31,6 +31,25 @@ use std::process::Command;
 pub struct EnrichedVtableFact {
     pub fact: VtableFact,
     pub type_name: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeObjectFact {
+    id: String,
+    heap_addr: u64,
+    stub_rva: u32,
+    stub_va: u64,
+    stub_size: usize,
+    vfptr_offsets: Vec<u32>,
+    vtable_rvas: Vec<u32>,
+    type_names: Vec<String>,
+    root_rvas: Vec<u32>,
+    incoming_edges: usize,
+    outgoing_edges: usize,
+    container_owner_count: usize,
+    container_element_count: usize,
+    confidence: &'static str,
+    provenance: &'static str,
 }
 
 #[cfg(target_os = "windows")]
@@ -116,6 +135,144 @@ impl Default for ProgressInfo {
 /// Progress callback type.
 pub type ProgressCallback = Box<dyn Fn(&ProgressInfo) + Send + Sync>;
 
+fn runtime_object_id(stub_rva: u32) -> String {
+    format!("obj_{stub_rva:08X}")
+}
+
+fn object_id_map(stub_generator: &StubGenerator) -> BTreeMap<u64, String> {
+    stub_generator
+        .stubs()
+        .map(|stub| (stub.original_addr, runtime_object_id(stub.new_rva)))
+        .collect()
+}
+
+fn join_hex_u32(values: &[u32]) -> String {
+    values
+        .iter()
+        .map(|value| format!("0x{value:X}"))
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+fn build_runtime_objects(
+    facts: &[EnrichedVtableFact],
+    heap_ptr_locs: &[(u32, u64)],
+    heap_edges: &[HeapPointerEdge],
+    containers: &[ContainerFact],
+    image_base: u64,
+    stub_generator: &StubGenerator,
+) -> Vec<RuntimeObjectFact> {
+    let mut type_names_by_heap: BTreeMap<u64, BTreeSet<String>> = BTreeMap::new();
+    let mut roots_by_heap: BTreeMap<u64, BTreeSet<u32>> = BTreeMap::new();
+    let mut incoming_by_heap: BTreeMap<u64, usize> = BTreeMap::new();
+    let mut outgoing_by_heap: BTreeMap<u64, usize> = BTreeMap::new();
+    let mut container_owner_by_heap: BTreeMap<u64, usize> = BTreeMap::new();
+    let mut container_element_by_heap: BTreeMap<u64, usize> = BTreeMap::new();
+
+    for enriched in facts {
+        if let Some(type_name) = enriched
+            .type_name
+            .as_deref()
+            .filter(|name| !name.is_empty())
+        {
+            type_names_by_heap
+                .entry(enriched.fact.heap_addr)
+                .or_default()
+                .insert(type_name.to_string());
+        }
+    }
+
+    for &(source_rva, heap_addr) in heap_ptr_locs {
+        roots_by_heap
+            .entry(strip_pointer_tags(heap_addr))
+            .or_default()
+            .insert(source_rva);
+    }
+
+    for edge in heap_edges {
+        *outgoing_by_heap.entry(edge.source_heap_addr).or_default() += 1;
+        *incoming_by_heap.entry(edge.target_heap_addr).or_default() += 1;
+    }
+
+    for container in containers {
+        *container_owner_by_heap
+            .entry(container.source_heap_addr)
+            .or_default() += 1;
+        for &target in &container.targets {
+            *container_element_by_heap.entry(target).or_default() += 1;
+        }
+    }
+
+    let mut stubs = stub_generator.stubs().collect::<Vec<_>>();
+    stubs.sort_by_key(|stub| (stub.new_rva, stub.original_addr));
+
+    stubs
+        .into_iter()
+        .map(|stub| {
+            let root_rvas = roots_by_heap
+                .get(&stub.original_addr)
+                .map(|roots| roots.iter().copied().collect::<Vec<_>>())
+                .unwrap_or_default();
+            let type_names = type_names_by_heap
+                .get(&stub.original_addr)
+                .map(|names| names.iter().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            let vfptr_offsets = stub
+                .vtable_refs
+                .iter()
+                .map(|r| r.offset as u32)
+                .collect::<Vec<_>>();
+            let vtable_rvas = stub
+                .vtable_refs
+                .iter()
+                .map(|r| r.vtable_rva)
+                .collect::<Vec<_>>();
+            let confidence = if !type_names.is_empty() {
+                "rtti_confirmed"
+            } else if !root_rvas.is_empty() {
+                "global_rooted"
+            } else {
+                "heap_reachable"
+            };
+            let provenance = if !root_rvas.is_empty() {
+                "module_pointer_scan"
+            } else {
+                "recursive_heap_scan"
+            };
+
+            RuntimeObjectFact {
+                id: runtime_object_id(stub.new_rva),
+                heap_addr: stub.original_addr,
+                stub_rva: stub.new_rva,
+                stub_va: image_base + stub.new_rva as u64,
+                stub_size: stub.size,
+                vfptr_offsets,
+                vtable_rvas,
+                type_names,
+                root_rvas,
+                incoming_edges: incoming_by_heap
+                    .get(&stub.original_addr)
+                    .copied()
+                    .unwrap_or_default(),
+                outgoing_edges: outgoing_by_heap
+                    .get(&stub.original_addr)
+                    .copied()
+                    .unwrap_or_default(),
+                container_owner_count: container_owner_by_heap
+                    .get(&stub.original_addr)
+                    .copied()
+                    .unwrap_or_default(),
+                container_element_count: container_element_by_heap
+                    .get(&stub.original_addr)
+                    .copied()
+                    .unwrap_or_default(),
+                confidence,
+                provenance,
+            }
+        })
+        .collect()
+}
+
 /// Build an IDA-friendly metadata section that lists every flattened vtable fact.
 pub fn build_revdmp_metadata(
     facts: &[EnrichedVtableFact],
@@ -127,11 +284,51 @@ pub fn build_revdmp_metadata(
     stub_generator: &StubGenerator,
 ) -> Vec<u8> {
     let mut text = String::new();
-    let _ = writeln!(text, "REVDMP_SCHEMA v2");
+    let runtime_objects = build_runtime_objects(
+        facts,
+        heap_ptr_locs,
+        heap_edges,
+        containers,
+        image_base,
+        stub_generator,
+    );
+    let object_ids = object_id_map(stub_generator);
+
+    let _ = writeln!(text, "REVDMP_SCHEMA v3");
     let _ = writeln!(text, "key,value");
     let _ = writeln!(text, "sidecar_required,false");
-    let _ = writeln!(text, "relationship_model,runtime_graph_v2");
+    let _ = writeln!(text, "relationship_model,runtime_graph_v3");
     let _ = writeln!(text, "target_consumers,ida;ghidra;binaryninja;custom");
+    let _ = writeln!(text);
+
+    let _ = writeln!(text, "REVDMP_OBJECTS v1");
+    let _ = writeln!(
+        text,
+        "object_id,heap_addr,stub_rva,stub_va,stub_size,vfptr_count,vfptr_offsets,vtable_rvas,type_names,root_rvas,in_edges,out_edges,container_owner_count,container_element_count,confidence,provenance"
+    );
+    for object in &runtime_objects {
+        let type_names = object.type_names.join(";");
+        let _ = writeln!(
+            text,
+            "{},0x{:X},0x{:X},0x{:X},0x{:X},{},{},{},{},{},{},{},{},{},{},{}",
+            object.id,
+            object.heap_addr,
+            object.stub_rva,
+            object.stub_va,
+            object.stub_size,
+            object.vfptr_offsets.len(),
+            join_hex_u32(&object.vfptr_offsets),
+            join_hex_u32(&object.vtable_rvas),
+            type_names,
+            join_hex_u32(&object.root_rvas),
+            object.incoming_edges,
+            object.outgoing_edges,
+            object.container_owner_count,
+            object.container_element_count,
+            object.confidence,
+            object.provenance,
+        );
+    }
     let _ = writeln!(text);
 
     let _ = writeln!(text, "REVDMP_VTABLE_FACTS v1");
@@ -264,10 +461,10 @@ pub fn build_revdmp_metadata(
     }
 
     let _ = writeln!(text);
-    let _ = writeln!(text, "REVDMP_RUNTIME_RELATIONSHIPS v2");
+    let _ = writeln!(text, "REVDMP_RUNTIME_RELATIONSHIPS v3");
     let _ = writeln!(
         text,
-        "id,kind,source_kind,source_rva,source_heap_addr,source_stub_rva,source_offset,target_kind,target_rva,target_va,target_heap_addr,target_stub_rva,confidence,reason,provenance"
+        "id,kind,source_id,target_id,source_kind,source_rva,source_heap_addr,source_stub_rva,source_offset,target_kind,target_rva,target_va,target_heap_addr,target_stub_rva,confidence,reason,provenance"
     );
     let mut relationship_id = 0usize;
     for enriched in facts {
@@ -279,8 +476,13 @@ pub fn build_revdmp_metadata(
             .unwrap_or_else(|| "heap_recursive".to_string());
         let _ = writeln!(
             text,
-            "{},vfptr_to_vtable,stub_vfptr,,0x{:X},0x{:X},0x{:X},vtable,0x{:X},0x{:X},,,high,vfptr_points_to_module_vtable,{}",
+            "{},vfptr_to_vtable,{},vtable_{:08X},stub_vfptr,,0x{:X},0x{:X},0x{:X},vtable,0x{:X},0x{:X},,,high,vfptr_points_to_module_vtable,{}",
             relationship_id,
+            object_ids
+                .get(&fact.heap_addr)
+                .cloned()
+                .unwrap_or_else(|| runtime_object_id(fact.stub_rva)),
+            fact.vtable_rva,
             fact.heap_addr,
             fact.stub_rva,
             fact.vfptr_offset,
@@ -300,8 +502,12 @@ pub fn build_revdmp_metadata(
         };
         let _ = writeln!(
             text,
-            "{},global_to_heap_object,global,0x{:X},,,0x0,heap_object,,,0x{:X},{},{},{},module_pointer_scan",
+            "{},global_to_heap_object,global_{:08X},{},global,0x{:X},,,0x0,heap_object,,,0x{:X},{},{},{},module_pointer_scan",
             relationship_id,
+            source_rva,
+            target_stub
+                .map(runtime_object_id)
+                .unwrap_or_else(|| format!("heap_{target_heap_addr:016X}")),
             source_rva,
             target_heap_addr,
             target_stub
@@ -321,8 +527,16 @@ pub fn build_revdmp_metadata(
         relationship_id += 1;
         let _ = writeln!(
             text,
-            "{},heap_field_to_heap_object,heap_object,,0x{:X},{},0x{:X},heap_object,,,0x{:X},{},{},{},recursive_heap_scan",
+            "{},heap_field_to_heap_object,{},{},heap_object,,0x{:X},{},0x{:X},heap_object,,,0x{:X},{},{},{},recursive_heap_scan",
             relationship_id,
+            object_ids
+                .get(&edge.source_heap_addr)
+                .cloned()
+                .unwrap_or_else(|| format!("heap_{:016X}", edge.source_heap_addr)),
+            object_ids
+                .get(&edge.target_heap_addr)
+                .cloned()
+                .unwrap_or_else(|| format!("heap_{:016X}", edge.target_heap_addr)),
             edge.source_heap_addr,
             source_stub
                 .map(|rva| format!("0x{rva:X}"))
@@ -356,11 +570,27 @@ pub fn build_revdmp_metadata(
             })
             .collect::<Vec<_>>()
             .join(";");
+        let target_object_ids = container
+            .targets
+            .iter()
+            .map(|addr| {
+                object_ids
+                    .get(addr)
+                    .cloned()
+                    .unwrap_or_else(|| format!("heap_{addr:016X}"))
+            })
+            .collect::<Vec<_>>()
+            .join(";");
         relationship_id += 1;
         let _ = writeln!(
             text,
-            "{},container_to_heap_objects,heap_container,,0x{:X},{},0x{:X},heap_object_set,,,{},{},high,{},container_shape_analysis",
+            "{},container_to_heap_objects,{},{},heap_container,,0x{:X},{},0x{:X},heap_object_set,,,{},{},high,{},container_shape_analysis",
             relationship_id,
+            object_ids
+                .get(&container.source_heap_addr)
+                .cloned()
+                .unwrap_or_else(|| format!("heap_{:016X}", container.source_heap_addr)),
+            target_object_ids,
             container.source_heap_addr,
             source_stub
                 .map(|rva| format!("0x{rva:X}"))
@@ -375,8 +605,10 @@ pub fn build_revdmp_metadata(
         relationship_id += 1;
         let _ = writeln!(
             text,
-            "{},global_indirect_call,instruction,0x{:X},,,0x{:X},function,0x{:X},0x{:X},,,{},{},global_function_pointer_resolution",
+            "{},global_indirect_call,call_{:08X},func_{:08X},instruction,0x{:X},,,0x{:X},function,0x{:X},0x{:X},,,{},{},global_function_pointer_resolution",
             relationship_id,
+            call.instruction_rva,
+            call.target_rva,
             call.instruction_rva,
             call.global_rva,
             call.target_rva,
@@ -2015,8 +2247,12 @@ mod tests {
             &stub_generator,
         );
         let text = String::from_utf8(metadata).unwrap();
-        assert!(text.contains("REVDMP_SCHEMA v2"));
+        assert!(text.contains("REVDMP_SCHEMA v3"));
         assert!(text.contains("sidecar_required,false"));
+        assert!(text.contains("REVDMP_OBJECTS v1"));
+        assert!(text.contains(
+            "obj_00008000,0x10000000,0x8000,0x14008000,0x28,1,0x20,0x5000,AudioService,0x2000,0,1,0,0,rtti_confirmed,module_pointer_scan"
+        ));
         assert!(text.contains("REVDMP_VTABLE_FACTS v1"));
         assert!(text.contains("0x2000,0x10000000,0x8000,0x20,0x5000,0x14005000,AudioService"));
         assert!(text.contains("heap,0x20000000,0x9000,0x0,0x7000,0x14007000,"));
@@ -2026,8 +2262,11 @@ mod tests {
         assert!(text.contains("REVDMP_CONTAINERS v1"));
         assert!(text.contains("REVDMP_INDIRECT_CALLS v1"));
         assert!(text.contains("0x1234,0x6,call,0x3000,0x4560,0x14004560,false,high"));
-        assert!(text.contains("REVDMP_RUNTIME_RELATIONSHIPS v2"));
-        assert!(text.contains("global_indirect_call,instruction,0x1234"));
+        assert!(text.contains("REVDMP_RUNTIME_RELATIONSHIPS v3"));
+        assert!(text.contains("vfptr_to_vtable,obj_00008000,vtable_00005000"));
+        assert!(
+            text.contains("global_indirect_call,call_00001234,func_00004560,instruction,0x1234")
+        );
         assert!(text.contains("REVDMP_SYNTHETIC_STRUCTS v1"));
     }
 

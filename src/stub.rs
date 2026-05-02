@@ -906,9 +906,14 @@ impl StubGenerator {
     pub fn assign_rvas(&mut self, base_rva: u32) -> usize {
         let mut current_rva = base_rva;
 
-        for stub in self.stubs.values_mut() {
-            stub.new_rva = current_rva;
-            current_rva += stub.size as u32;
+        let mut heap_addrs = self.stubs.keys().copied().collect::<Vec<_>>();
+        heap_addrs.sort_unstable();
+
+        for heap_addr in heap_addrs {
+            if let Some(stub) = self.stubs.get_mut(&heap_addr) {
+                stub.new_rva = current_rva;
+                current_rva += stub.size as u32;
+            }
         }
 
         (current_rva - base_rva) as usize
@@ -1109,6 +1114,42 @@ mod tests {
         let data = generator.build_section_data(8, 0x200, image_base);
         let stored = u64::from_le_bytes(data[0..8].try_into().unwrap());
         assert_eq!(stored, image_base + vtable_rva as u64);
+    }
+
+    #[test]
+    fn test_assign_rvas_is_deterministic_by_heap_address() {
+        let mut generator = StubGenerator {
+            mod_base: 0x1400_0000,
+            mod_end: 0x1410_0000,
+            config: StubConfig::default(),
+            region_cache: MemoryRegionCache::new(),
+            stubs: HashMap::new(),
+            visited: HashSet::new(),
+            heap_edges: Vec::new(),
+            containers: Vec::new(),
+        };
+
+        for heap_addr in [0x3000u64, 0x1000, 0x2000] {
+            generator.stubs.insert(
+                heap_addr,
+                VtableStub {
+                    original_addr: heap_addr,
+                    size: 8,
+                    data: vec![0; 8],
+                    new_rva: 0,
+                    vtable_refs: vec![VtableRef {
+                        offset: 0,
+                        vtable_rva: 0x5000,
+                    }],
+                    vfptr_offsets: [0].into_iter().collect(),
+                },
+            );
+        }
+
+        assert_eq!(generator.assign_rvas(0x8000), 0x18);
+        assert_eq!(generator.get_stub(0x1000).unwrap().new_rva, 0x8000);
+        assert_eq!(generator.get_stub(0x2000).unwrap().new_rva, 0x8008);
+        assert_eq!(generator.get_stub(0x3000).unwrap().new_rva, 0x8010);
     }
 
     #[test]
