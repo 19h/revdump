@@ -7,7 +7,7 @@
 //! 4. Generate fixups
 //! 5. Build and write the output PE
 
-use crate::devirt::{self, DevirtConfig, DevirtStats};
+use crate::devirt::{self, DevirtConfig, DevirtStats, IndirectCallFact, VcallKind};
 use crate::error::{Error, Result};
 use crate::fixup::{apply_fixups, generate_fixups, SectionMapping};
 use crate::memory::{is_memory_readable, strip_pointer_tags};
@@ -122,10 +122,18 @@ pub fn build_revdmp_metadata(
     heap_ptr_locs: &[(u32, u64)],
     heap_edges: &[HeapPointerEdge],
     containers: &[ContainerFact],
+    indirect_calls: &[IndirectCallFact],
     image_base: u64,
     stub_generator: &StubGenerator,
 ) -> Vec<u8> {
     let mut text = String::new();
+    let _ = writeln!(text, "REVDMP_SCHEMA v2");
+    let _ = writeln!(text, "key,value");
+    let _ = writeln!(text, "sidecar_required,false");
+    let _ = writeln!(text, "relationship_model,runtime_graph_v2");
+    let _ = writeln!(text, "target_consumers,ida;ghidra;binaryninja;custom");
+    let _ = writeln!(text);
+
     let _ = writeln!(text, "REVDMP_VTABLE_FACTS v1");
     let _ = writeln!(
         text,
@@ -234,6 +242,151 @@ pub fn build_revdmp_metadata(
     }
 
     let _ = writeln!(text);
+    let _ = writeln!(text, "REVDMP_INDIRECT_CALLS v1");
+    let _ = writeln!(
+        text,
+        "instruction_rva,instruction_len,kind,global_rva,target_rva,target_va,via_register,confidence,reason"
+    );
+    for call in indirect_calls {
+        let _ = writeln!(
+            text,
+            "0x{:X},0x{:X},{},0x{:X},0x{:X},0x{:X},{},{},{}",
+            call.instruction_rva,
+            call.instruction_len,
+            indirect_call_kind_name(call.kind),
+            call.global_rva,
+            call.target_rva,
+            call.target_va,
+            call.via_register,
+            call.confidence,
+            call.reason,
+        );
+    }
+
+    let _ = writeln!(text);
+    let _ = writeln!(text, "REVDMP_RUNTIME_RELATIONSHIPS v2");
+    let _ = writeln!(
+        text,
+        "id,kind,source_kind,source_rva,source_heap_addr,source_stub_rva,source_offset,target_kind,target_rva,target_va,target_heap_addr,target_stub_rva,confidence,reason,provenance"
+    );
+    let mut relationship_id = 0usize;
+    for enriched in facts {
+        let fact = &enriched.fact;
+        relationship_id += 1;
+        let provenance = fact
+            .source_rva
+            .map(|rva| format!("global:0x{rva:X}"))
+            .unwrap_or_else(|| "heap_recursive".to_string());
+        let _ = writeln!(
+            text,
+            "{},vfptr_to_vtable,stub_vfptr,,0x{:X},0x{:X},0x{:X},vtable,0x{:X},0x{:X},,,high,vfptr_points_to_module_vtable,{}",
+            relationship_id,
+            fact.heap_addr,
+            fact.stub_rva,
+            fact.vfptr_offset,
+            fact.vtable_rva,
+            image_base + fact.vtable_rva as u64,
+            provenance,
+        );
+    }
+    for &(source_rva, target_heap_addr) in heap_ptr_locs {
+        let target_heap_addr = strip_pointer_tags(target_heap_addr);
+        let target_stub = stub_generator.get_stub(target_heap_addr).map(|s| s.new_rva);
+        relationship_id += 1;
+        let (confidence, reason) = if target_stub.is_some() {
+            ("high", "global_targets_vtable_object")
+        } else {
+            ("low", "global_targets_heap_pointer")
+        };
+        let _ = writeln!(
+            text,
+            "{},global_to_heap_object,global,0x{:X},,,0x0,heap_object,,,0x{:X},{},{},{},module_pointer_scan",
+            relationship_id,
+            source_rva,
+            target_heap_addr,
+            target_stub
+                .map(|rva| format!("0x{rva:X}"))
+                .unwrap_or_default(),
+            confidence,
+            reason,
+        );
+    }
+    for edge in heap_edges {
+        let source_stub = stub_generator
+            .get_stub(edge.source_heap_addr)
+            .map(|s| s.new_rva);
+        let target_stub = stub_generator
+            .get_stub(edge.target_heap_addr)
+            .map(|s| s.new_rva);
+        relationship_id += 1;
+        let _ = writeln!(
+            text,
+            "{},heap_field_to_heap_object,heap_object,,0x{:X},{},0x{:X},heap_object,,,0x{:X},{},{},{},recursive_heap_scan",
+            relationship_id,
+            edge.source_heap_addr,
+            source_stub
+                .map(|rva| format!("0x{rva:X}"))
+                .unwrap_or_default(),
+            edge.field_offset,
+            edge.target_heap_addr,
+            target_stub
+                .map(|rva| format!("0x{rva:X}"))
+                .unwrap_or_default(),
+            edge.confidence.as_str(),
+            edge.reason,
+        );
+    }
+    for container in containers {
+        let source_stub = stub_generator
+            .get_stub(container.source_heap_addr)
+            .map(|s| s.new_rva);
+        let target_heap_addrs = container
+            .targets
+            .iter()
+            .map(|addr| format!("0x{addr:X}"))
+            .collect::<Vec<_>>()
+            .join(";");
+        let target_stub_rvas = container
+            .targets
+            .iter()
+            .filter_map(|addr| {
+                stub_generator
+                    .get_stub(*addr)
+                    .map(|stub| format!("0x{:X}", stub.new_rva))
+            })
+            .collect::<Vec<_>>()
+            .join(";");
+        relationship_id += 1;
+        let _ = writeln!(
+            text,
+            "{},container_to_heap_objects,heap_container,,0x{:X},{},0x{:X},heap_object_set,,,{},{},high,{},container_shape_analysis",
+            relationship_id,
+            container.source_heap_addr,
+            source_stub
+                .map(|rva| format!("0x{rva:X}"))
+                .unwrap_or_default(),
+            container.field_offset,
+            target_heap_addrs,
+            target_stub_rvas,
+            container.kind,
+        );
+    }
+    for call in indirect_calls {
+        relationship_id += 1;
+        let _ = writeln!(
+            text,
+            "{},global_indirect_call,instruction,0x{:X},,,0x{:X},function,0x{:X},0x{:X},,,{},{},global_function_pointer_resolution",
+            relationship_id,
+            call.instruction_rva,
+            call.global_rva,
+            call.target_rva,
+            call.target_va,
+            call.confidence,
+            call.reason,
+        );
+    }
+
+    let _ = writeln!(text);
     let _ = writeln!(text, "REVDMP_SYNTHETIC_STRUCTS v1");
     let _ = writeln!(text, "stub_rva,heap_addr,struct_name,size,vfptr_offsets");
     for stub in stub_generator.stubs() {
@@ -303,6 +456,14 @@ fn build_output_coff_string_table(pe: &PeParser) -> Vec<u8> {
 
 fn synthetic_struct_name(stub_rva: u32) -> String {
     format!("revdump_obj_{stub_rva:X}")
+}
+
+fn indirect_call_kind_name(kind: VcallKind) -> &'static str {
+    match kind {
+        VcallKind::GlobalIndirectCall => "call",
+        VcallKind::GlobalIndirectJmp => "jmp",
+        _ => "unknown",
+    }
 }
 
 fn ida_script_path(output_path: &Path) -> PathBuf {
@@ -655,7 +816,7 @@ pub fn build_ida_script(
     let _ = writeln!(script, "        for off, mname in members:");
     let _ = writeln!(script, "            ida_struct.add_struc_member(sptr, mname, off, ida_bytes.FF_QWORD | ida_bytes.FF_DATA, None, 8)");
     let _ = writeln!(script, "        revdump_counts['structs'] += 1");
-    let _ = writeln!(script, "");
+    let _ = writeln!(script);
 
     for stub in stub_generator.stubs() {
         let struct_name = synthetic_struct_name(stub.new_rva);
@@ -1035,12 +1196,33 @@ impl Dumper {
         let heap_section_size = stub_generator.assign_rvas(heap_section_va);
         let vtable_facts = stub_generator.vtable_facts(&heap_ptr_locs);
         let enriched_facts = enrich_vtable_facts(pe, &vtable_facts, config.parse_rtti);
+        let indirect_calls = if config.emit_revdmp {
+            pe.sections
+                .iter()
+                .find(|s| s.name == ".text" || (s.characteristics & 0x20) != 0)
+                .and_then(|text_section| {
+                    let text_addr = unsafe { self.base.add(text_section.virtual_address as usize) };
+                    is_memory_readable(text_addr, text_section.virtual_size as usize).then(|| {
+                        devirt::analyze_global_indirect_calls(
+                            self.base,
+                            pe.image_base,
+                            text_section.virtual_address,
+                            text_section.virtual_size,
+                            &config.effective_devirt_config(),
+                        )
+                    })
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let metadata_data = if config.emit_revdmp {
             build_revdmp_metadata(
                 &enriched_facts,
                 &heap_ptr_locs,
                 stub_generator.heap_edges(),
                 stub_generator.containers(),
+                &indirect_calls,
                 pe.image_base,
                 &stub_generator,
             )
@@ -1093,8 +1275,9 @@ impl Dumper {
             )?;
 
             eprintln!(
-                "Devirt: {} vcalls found, {} resolved, {} patched",
+                "Devirt: {} indirect sites found ({} global), {} resolved, {} patched",
                 devirt_stats.vcalls_detected,
+                devirt_stats.global_indirect_calls_detected,
                 devirt_stats.vcalls_resolved,
                 devirt_stats.patches_applied,
             );
@@ -1550,7 +1733,7 @@ impl Dumper {
             text_section.virtual_size,
             vtable_facts,
             heap_edges,
-            &section_mappings,
+            section_mappings,
             aligned_headers,
             &config.effective_devirt_config(),
         )
@@ -1803,6 +1986,17 @@ mod tests {
                 vfptr_offsets: [0x20].into_iter().collect(),
             }],
         );
+        let indirect_calls = vec![IndirectCallFact {
+            instruction_rva: 0x1234,
+            instruction_len: 6,
+            global_rva: 0x3000,
+            target_rva: 0x4560,
+            target_va: 0x1400_4560,
+            kind: VcallKind::GlobalIndirectCall,
+            via_register: false,
+            confidence: "high",
+            reason: "rip_relative_global_function_pointer",
+        }];
 
         let metadata = build_revdmp_metadata(
             &facts,
@@ -1816,10 +2010,13 @@ mod tests {
                 target_has_vtable: false,
             }],
             &[],
+            &indirect_calls,
             0x1400_0000,
             &stub_generator,
         );
         let text = String::from_utf8(metadata).unwrap();
+        assert!(text.contains("REVDMP_SCHEMA v2"));
+        assert!(text.contains("sidecar_required,false"));
         assert!(text.contains("REVDMP_VTABLE_FACTS v1"));
         assert!(text.contains("0x2000,0x10000000,0x8000,0x20,0x5000,0x14005000,AudioService"));
         assert!(text.contains("heap,0x20000000,0x9000,0x0,0x7000,0x14007000,"));
@@ -1827,6 +2024,10 @@ mod tests {
         assert!(text.contains("global,0x2000,,,0x0,0x10000000,0x8000"));
         assert!(text.contains("heap,,0x10000000,0x8000,0x18,0x20000000,"));
         assert!(text.contains("REVDMP_CONTAINERS v1"));
+        assert!(text.contains("REVDMP_INDIRECT_CALLS v1"));
+        assert!(text.contains("0x1234,0x6,call,0x3000,0x4560,0x14004560,false,high"));
+        assert!(text.contains("REVDMP_RUNTIME_RELATIONSHIPS v2"));
+        assert!(text.contains("global_indirect_call,instruction,0x1234"));
         assert!(text.contains("REVDMP_SYNTHETIC_STRUCTS v1"));
     }
 

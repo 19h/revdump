@@ -35,12 +35,22 @@ pub enum VcallKind {
     IndirectCall,
     /// `jmp qword ptr [reg+offset]` - tail call through vtable
     IndirectJmp,
+    /// `call qword ptr [rip+global]` or `mov reg, [rip+global]; call reg`.
+    GlobalIndirectCall,
+    /// `jmp qword ptr [rip+global]` or `mov reg, [rip+global]; jmp reg`.
+    GlobalIndirectJmp,
     /// `lea reg, [reg+offset]` - loading function pointer from vtable
     LeaVtableSlot,
     /// `mov reg, [reg+offset]` - loading function pointer into register
     MovVtableSlot,
-    /// `call reg` - call through register holding vtable func ptr (can't patch, too short)
+    /// `call reg` - call through register holding a resolved function pointer
     CallRegister,
+}
+
+impl VcallKind {
+    fn is_global_indirect(self) -> bool {
+        matches!(self, Self::GlobalIndirectCall | Self::GlobalIndirectJmp)
+    }
 }
 
 /// A detected vcall site in code.
@@ -68,6 +78,29 @@ pub struct VcallSite {
     pub patch_site: Option<(u32, usize)>,
 }
 
+/// A resolved indirect call whose target function pointer was stored in module data.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndirectCallFact {
+    /// RVA of the call or jmp instruction.
+    pub instruction_rva: u32,
+    /// Length of the indirect control-flow instruction in bytes.
+    pub instruction_len: usize,
+    /// RVA of the global qword that held the target function pointer.
+    pub global_rva: u32,
+    /// Resolved concrete target function RVA.
+    pub target_rva: u32,
+    /// Resolved concrete target function VA in the dumped image.
+    pub target_va: u64,
+    /// Whether this is a call or a tail jmp.
+    pub kind: VcallKind,
+    /// True when the global was first loaded into a register and then called.
+    pub via_register: bool,
+    /// Conservative machine-readable confidence label.
+    pub confidence: &'static str,
+    /// Short machine-readable reason for the resolution.
+    pub reason: &'static str,
+}
+
 /// A code patch to apply.
 #[derive(Clone, Debug)]
 pub struct CodePatch {
@@ -88,6 +121,10 @@ pub struct DevirtStats {
     pub vcalls_detected: usize,
     /// Vcalls successfully resolved to targets.
     pub vcalls_resolved: usize,
+    /// Indirect call/jmp sites whose target came from a global function pointer.
+    pub global_indirect_calls_detected: usize,
+    /// Global function-pointer call/jmp sites resolved to concrete module targets.
+    pub global_indirect_calls_resolved: usize,
     /// Patches actually applied.
     pub patches_applied: usize,
     /// Globals referenced but not in our map.
@@ -171,13 +208,7 @@ impl ThunkAllocator {
                 }
                 0
             }
-            0x0f => {
-                if code.len() >= 2 && code[1] == 0x1f {
-                    Self::get_0f1f_nop_len(code)
-                } else {
-                    0
-                }
-            }
+            0x0f if code.len() >= 2 && code[1] == 0x1f => Self::get_0f1f_nop_len(code),
             _ => 0,
         }
     }
@@ -298,7 +329,7 @@ impl ThunkAllocator {
 
             // Check if reachable with jmp rel8
             let offset = slot_rva as i64 - near_rva as i64;
-            if offset >= -126 && offset <= 127 {
+            if (-126..=127).contains(&offset) {
                 // Use this slot
                 let result = (slot_rva, slot_size);
                 // Shrink or remove the slot
@@ -348,6 +379,18 @@ pub enum RegisterValue {
     /// Holds a pointer loaded from a global variable.
     GlobalPtr {
         /// RVA of the global that was loaded.
+        global_rva: u32,
+    },
+    /// Holds a concrete function pointer loaded from a global variable.
+    GlobalFuncPtr {
+        /// RVA of the global that was loaded.
+        global_rva: u32,
+        /// Resolved function target RVA.
+        target_rva: u32,
+    },
+    /// Holds the address of a global slot that stores a concrete function pointer.
+    GlobalFuncSlot {
+        /// RVA of the global slot.
         global_rva: u32,
     },
     /// Holds an object pointer loaded from a field of a global-owned object.
@@ -497,30 +540,15 @@ fn to_64bit_reg(reg: Register) -> Register {
     }
 }
 
-/// Check if instruction is a control flow boundary (resets register tracking).
+/// Check if instruction should reset linear register tracking.
+///
+/// Conditional branches preserve the fallthrough state, which is essential for
+/// guarded function-pointer calls such as `mov rax, [global]; test rax, rax;
+/// je skip; call rax`.
 fn is_control_flow(instr: &Instruction) -> bool {
     matches!(
         instr.mnemonic(),
         Mnemonic::Jmp
-            | Mnemonic::Je
-            | Mnemonic::Jne
-            | Mnemonic::Ja
-            | Mnemonic::Jae
-            | Mnemonic::Jb
-            | Mnemonic::Jbe
-            | Mnemonic::Jg
-            | Mnemonic::Jge
-            | Mnemonic::Jl
-            | Mnemonic::Jle
-            | Mnemonic::Jo
-            | Mnemonic::Jno
-            | Mnemonic::Js
-            | Mnemonic::Jns
-            | Mnemonic::Jp
-            | Mnemonic::Jnp
-            | Mnemonic::Jcxz
-            | Mnemonic::Jecxz
-            | Mnemonic::Jrcxz
             | Mnemonic::Loop
             | Mnemonic::Loope
             | Mnemonic::Loopne
@@ -694,6 +722,8 @@ pub struct VcallScanner<'a> {
     mod_base: *const u8,
     /// Module image base (for RIP-relative calculations).
     image_base: u64,
+    /// Optional executable RVA ranges used to reject non-code global targets.
+    code_target_ranges: Vec<(u32, u32)>,
     /// Global-to-vtable mapping.
     global_map: &'a GlobalVtableMap,
     /// Configuration.
@@ -710,9 +740,16 @@ impl<'a> VcallScanner<'a> {
         Self {
             mod_base,
             image_base,
+            code_target_ranges: Vec::new(),
             global_map,
             config,
         }
+    }
+
+    /// Restrict resolved global function-pointer targets to known code ranges.
+    pub fn with_code_target_ranges(mut self, ranges: Vec<(u32, u32)>) -> Self {
+        self.code_target_ranges = ranges;
+        self
     }
 
     /// Scan a code section for vcall patterns.
@@ -736,8 +773,22 @@ impl<'a> VcallScanner<'a> {
                 // But first check if this is a vcall/vjmp before resetting
                 let maybe_site = match instr.mnemonic() {
                     Mnemonic::Call => {
-                        // First try indirect call (call [reg+offset])
-                        if let Some(site) = self.check_indirect_call(&instr, &reg_state, instr_rva)
+                        // Direct global function pointer: call qword ptr [rip+global].
+                        if let Some(site) = self.check_global_indirect_mem(
+                            &instr,
+                            instr_rva,
+                            VcallKind::GlobalIndirectCall,
+                        ) {
+                            Some(site)
+                        } else if let Some(site) = self.check_global_slot_indirect_mem(
+                            &instr,
+                            &reg_state,
+                            instr_rva,
+                            VcallKind::GlobalIndirectCall,
+                        ) {
+                            Some(site)
+                        } else if let Some(site) =
+                            self.check_indirect_call(&instr, &reg_state, instr_rva)
                         {
                             Some(site)
                         } else {
@@ -745,22 +796,32 @@ impl<'a> VcallScanner<'a> {
                             self.check_call_register(&instr, &reg_state, instr_rva)
                         }
                     }
-                    Mnemonic::Jmp => self.check_indirect_jmp(&instr, &reg_state, instr_rva),
+                    Mnemonic::Jmp => {
+                        if let Some(site) = self.check_global_indirect_mem(
+                            &instr,
+                            instr_rva,
+                            VcallKind::GlobalIndirectJmp,
+                        ) {
+                            Some(site)
+                        } else if let Some(site) = self.check_global_slot_indirect_mem(
+                            &instr,
+                            &reg_state,
+                            instr_rva,
+                            VcallKind::GlobalIndirectJmp,
+                        ) {
+                            Some(site)
+                        } else if let Some(site) =
+                            self.check_indirect_jmp(&instr, &reg_state, instr_rva)
+                        {
+                            Some(site)
+                        } else {
+                            self.check_jmp_register(&instr, &reg_state, instr_rva)
+                        }
+                    }
                     _ => None,
                 };
-                if let Some(mut site) = maybe_site {
-                    site.resolved_target = self.global_map.resolve_vcall(
-                        site.vtable_rva,
-                        site.vtable_offset,
-                        self.mod_base,
-                    );
-                    if site.resolved_target.is_some() {
-                        stats.vcalls_resolved += 1;
-                    } else {
-                        stats.unresolved_globals += 1;
-                    }
-                    stats.vcalls_detected += 1;
-                    sites.push(site);
+                if let Some(site) = maybe_site {
+                    sites.push(self.resolve_site_target(site, &mut stats));
                 }
                 reg_state.reset();
                 block_instr_count = 0;
@@ -771,7 +832,22 @@ impl<'a> VcallScanner<'a> {
             if let Some((dest, global_rva)) = self.check_global_load(&instr) {
                 if self.global_map.contains_global(global_rva) {
                     reg_state.set(dest, RegisterValue::GlobalPtr { global_rva });
+                } else if let Some(target_rva) = self.resolve_global_function_pointer(global_rva) {
+                    reg_state.set(
+                        dest,
+                        RegisterValue::GlobalFuncPtr {
+                            global_rva,
+                            target_rva,
+                        },
+                    );
+                } else {
+                    reg_state.clobber(dest);
                 }
+                continue;
+            }
+
+            if let Some((dest, global_rva)) = self.check_global_slot_lea(&instr) {
+                reg_state.set(dest, RegisterValue::GlobalFuncSlot { global_rva });
                 continue;
             }
 
@@ -800,6 +876,19 @@ impl<'a> VcallScanner<'a> {
                 }
             }
 
+            if let Some((dest, global_rva, target_rva)) =
+                self.check_global_slot_load(&instr, &reg_state)
+            {
+                reg_state.set(
+                    dest,
+                    RegisterValue::GlobalFuncPtr {
+                        global_rva,
+                        target_rva,
+                    },
+                );
+                continue;
+            }
+
             // Pattern 2: mov reg, [reg+offset] - dereference to get vtable
             if let Some((dest, src_global_rva, instance_offset, vtable_rva)) =
                 self.check_vtable_deref(&instr, &reg_state)
@@ -819,34 +908,14 @@ impl<'a> VcallScanner<'a> {
 
             // Pattern 3: lea reg, [reg+offset] - load vtable slot address
             if let Some(mut site) = self.check_lea_pattern(&instr, &reg_state, instr_rva) {
-                site.resolved_target = self.global_map.resolve_vcall(
-                    site.vtable_rva,
-                    site.vtable_offset,
-                    self.mod_base,
-                );
-                if site.resolved_target.is_some() {
-                    stats.vcalls_resolved += 1;
-                } else {
-                    stats.unresolved_globals += 1;
-                }
-                stats.vcalls_detected += 1;
+                site = self.resolve_site_target(site, &mut stats);
                 sites.push(site);
                 continue;
             }
 
             // Pattern 4: mov reg, [reg+offset] - load function pointer from vtable
             if let Some(mut site) = self.check_mov_vtable_pattern(&instr, &reg_state, instr_rva) {
-                site.resolved_target = self.global_map.resolve_vcall(
-                    site.vtable_rva,
-                    site.vtable_offset,
-                    self.mod_base,
-                );
-                if site.resolved_target.is_some() {
-                    stats.vcalls_resolved += 1;
-                } else {
-                    stats.unresolved_globals += 1;
-                }
-                stats.vcalls_detected += 1;
+                site = self.resolve_site_target(site, &mut stats);
                 sites.push(site);
                 continue;
             }
@@ -898,17 +967,7 @@ impl<'a> VcallScanner<'a> {
 
             // Pattern 7: call reg where reg holds VtableFuncPtr
             if let Some(mut site) = self.check_call_register(&instr, &reg_state, instr_rva) {
-                site.resolved_target = self.global_map.resolve_vcall(
-                    site.vtable_rva,
-                    site.vtable_offset,
-                    self.mod_base,
-                );
-                if site.resolved_target.is_some() {
-                    stats.vcalls_resolved += 1;
-                } else {
-                    stats.unresolved_globals += 1;
-                }
-                stats.vcalls_detected += 1;
+                site = self.resolve_site_target(site, &mut stats);
                 sites.push(site);
                 continue;
             }
@@ -942,9 +1001,205 @@ impl<'a> VcallScanner<'a> {
         let dest = instr.op0_register();
         // Calculate the absolute address being loaded, then convert to RVA
         let target_addr = instr.ip_rel_memory_address();
-        let global_rva = (target_addr - self.image_base) as u32;
+        let global_rva = u32::try_from(target_addr.checked_sub(self.image_base)?).ok()?;
 
         Some((dest, global_rva))
+    }
+
+    /// Check for `lea reg, [rip+global]` where the global slot stores a function pointer.
+    fn check_global_slot_lea(&self, instr: &Instruction) -> Option<(Register, u32)> {
+        if instr.mnemonic() != Mnemonic::Lea
+            || instr.op0_kind() != OpKind::Register
+            || instr.op1_kind() != OpKind::Memory
+            || instr.memory_base() != Register::RIP
+            || instr.memory_index() != Register::None
+        {
+            return None;
+        }
+
+        let global_rva =
+            u32::try_from(instr.ip_rel_memory_address().checked_sub(self.image_base)?).ok()?;
+        Some((instr.op0_register(), global_rva))
+    }
+
+    fn read_global_qword(&self, global_rva: u32) -> Option<u64> {
+        let global_addr = self.mod_base as u64 + global_rva as u64;
+        let mut bytes = [0u8; 8];
+        if !safe_read_memory(global_addr as *const u8, &mut bytes) {
+            return None;
+        }
+        Some(strip_pointer_tags(u64::from_le_bytes(bytes)))
+    }
+
+    fn target_address_to_rva(&self, target: u64) -> Option<u32> {
+        let runtime_base = self.mod_base as u64;
+        for base in [runtime_base, self.image_base] {
+            let Some(delta) = target.checked_sub(base) else {
+                continue;
+            };
+            if delta <= u32::MAX as u64 {
+                let rva = delta as u32;
+                if self.rva_in_code_targets(rva) {
+                    return Some(rva);
+                }
+            }
+        }
+        None
+    }
+
+    fn rva_in_code_targets(&self, rva: u32) -> bool {
+        self.code_target_ranges.is_empty()
+            || self.code_target_ranges.iter().any(|&(start, size)| {
+                let end = start.saturating_add(size);
+                rva >= start && rva < end
+            })
+    }
+
+    fn resolve_global_function_pointer(&self, global_rva: u32) -> Option<u32> {
+        let target = self.read_global_qword(global_rva)?;
+        self.target_address_to_rva(target)
+    }
+
+    fn resolve_global_function_slot(&self, base_global_rva: u32, displacement: u64) -> Option<u32> {
+        let displacement = u32::try_from(displacement).ok()?;
+        base_global_rva.checked_add(displacement)
+    }
+
+    fn resolve_site_target(&self, mut site: VcallSite, stats: &mut DevirtStats) -> VcallSite {
+        if site.kind.is_global_indirect() {
+            stats.global_indirect_calls_detected += 1;
+            if site.resolved_target.is_some() {
+                stats.global_indirect_calls_resolved += 1;
+                stats.vcalls_resolved += 1;
+            } else {
+                stats.unresolved_globals += 1;
+            }
+        } else {
+            site.resolved_target =
+                self.global_map
+                    .resolve_vcall(site.vtable_rva, site.vtable_offset, self.mod_base);
+            if site.resolved_target.is_some() {
+                stats.vcalls_resolved += 1;
+            } else {
+                stats.unresolved_globals += 1;
+            }
+        }
+        stats.vcalls_detected += 1;
+        site
+    }
+
+    /// Check `call/jmp qword ptr [rip+global]` where the global stores a function pointer.
+    fn check_global_indirect_mem(
+        &self,
+        instr: &Instruction,
+        instr_rva: u32,
+        kind: VcallKind,
+    ) -> Option<VcallSite> {
+        if !kind.is_global_indirect() {
+            return None;
+        }
+        match (kind, instr.mnemonic()) {
+            (VcallKind::GlobalIndirectCall, Mnemonic::Call)
+            | (VcallKind::GlobalIndirectJmp, Mnemonic::Jmp) => {}
+            _ => return None,
+        }
+        if instr.op0_kind() != OpKind::Memory || instr.memory_base() != Register::RIP {
+            return None;
+        }
+        if instr.memory_index() != Register::None {
+            return None;
+        }
+
+        let global_rva =
+            u32::try_from(instr.ip_rel_memory_address().checked_sub(self.image_base)?).ok()?;
+        let target_rva = self.resolve_global_function_pointer(global_rva)?;
+        Some(VcallSite {
+            instruction_rva: instr_rva,
+            instruction_len: instr.len(),
+            global_rva,
+            instance_offset: 0,
+            vtable_rva: 0,
+            vtable_offset: 0,
+            resolved_target: Some(target_rva),
+            kind,
+            dest_register: None,
+            patch_site: None,
+        })
+    }
+
+    /// Check `call/jmp qword ptr [reg+disp]` where `reg` holds the address of a global slot.
+    fn check_global_slot_indirect_mem(
+        &self,
+        instr: &Instruction,
+        reg_state: &RegisterState,
+        instr_rva: u32,
+        kind: VcallKind,
+    ) -> Option<VcallSite> {
+        if !kind.is_global_indirect() {
+            return None;
+        }
+        match (kind, instr.mnemonic()) {
+            (VcallKind::GlobalIndirectCall, Mnemonic::Call)
+            | (VcallKind::GlobalIndirectJmp, Mnemonic::Jmp) => {}
+            _ => return None,
+        }
+        if instr.op0_kind() != OpKind::Memory || instr.memory_index() != Register::None {
+            return None;
+        }
+
+        let base = instr.memory_base();
+        if base == Register::None || base == Register::RIP {
+            return None;
+        }
+
+        if let RegisterValue::GlobalFuncSlot { global_rva } = reg_state.get(base) {
+            let slot_rva =
+                self.resolve_global_function_slot(*global_rva, instr.memory_displacement64())?;
+            let target_rva = self.resolve_global_function_pointer(slot_rva)?;
+            return Some(VcallSite {
+                instruction_rva: instr_rva,
+                instruction_len: instr.len(),
+                global_rva: slot_rva,
+                instance_offset: 0,
+                vtable_rva: 0,
+                vtable_offset: 0,
+                resolved_target: Some(target_rva),
+                kind,
+                dest_register: Some(base),
+                patch_site: None,
+            });
+        }
+
+        None
+    }
+
+    /// Check `mov reg, [slot_reg+disp]` where `slot_reg` names a global function slot.
+    fn check_global_slot_load(
+        &self,
+        instr: &Instruction,
+        reg_state: &RegisterState,
+    ) -> Option<(Register, u32, u32)> {
+        if instr.mnemonic() != Mnemonic::Mov
+            || instr.op0_kind() != OpKind::Register
+            || instr.op1_kind() != OpKind::Memory
+            || instr.memory_index() != Register::None
+        {
+            return None;
+        }
+
+        let base = instr.memory_base();
+        if base == Register::None || base == Register::RIP {
+            return None;
+        }
+
+        if let RegisterValue::GlobalFuncSlot { global_rva } = reg_state.get(base) {
+            let slot_rva =
+                self.resolve_global_function_slot(*global_rva, instr.memory_displacement64())?;
+            let target_rva = self.resolve_global_function_pointer(slot_rva)?;
+            return Some((instr.op0_register(), slot_rva, target_rva));
+        }
+
+        None
     }
 
     /// Check for `mov reg, [reg+offset]` where source reg holds a GlobalPtr.
@@ -1453,6 +1708,25 @@ impl<'a> VcallScanner<'a> {
 
         let reg = instr.op0_register();
 
+        if let RegisterValue::GlobalFuncPtr {
+            global_rva,
+            target_rva,
+        } = reg_state.get(reg)
+        {
+            return Some(VcallSite {
+                instruction_rva: instr_rva,
+                instruction_len: instr.len(),
+                global_rva: *global_rva,
+                instance_offset: 0,
+                vtable_rva: 0,
+                vtable_offset: 0,
+                resolved_target: Some(*target_rva),
+                kind: VcallKind::GlobalIndirectCall,
+                dest_register: Some(reg),
+                patch_site: None,
+            });
+        }
+
         // Check if reg holds a VtableFuncPtr
         if let RegisterValue::VtableFuncPtr {
             global_rva,
@@ -1481,8 +1755,48 @@ impl<'a> VcallScanner<'a> {
         None
     }
 
+    /// Check for `jmp reg` where reg holds a global function pointer.
+    fn check_jmp_register(
+        &self,
+        instr: &Instruction,
+        reg_state: &RegisterState,
+        instr_rva: u32,
+    ) -> Option<VcallSite> {
+        if instr.mnemonic() != Mnemonic::Jmp || instr.op0_kind() != OpKind::Register {
+            return None;
+        }
+
+        let reg = instr.op0_register();
+        if let RegisterValue::GlobalFuncPtr {
+            global_rva,
+            target_rva,
+        } = reg_state.get(reg)
+        {
+            return Some(VcallSite {
+                instruction_rva: instr_rva,
+                instruction_len: instr.len(),
+                global_rva: *global_rva,
+                instance_offset: 0,
+                vtable_rva: 0,
+                vtable_offset: 0,
+                resolved_target: Some(*target_rva),
+                kind: VcallKind::GlobalIndirectJmp,
+                dest_register: Some(reg),
+                patch_site: None,
+            });
+        }
+
+        None
+    }
+
     /// Update register state for general mov instructions.
     fn update_reg_state(&self, instr: &Instruction, reg_state: &mut RegisterState) {
+        // Comparisons do not write their register operands; preserving state here
+        // catches common null-guarded indirect calls.
+        if matches!(instr.mnemonic(), Mnemonic::Cmp | Mnemonic::Test) {
+            return;
+        }
+
         // If destination is a register, and source is a register, propagate state
         if instr.mnemonic() == Mnemonic::Mov
             && instr.op0_kind() == OpKind::Register
@@ -1564,8 +1878,12 @@ impl PatchGenerator {
 
     fn generate_patch(&self, site: &VcallSite, target_rva: u32) -> PatchResult {
         match site.kind {
-            VcallKind::IndirectCall => self.generate_call_patch(site, target_rva),
-            VcallKind::IndirectJmp => self.generate_jmp_patch(site, target_rva),
+            VcallKind::IndirectCall | VcallKind::GlobalIndirectCall => {
+                self.generate_call_patch(site, target_rva)
+            }
+            VcallKind::IndirectJmp | VcallKind::GlobalIndirectJmp => {
+                self.generate_jmp_patch(site, target_rva)
+            }
             VcallKind::LeaVtableSlot => match self.generate_lea_patch(site, target_rva) {
                 Some(p) => PatchResult::Inline(p),
                 None => PatchResult::Skip,
@@ -1717,12 +2035,8 @@ impl PatchGenerator {
     /// We patch the `add+mov` sequence (7 bytes) to `lea reg, [rip+rel32]` (7 bytes),
     /// leaving the `call reg` instruction unchanged but now calling the right function.
     fn generate_call_reg_patch(&self, site: &VcallSite, target_rva: u32) -> Option<CodePatch> {
-        let Some((patch_rva, patch_len)) = site.patch_site else {
-            return None;
-        };
-        let Some(dest_reg) = site.dest_register else {
-            return None;
-        };
+        let (patch_rva, patch_len) = site.patch_site?;
+        let dest_reg = site.dest_register?;
         let dest_reg64 = to_64bit_reg(dest_reg);
 
         // Need at least 7 bytes for lea reg, [rip+rel32]
@@ -2062,10 +2376,61 @@ fn generate_thunk_patches(
 // Main Entry Point
 // ============================================================================
 
+fn indirect_call_fact_from_site(site: &VcallSite, image_base: u64) -> Option<IndirectCallFact> {
+    if !site.kind.is_global_indirect() {
+        return None;
+    }
+    let target_rva = site.resolved_target?;
+    let via_register = site.dest_register.is_some();
+    Some(IndirectCallFact {
+        instruction_rva: site.instruction_rva,
+        instruction_len: site.instruction_len,
+        global_rva: site.global_rva,
+        target_rva,
+        target_va: image_base + target_rva as u64,
+        kind: site.kind,
+        via_register,
+        confidence: "high",
+        reason: if via_register {
+            "global_loaded_to_register"
+        } else {
+            "rip_relative_global_function_pointer"
+        },
+    })
+}
+
+/// Analyze `.text` for indirect call/jmp sites whose targets are stored in globals.
+///
+/// This is side-effect free and is used by the dumper to embed call-resolution facts
+/// in `.revdmp` even when patching is disabled.
+pub(crate) fn analyze_global_indirect_calls(
+    mod_base: *const u8,
+    image_base: u64,
+    text_section_rva: u32,
+    text_section_size: u32,
+    config: &DevirtConfig,
+) -> Vec<IndirectCallFact> {
+    if text_section_size == 0 {
+        return Vec::new();
+    }
+
+    let text_addr = unsafe { mod_base.add(text_section_rva as usize) };
+    let text_data = unsafe { std::slice::from_raw_parts(text_addr, text_section_size as usize) };
+    let empty_map = GlobalVtableMap::build(&[], &[], image_base);
+    let scanner = VcallScanner::new(mod_base, image_base, &empty_map, config)
+        .with_code_target_ranges(vec![(text_section_rva, text_section_size)]);
+
+    let (sites, _) = scanner.scan_section(text_data, text_section_rva);
+    sites
+        .iter()
+        .filter_map(|site| indirect_call_fact_from_site(site, image_base))
+        .collect()
+}
+
 /// Perform devirtualization on a dumped PE.
 ///
 /// This is the main entry point called from the dumper.
-pub fn devirtualize(
+pub(crate) fn devirtualize(
     output: &mut [u8],
     mod_base: *const u8,
     image_base: u64,
@@ -2080,16 +2445,13 @@ pub fn devirtualize(
     // Build global-to-vtable mapping
     let global_map = GlobalVtableMap::build(vtable_facts, heap_edges, image_base);
 
-    if global_map.is_empty() {
-        return Ok(DevirtStats::default());
-    }
-
     // Read .text section from memory
     let text_addr = unsafe { mod_base.add(text_section_rva as usize) };
     let text_data = unsafe { std::slice::from_raw_parts(text_addr, text_section_size as usize) };
 
     // Scan for vcall patterns
-    let scanner = VcallScanner::new(mod_base, image_base, &global_map, config);
+    let scanner = VcallScanner::new(mod_base, image_base, &global_map, config)
+        .with_code_target_ranges(vec![(text_section_rva, text_section_size)]);
     let (sites, mut stats) = scanner.scan_section(text_data, text_section_rva);
 
     if config.dry_run {
@@ -2305,6 +2667,136 @@ mod tests {
     }
 
     #[test]
+    fn test_scanner_resolves_direct_global_indirect_call() {
+        let mut module = vec![0u8; 0x1000];
+        let image_base = module.as_mut_ptr() as u64;
+        let section_rva = 0x100u32;
+        let global_rva = 0x300u32;
+        let func_rva = 0x700u32;
+
+        module[global_rva as usize..global_rva as usize + 8]
+            .copy_from_slice(&(image_base + func_rva as u64).to_le_bytes());
+
+        let next_ip = image_base + section_rva as u64 + 6;
+        let global_va = image_base + global_rva as u64;
+        let disp = (global_va as i64 - next_ip as i64) as i32;
+        let mut code = vec![0xFF, 0x15]; // call qword ptr [rip+disp32]
+        code.extend_from_slice(&disp.to_le_bytes());
+
+        let map = GlobalVtableMap::build(&[], &[], image_base);
+        let config = DevirtConfig::default();
+        let scanner = VcallScanner::new(module.as_ptr(), image_base, &map, &config)
+            .with_code_target_ranges(vec![(section_rva, 0x900)]);
+
+        let (sites, stats) = scanner.scan_section(&code, section_rva);
+        assert_eq!(stats.vcalls_detected, 1);
+        assert_eq!(stats.global_indirect_calls_detected, 1);
+        assert_eq!(stats.global_indirect_calls_resolved, 1);
+        assert_eq!(sites[0].kind, VcallKind::GlobalIndirectCall);
+        assert_eq!(sites[0].global_rva, global_rva);
+        assert_eq!(sites[0].resolved_target, Some(func_rva));
+    }
+
+    #[test]
+    fn test_scanner_resolves_global_function_slot_call() {
+        let mut module = vec![0u8; 0x1000];
+        let image_base = module.as_mut_ptr() as u64;
+        let section_rva = 0x100u32;
+        let global_rva = 0x300u32;
+        let func_rva = 0x700u32;
+
+        module[global_rva as usize..global_rva as usize + 8]
+            .copy_from_slice(&(image_base + func_rva as u64).to_le_bytes());
+
+        let next_ip_after_lea = image_base + section_rva as u64 + 7;
+        let global_va = image_base + global_rva as u64;
+        let disp = (global_va as i64 - next_ip_after_lea as i64) as i32;
+        let mut code = vec![0x48, 0x8D, 0x05]; // lea rax, [rip+disp32]
+        code.extend_from_slice(&disp.to_le_bytes());
+        code.extend_from_slice(&[0xFF, 0x10]); // call qword ptr [rax]
+
+        let map = GlobalVtableMap::build(&[], &[], image_base);
+        let config = DevirtConfig::default();
+        let scanner = VcallScanner::new(module.as_ptr(), image_base, &map, &config)
+            .with_code_target_ranges(vec![(section_rva, 0x900)]);
+
+        let (sites, stats) = scanner.scan_section(&code, section_rva);
+        assert_eq!(stats.global_indirect_calls_resolved, 1);
+        assert_eq!(sites[0].kind, VcallKind::GlobalIndirectCall);
+        assert_eq!(sites[0].instruction_rva, section_rva + 7);
+        assert_eq!(sites[0].global_rva, global_rva);
+        assert_eq!(sites[0].resolved_target, Some(func_rva));
+    }
+
+    #[test]
+    fn test_scanner_resolves_global_function_slot_load_then_call() {
+        let mut module = vec![0u8; 0x1000];
+        let image_base = module.as_mut_ptr() as u64;
+        let section_rva = 0x100u32;
+        let global_rva = 0x300u32;
+        let func_rva = 0x700u32;
+
+        module[global_rva as usize..global_rva as usize + 8]
+            .copy_from_slice(&(image_base + func_rva as u64).to_le_bytes());
+
+        let next_ip_after_lea = image_base + section_rva as u64 + 7;
+        let global_va = image_base + global_rva as u64;
+        let disp = (global_va as i64 - next_ip_after_lea as i64) as i32;
+        let mut code = vec![0x48, 0x8D, 0x05]; // lea rax, [rip+disp32]
+        code.extend_from_slice(&disp.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0x8B, 0x08]); // mov rcx, [rax]
+        code.extend_from_slice(&[0xFF, 0xD1]); // call rcx
+
+        let map = GlobalVtableMap::build(&[], &[], image_base);
+        let config = DevirtConfig::default();
+        let scanner = VcallScanner::new(module.as_ptr(), image_base, &map, &config)
+            .with_code_target_ranges(vec![(section_rva, 0x900)]);
+
+        let (sites, stats) = scanner.scan_section(&code, section_rva);
+        assert_eq!(stats.global_indirect_calls_resolved, 1);
+        assert_eq!(sites[0].instruction_rva, section_rva + 10);
+        assert_eq!(sites[0].global_rva, global_rva);
+        assert_eq!(sites[0].resolved_target, Some(func_rva));
+    }
+
+    #[test]
+    fn test_scanner_resolves_guarded_global_indirect_call_register() {
+        let mut module = vec![0u8; 0x1000];
+        let image_base = module.as_mut_ptr() as u64;
+        let section_rva = 0x100u32;
+        let global_rva = 0x300u32;
+        let func_rva = 0x700u32;
+
+        module[global_rva as usize..global_rva as usize + 8]
+            .copy_from_slice(&(image_base + func_rva as u64).to_le_bytes());
+
+        let next_ip_after_global_load = image_base + section_rva as u64 + 7;
+        let global_va = image_base + global_rva as u64;
+        let disp = (global_va as i64 - next_ip_after_global_load as i64) as i32;
+        let mut code = vec![0x48, 0x8B, 0x05]; // mov rax, [rip+disp32]
+        code.extend_from_slice(&disp.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
+        code.extend_from_slice(&[0x74, 0x02]); // je over call
+        code.extend_from_slice(&[0xFF, 0xD0]); // call rax
+        module[section_rva as usize..section_rva as usize + code.len()].copy_from_slice(&code);
+
+        let facts = analyze_global_indirect_calls(
+            module.as_ptr(),
+            image_base,
+            section_rva,
+            0x900,
+            &DevirtConfig::default(),
+        );
+
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].instruction_rva, section_rva + 12);
+        assert_eq!(facts[0].global_rva, global_rva);
+        assert_eq!(facts[0].target_rva, func_rva);
+        assert!(facts[0].via_register);
+        assert_eq!(facts[0].reason, "global_loaded_to_register");
+    }
+
+    #[test]
     fn test_register_state_reset() {
         let mut state = RegisterState::new();
 
@@ -2424,6 +2916,32 @@ mod tests {
         assert_eq!(patch.patch_bytes.len(), original_len);
         // First byte should be E8 (call rel32)
         assert_eq!(patch.patch_bytes[0], 0xE8);
+    }
+
+    #[test]
+    fn test_encode_global_indirect_call_patch() {
+        let image_base = 0x140000000u64;
+        let call_rva = 0x1000u32;
+        let target_rva = 0x5000u32;
+
+        let gen = PatchGenerator::new(image_base);
+        let site = VcallSite {
+            instruction_rva: call_rva,
+            instruction_len: 6,
+            global_rva: 0x3000,
+            instance_offset: 0,
+            vtable_rva: 0,
+            vtable_offset: 0,
+            resolved_target: Some(target_rva),
+            kind: VcallKind::GlobalIndirectCall,
+            dest_register: None,
+            patch_site: None,
+        };
+
+        let (patches, _) = gen.generate_patches(&[site]);
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].rva, call_rva);
+        assert_eq!(patches[0].patch_bytes[0], 0xE8);
     }
 
     #[test]
@@ -2628,10 +3146,13 @@ mod tests {
     #[test]
     fn test_all_vcall_kinds_distinct() {
         assert_ne!(VcallKind::IndirectCall, VcallKind::IndirectJmp);
+        assert_ne!(VcallKind::IndirectCall, VcallKind::GlobalIndirectCall);
+        assert_ne!(VcallKind::IndirectJmp, VcallKind::GlobalIndirectJmp);
         assert_ne!(VcallKind::IndirectCall, VcallKind::LeaVtableSlot);
         assert_ne!(VcallKind::IndirectCall, VcallKind::MovVtableSlot);
         assert_ne!(VcallKind::IndirectJmp, VcallKind::LeaVtableSlot);
         assert_ne!(VcallKind::IndirectJmp, VcallKind::MovVtableSlot);
+        assert_ne!(VcallKind::GlobalIndirectCall, VcallKind::GlobalIndirectJmp);
         assert_ne!(VcallKind::LeaVtableSlot, VcallKind::MovVtableSlot);
     }
 }

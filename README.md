@@ -49,8 +49,8 @@ revdump bridges that gap:
 - It emits minimal synthetic objects, avoiding noisy full-heap dumps while keeping vfptr offsets intact.
 - It supports secondary vfptrs and multiple inheritance, not just `object+0` vtables.
 - It recursively follows heap-owned object references and records a scored object graph.
-- It can patch resolved virtual calls into direct calls for better decompiler output.
-- It generates `.revdmp` metadata and IDAPython annotations so the recovered runtime context is immediately usable in reverse-engineering tools.
+- It can patch resolved virtual calls and global function-pointer indirect calls into direct calls for better decompiler output.
+- It embeds a self-describing `.revdmp` runtime graph so IDA, Ghidra, Binary Ninja, or custom tooling can consume the recovered context without a sidecar; IDAPython annotation output remains optional.
 
 ## Features
 
@@ -66,14 +66,15 @@ revdump bridges that gap:
 ### Vcall Devirtualization
 - **Pattern detection** - Identifies `call [rax+offset]`, `jmp [rax+offset]`, and related patterns
 - **Direct call patching** - Rewrites indirect vtable calls to direct `call target` instructions
+- **Global function-pointer resolution** - Resolves and patches `call [rip+global]` and `mov reg, [rip+global]; call reg` when the global stores a module function pointer
 - **Thunk generation** - Places call thunks in code padding for space-constrained patches
 - **Secondary vfptr support** - Resolves vcalls through nonzero object vfptr offsets
-- **Strong analysis mode** - Optional bounded tracking through object fields and simple stack aliases
+- **Strong analysis mode** - Optional bounded tracking through object fields, simple stack aliases, guarded call fallthrough, and global function-pointer registers
 - **Multi-byte NOP detection** - Finds padding regions for thunk placement
 
 ### Analysis Metadata
-- **Embedded `.revdmp` section** - Stores vtable facts, object graph edges, containers, and synthetic structs
-- **IDA sidecar script** - Generates `*.ida.py` annotations for names, offsets, structs, comments, and graph edges
+- **Embedded `.revdmp` section** - Stores a schema manifest, vtable facts, object graph edges, containers, resolved global indirect calls, normalized runtime relationships, and synthetic structs
+- **No sidecar required** - `.revdmp` is the authoritative in-PE representation for tooling; the generated `*.ida.py` annotations are compatibility sugar
 - **IDA self-check** - Generated script records whether expected annotations were applied
 - **RTTI recovery** - Resolves MSVC and Itanium-style type names where metadata is available
 - **COFF symbol fallback** - Uses vtable-like COFF symbols when RTTI is unavailable
