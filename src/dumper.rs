@@ -84,6 +84,45 @@ pub struct FunctionPointerTableFact {
     reason: &'static str,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VtableSlotFact {
+    vtable_rva: u32,
+    type_name: Option<String>,
+    slot_index: usize,
+    slot_offset: u32,
+    entry_rva: u32,
+    entry_va: u64,
+    normalized_target_rva: u32,
+    normalized_target_va: u64,
+    slot_kind: &'static str,
+    target_kind: &'static str,
+    function_symbol: String,
+    confidence: &'static str,
+    reason: &'static str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThunkNormalizationFact {
+    thunk_rva: u32,
+    thunk_va: u64,
+    normalized_target_rva: u32,
+    normalized_target_va: u64,
+    thunk_kind: &'static str,
+    instruction_len: usize,
+    this_adjustment: Option<i32>,
+    confidence: &'static str,
+    reason: &'static str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ThunkAnalysis {
+    normalized_target_rva: u32,
+    thunk_kind: &'static str,
+    instruction_len: usize,
+    this_adjustment: Option<i32>,
+    reason: &'static str,
+}
+
 #[derive(Clone, Debug)]
 struct RuntimeObjectFact {
     id: String,
@@ -456,6 +495,319 @@ fn analyze_function_pointer_tables(
     (pointers, tables)
 }
 
+const MAX_VTABLE_SLOTS: usize = 256;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DecodedThunkJump {
+    target_rva: u32,
+    instruction_len: usize,
+    jump_kind: &'static str,
+    reason: &'static str,
+}
+
+fn read_pointer_at_rva(pe: &PeParser, rva: u32) -> Option<u64> {
+    if pe.is_64bit {
+        read_u64_at_rva(pe, rva)
+    } else {
+        read_u32_at_rva(pe, rva).map(u64::from)
+    }
+}
+
+fn relative_target_rva(instr_rva: u32, instr_len: usize, rel: i64) -> Option<u32> {
+    let target = instr_rva as i64 + instr_len as i64 + rel;
+    (0..=u32::MAX as i64)
+        .contains(&target)
+        .then_some(target as u32)
+}
+
+fn decode_simple_thunk_jump(
+    pe: &PeParser,
+    instr_rva: u32,
+    bytes: &[u8],
+    code_ranges: &[(u32, u32)],
+) -> Option<DecodedThunkJump> {
+    if bytes.len() >= 5 && bytes[0] == 0xE9 {
+        let rel = i32::from_le_bytes(bytes[1..5].try_into().ok()?) as i64;
+        let target_rva = relative_target_rva(instr_rva, 5, rel)?;
+        if rva_in_ranges(target_rva, code_ranges) {
+            return Some(DecodedThunkJump {
+                target_rva,
+                instruction_len: 5,
+                jump_kind: "relative_jmp",
+                reason: "direct_relative_jump_thunk",
+            });
+        }
+    }
+
+    if bytes.len() >= 2 && bytes[0] == 0xEB {
+        let rel = bytes[1] as i8 as i64;
+        let target_rva = relative_target_rva(instr_rva, 2, rel)?;
+        if rva_in_ranges(target_rva, code_ranges) {
+            return Some(DecodedThunkJump {
+                target_rva,
+                instruction_len: 2,
+                jump_kind: "short_jmp",
+                reason: "short_relative_jump_thunk",
+            });
+        }
+    }
+
+    let prefix_len = bytes
+        .first()
+        .filter(|&&byte| (0x40..=0x4F).contains(&byte))
+        .map(|_| 1usize)
+        .unwrap_or_default();
+    if bytes.len() >= prefix_len + 6 && bytes[prefix_len] == 0xFF && bytes[prefix_len + 1] == 0x25 {
+        let disp =
+            i32::from_le_bytes(bytes[prefix_len + 2..prefix_len + 6].try_into().ok()?) as i64;
+        let instruction_len = prefix_len + 6;
+        let slot_rva = relative_target_rva(instr_rva, instruction_len, disp)?;
+        let target_ptr = read_pointer_at_rva(pe, slot_rva)?;
+        let target_rva = ptr_to_rva(pe, target_ptr)?;
+        if rva_in_ranges(target_rva, code_ranges) {
+            return Some(DecodedThunkJump {
+                target_rva,
+                instruction_len,
+                jump_kind: "rip_indirect_jmp",
+                reason: "rip_indirect_jump_thunk",
+            });
+        }
+    }
+
+    if bytes.len() >= 12
+        && bytes[0] == 0x48
+        && bytes[1] == 0xB8
+        && bytes[10] == 0xFF
+        && bytes[11] == 0xE0
+    {
+        let target_ptr = u64::from_le_bytes(bytes[2..10].try_into().ok()?);
+        let target_rva = ptr_to_rva(pe, target_ptr)?;
+        if rva_in_ranges(target_rva, code_ranges) {
+            return Some(DecodedThunkJump {
+                target_rva,
+                instruction_len: 12,
+                jump_kind: "mov_rax_jmp",
+                reason: "absolute_jump_thunk",
+            });
+        }
+    }
+
+    None
+}
+
+fn decode_this_adjustment(bytes: &[u8]) -> Option<(usize, i32)> {
+    if bytes.len() >= 4 && bytes[0] == 0x48 && bytes[1] == 0x83 {
+        let imm = bytes[3] as i8 as i32;
+        return match bytes[2] {
+            0xC1 => Some((4, imm)),
+            0xE9 => Some((4, imm.saturating_neg())),
+            _ => None,
+        };
+    }
+
+    if bytes.len() >= 7 && bytes[0] == 0x48 && bytes[1] == 0x81 {
+        let imm = i32::from_le_bytes(bytes[3..7].try_into().ok()?);
+        return match bytes[2] {
+            0xC1 => Some((7, imm)),
+            0xE9 => Some((7, imm.saturating_neg())),
+            _ => None,
+        };
+    }
+
+    if bytes.len() >= 4 && bytes[0] == 0x48 && bytes[1] == 0x8D && bytes[2] == 0x49 {
+        return Some((4, bytes[3] as i8 as i32));
+    }
+
+    if bytes.len() >= 7 && bytes[0] == 0x48 && bytes[1] == 0x8D && bytes[2] == 0x89 {
+        return Some((7, i32::from_le_bytes(bytes[3..7].try_into().ok()?)));
+    }
+
+    None
+}
+
+fn analyze_thunk(
+    pe: &PeParser,
+    thunk_rva: u32,
+    code_ranges: &[(u32, u32)],
+) -> Option<ThunkAnalysis> {
+    let bytes = read_bytes_at_rva(pe, thunk_rva, 16)?;
+    if let Some(jump) = decode_simple_thunk_jump(pe, thunk_rva, bytes, code_ranges) {
+        return Some(ThunkAnalysis {
+            normalized_target_rva: jump.target_rva,
+            thunk_kind: "jump_thunk",
+            instruction_len: jump.instruction_len,
+            this_adjustment: None,
+            reason: jump.reason,
+        });
+    }
+
+    let (adjust_len, this_adjustment) = decode_this_adjustment(bytes)?;
+    let jump_rva = thunk_rva.checked_add(adjust_len as u32)?;
+    let jump_bytes = bytes.get(adjust_len..)?;
+    let jump = decode_simple_thunk_jump(pe, jump_rva, jump_bytes, code_ranges)?;
+    Some(ThunkAnalysis {
+        normalized_target_rva: jump.target_rva,
+        thunk_kind: "adjustor_thunk",
+        instruction_len: adjust_len + jump.instruction_len,
+        this_adjustment: Some(this_adjustment),
+        reason: "this_adjustment_then_jump",
+    })
+}
+
+fn classify_vtable_slot(
+    function_symbol: &str,
+    thunk: Option<&ThunkAnalysis>,
+) -> (&'static str, &'static str, &'static str, &'static str) {
+    let lower = function_symbol.to_ascii_lowercase();
+    if !function_symbol.is_empty() {
+        if lower.contains("purecall") {
+            return (
+                "pure_virtual",
+                "function",
+                "high",
+                "symbol_name_contains_purecall",
+            );
+        }
+        if function_symbol.starts_with("??_G") || lower.contains("scalar deleting destructor") {
+            return (
+                "scalar_deleting_destructor",
+                "function",
+                "high",
+                "msvc_deleting_destructor_symbol",
+            );
+        }
+        if function_symbol.starts_with("??_E") || lower.contains("vector deleting destructor") {
+            return (
+                "vector_deleting_destructor",
+                "function",
+                "high",
+                "msvc_deleting_destructor_symbol",
+            );
+        }
+        if function_symbol.starts_with("??1")
+            || lower.contains("destructor")
+            || lower.contains("dtor")
+        {
+            return ("destructor", "function", "high", "destructor_symbol");
+        }
+    }
+
+    if let Some(thunk) = thunk {
+        if thunk.thunk_kind == "adjustor_thunk" {
+            return (
+                "adjustor_thunk",
+                "normalized_function",
+                "high",
+                thunk.reason,
+            );
+        }
+        return ("jump_thunk", "normalized_function", "high", thunk.reason);
+    }
+
+    (
+        "virtual_function",
+        "function",
+        "medium",
+        "module_code_pointer_slot",
+    )
+}
+
+fn analyze_vtable_slots(
+    pe: &PeParser,
+    facts: &[EnrichedVtableFact],
+) -> (Vec<VtableSlotFact>, Vec<ThunkNormalizationFact>) {
+    let code_ranges = executable_ranges(pe);
+    if code_ranges.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let pointer_size = if pe.is_64bit { 8usize } else { 4usize };
+    let function_symbols = parse_coff_function_symbols(pe);
+    let mut vtables = BTreeMap::<u32, Option<String>>::new();
+    for enriched in facts {
+        vtables
+            .entry(enriched.fact.vtable_rva)
+            .and_modify(|name| {
+                if name.is_none() && enriched.type_name.is_some() {
+                    *name = enriched.type_name.clone();
+                }
+            })
+            .or_insert_with(|| enriched.type_name.clone());
+    }
+
+    let mut slots = Vec::new();
+    let mut thunks = BTreeMap::<u32, ThunkNormalizationFact>::new();
+    for (vtable_rva, type_name) in vtables {
+        for slot_index in 0..MAX_VTABLE_SLOTS {
+            let Some(slot_offset) = (slot_index * pointer_size).try_into().ok() else {
+                break;
+            };
+            let Some(slot_rva) = vtable_rva.checked_add(slot_offset) else {
+                break;
+            };
+            if !rva_in_image(pe, slot_rva, pointer_size) {
+                break;
+            }
+            let Some(entry_ptr) = read_pointer_at_rva(pe, slot_rva) else {
+                break;
+            };
+            let Some(entry_rva) = ptr_to_rva(pe, entry_ptr) else {
+                break;
+            };
+            if !rva_in_ranges(entry_rva, &code_ranges) {
+                break;
+            }
+
+            let thunk = analyze_thunk(pe, entry_rva, &code_ranges);
+            let normalized_target_rva = thunk
+                .as_ref()
+                .map(|analysis| analysis.normalized_target_rva)
+                .unwrap_or(entry_rva);
+            let function_symbol = function_symbols
+                .get(&normalized_target_rva)
+                .or_else(|| function_symbols.get(&entry_rva))
+                .cloned()
+                .unwrap_or_default();
+            let (slot_kind, target_kind, confidence, reason) =
+                classify_vtable_slot(&function_symbol, thunk.as_ref());
+
+            if let Some(thunk) = &thunk {
+                thunks
+                    .entry(entry_rva)
+                    .or_insert_with(|| ThunkNormalizationFact {
+                        thunk_rva: entry_rva,
+                        thunk_va: pe.image_base + entry_rva as u64,
+                        normalized_target_rva: thunk.normalized_target_rva,
+                        normalized_target_va: pe.image_base + thunk.normalized_target_rva as u64,
+                        thunk_kind: thunk.thunk_kind,
+                        instruction_len: thunk.instruction_len,
+                        this_adjustment: thunk.this_adjustment,
+                        confidence: "high",
+                        reason: thunk.reason,
+                    });
+            }
+
+            slots.push(VtableSlotFact {
+                vtable_rva,
+                type_name: type_name.clone(),
+                slot_index,
+                slot_offset,
+                entry_rva,
+                entry_va: pe.image_base + entry_rva as u64,
+                normalized_target_rva,
+                normalized_target_va: pe.image_base + normalized_target_rva as u64,
+                slot_kind,
+                target_kind,
+                function_symbol,
+                confidence,
+                reason,
+            });
+        }
+    }
+
+    (slots, thunks.into_values().collect())
+}
+
 /// Build an IDA-friendly metadata section that lists every flattened vtable fact.
 pub fn build_revdmp_metadata(
     facts: &[EnrichedVtableFact],
@@ -465,6 +817,8 @@ pub fn build_revdmp_metadata(
     indirect_calls: &[IndirectCallFact],
     function_pointers: &[FunctionPointerFact],
     function_pointer_tables: &[FunctionPointerTableFact],
+    vtable_slots: &[VtableSlotFact],
+    thunk_normalizations: &[ThunkNormalizationFact],
     image_base: u64,
     stub_generator: &StubGenerator,
 ) -> Vec<u8> {
@@ -574,6 +928,58 @@ pub fn build_revdmp_metadata(
             rtti.hierarchy_attributes,
             rtti.base_classes.len(),
             format_msvc_base_classes(&rtti.base_classes),
+        );
+    }
+
+    let _ = writeln!(text);
+    let _ = writeln!(text, "REVDMP_VTABLE_SLOTS v1");
+    let _ = writeln!(
+        text,
+        "vtable_rva,type_name,slot_index,slot_offset,entry_rva,entry_va,normalized_target_rva,normalized_target_va,slot_kind,target_kind,function_symbol,confidence,reason"
+    );
+    for slot in vtable_slots {
+        let _ = writeln!(
+            text,
+            "0x{:X},{},{},0x{:X},0x{:X},0x{:X},0x{:X},0x{:X},{},{},{},{},{}",
+            slot.vtable_rva,
+            slot.type_name.as_deref().unwrap_or(""),
+            slot.slot_index,
+            slot.slot_offset,
+            slot.entry_rva,
+            slot.entry_va,
+            slot.normalized_target_rva,
+            slot.normalized_target_va,
+            slot.slot_kind,
+            slot.target_kind,
+            slot.function_symbol,
+            slot.confidence,
+            slot.reason,
+        );
+    }
+
+    let _ = writeln!(text);
+    let _ = writeln!(text, "REVDMP_THUNK_NORMALIZATIONS v1");
+    let _ = writeln!(
+        text,
+        "thunk_rva,thunk_va,normalized_target_rva,normalized_target_va,thunk_kind,instruction_len,this_adjustment,confidence,reason"
+    );
+    for thunk in thunk_normalizations {
+        let this_adjustment = thunk
+            .this_adjustment
+            .map(|adjustment| adjustment.to_string())
+            .unwrap_or_default();
+        let _ = writeln!(
+            text,
+            "0x{:X},0x{:X},0x{:X},0x{:X},{},0x{:X},{},{},{}",
+            thunk.thunk_rva,
+            thunk.thunk_va,
+            thunk.normalized_target_rva,
+            thunk.normalized_target_va,
+            thunk.thunk_kind,
+            thunk.instruction_len,
+            this_adjustment,
+            thunk.confidence,
+            thunk.reason,
         );
     }
 
@@ -1034,6 +1440,39 @@ pub fn build_revdmp_metadata(
             pointer.reason,
         );
     }
+    for slot in vtable_slots {
+        relationship_id += 1;
+        let slot_rva = slot.vtable_rva.saturating_add(slot.slot_offset);
+        let _ = writeln!(
+            text,
+            "{},vtable_slot_to_function,vslot_{:08X}_{:03},func_{:08X},vtable_slot,0x{:X},,,0x{:X},function,0x{:X},0x{:X},,,{},{},vtable_slot_analysis",
+            relationship_id,
+            slot.vtable_rva,
+            slot.slot_index,
+            slot.normalized_target_rva,
+            slot_rva,
+            slot.slot_offset,
+            slot.normalized_target_rva,
+            slot.normalized_target_va,
+            slot.confidence,
+            slot.reason,
+        );
+    }
+    for thunk in thunk_normalizations {
+        relationship_id += 1;
+        let _ = writeln!(
+            text,
+            "{},thunk_to_function,thunk_{:08X},func_{:08X},thunk,0x{:X},,,0x0,function,0x{:X},0x{:X},,,{},{},thunk_normalization",
+            relationship_id,
+            thunk.thunk_rva,
+            thunk.normalized_target_rva,
+            thunk.thunk_rva,
+            thunk.normalized_target_rva,
+            thunk.normalized_target_va,
+            thunk.confidence,
+            thunk.reason,
+        );
+    }
     for rtti in msvc_rtti_by_vtable.values() {
         for base in &rtti.base_classes {
             if base.type_descriptor_rva == rtti.type_descriptor_rva {
@@ -1196,13 +1635,17 @@ fn sanitize_ida_name(name: &str) -> String {
     }
 }
 
-fn read_u32_at_rva(pe: &PeParser, rva: u32) -> Option<u32> {
+fn read_bytes_at_rva(pe: &PeParser, rva: u32, len: usize) -> Option<&[u8]> {
     let off = rva as usize;
-    if off + 4 > pe.size {
+    if off.checked_add(len)? > pe.size {
         return None;
     }
     let ptr = unsafe { pe.base.add(off) };
-    let bytes = unsafe { std::slice::from_raw_parts(ptr, 4) };
+    Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+}
+
+fn read_u32_at_rva(pe: &PeParser, rva: u32) -> Option<u32> {
+    let bytes = read_bytes_at_rva(pe, rva, 4)?;
     Some(u32::from_le_bytes(bytes.try_into().ok()?))
 }
 
@@ -1211,12 +1654,7 @@ fn read_i32_at_rva(pe: &PeParser, rva: u32) -> Option<i32> {
 }
 
 fn read_u64_at_rva(pe: &PeParser, rva: u32) -> Option<u64> {
-    let off = rva as usize;
-    if off + 8 > pe.size {
-        return None;
-    }
-    let ptr = unsafe { pe.base.add(off) };
-    let bytes = unsafe { std::slice::from_raw_parts(ptr, 8) };
+    let bytes = read_bytes_at_rva(pe, rva, 8)?;
     Some(u64::from_le_bytes(bytes.try_into().ok()?))
 }
 
@@ -1438,6 +1876,55 @@ fn resolve_itanium_rtti_type_name(pe: &PeParser, vtable_rva: u32) -> Option<Stri
     let name_rva = ptr_to_rva(pe, name_ptr)?;
     let raw = read_c_string_at_rva(pe, name_rva, 256)?;
     Some(demangle_itanium_type_name(&raw))
+}
+
+fn parse_coff_function_symbols(pe: &PeParser) -> BTreeMap<u32, String> {
+    const COFF_SYMBOL_SIZE: usize = 18;
+    let mut out = BTreeMap::new();
+    let raw = &pe.coff_symbol_table_raw;
+    let symbol_bytes = pe.number_of_symbols as usize * COFF_SYMBOL_SIZE;
+    if raw.len() < symbol_bytes + 4 {
+        return out;
+    }
+    let strings = &raw[symbol_bytes..];
+    let code_ranges = executable_ranges(pe);
+
+    let mut idx = 0usize;
+    while idx < pe.number_of_symbols as usize {
+        let off = idx * COFF_SYMBOL_SIZE;
+        if off + COFF_SYMBOL_SIZE > raw.len() {
+            break;
+        }
+
+        let name = if raw[off..off + 4] == [0, 0, 0, 0] {
+            let string_off = u32::from_le_bytes(raw[off + 4..off + 8].try_into().unwrap()) as usize;
+            if string_off >= 4 && string_off < strings.len() {
+                let bytes = &strings[string_off..];
+                let nul = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+                String::from_utf8_lossy(&bytes[..nul]).to_string()
+            } else {
+                String::new()
+            }
+        } else {
+            let nul = raw[off..off + 8].iter().position(|&b| b == 0).unwrap_or(8);
+            String::from_utf8_lossy(&raw[off..off + nul]).to_string()
+        };
+
+        let value = u32::from_le_bytes(raw[off + 8..off + 12].try_into().unwrap());
+        let section_number = i16::from_le_bytes(raw[off + 12..off + 14].try_into().unwrap());
+        let aux_count = raw[off + 17] as usize;
+        if section_number > 0 {
+            if let Some(section) = pe.sections.get(section_number as usize - 1) {
+                let rva = section.virtual_address.saturating_add(value);
+                if rva_in_ranges(rva, &code_ranges) && !name.is_empty() {
+                    out.entry(rva).or_insert(name);
+                }
+            }
+        }
+        idx += 1 + aux_count;
+    }
+
+    out
 }
 
 fn parse_coff_vtable_symbols(pe: &PeParser) -> HashMap<u32, String> {
@@ -2000,6 +2487,11 @@ impl Dumper {
         } else {
             (Vec::new(), Vec::new())
         };
+        let (vtable_slots, thunk_normalizations) = if config.emit_revdmp {
+            analyze_vtable_slots(pe, &enriched_facts)
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let metadata_data = if config.emit_revdmp {
             build_revdmp_metadata(
                 &enriched_facts,
@@ -2009,6 +2501,8 @@ impl Dumper {
                 &indirect_calls,
                 &function_pointers,
                 &function_pointer_tables,
+                &vtable_slots,
+                &thunk_normalizations,
                 pe.image_base,
                 &stub_generator,
             )
@@ -2838,6 +3332,32 @@ mod tests {
             confidence: "high",
             reason: "contiguous_code_pointer_run",
         }];
+        let vtable_slots = vec![VtableSlotFact {
+            vtable_rva: 0x5000,
+            type_name: Some("AudioService".to_string()),
+            slot_index: 0,
+            slot_offset: 0,
+            entry_rva: 0x7100,
+            entry_va: 0x1400_7100,
+            normalized_target_rva: 0x7200,
+            normalized_target_va: 0x1400_7200,
+            slot_kind: "adjustor_thunk",
+            target_kind: "normalized_function",
+            function_symbol: "AudioService::tick".to_string(),
+            confidence: "high",
+            reason: "this_adjustment_then_jump",
+        }];
+        let thunk_normalizations = vec![ThunkNormalizationFact {
+            thunk_rva: 0x7100,
+            thunk_va: 0x1400_7100,
+            normalized_target_rva: 0x7200,
+            normalized_target_va: 0x1400_7200,
+            thunk_kind: "adjustor_thunk",
+            instruction_len: 9,
+            this_adjustment: Some(-8),
+            confidence: "high",
+            reason: "this_adjustment_then_jump",
+        }];
 
         let metadata = build_revdmp_metadata(
             &facts,
@@ -2860,6 +3380,8 @@ mod tests {
             &indirect_calls,
             &function_pointers,
             &function_pointer_tables,
+            &vtable_slots,
+            &thunk_normalizations,
             0x1400_0000,
             &stub_generator,
         );
@@ -2882,6 +3404,14 @@ mod tests {
         assert!(text.contains("heap,,0x10000000,0x8000,0x18,0x20000000,"));
         assert!(text.contains("REVDMP_CONTAINERS v1"));
         assert!(text.contains("0x10000000,0x8000,0x30,vector_triple,1,0x20000000"));
+        assert!(text.contains("REVDMP_VTABLE_SLOTS v1"));
+        assert!(text.contains(
+            "0x5000,AudioService,0,0x0,0x7100,0x14007100,0x7200,0x14007200,adjustor_thunk,normalized_function,AudioService::tick,high,this_adjustment_then_jump"
+        ));
+        assert!(text.contains("REVDMP_THUNK_NORMALIZATIONS v1"));
+        assert!(text.contains(
+            "0x7100,0x14007100,0x7200,0x14007200,adjustor_thunk,0x9,-8,high,this_adjustment_then_jump"
+        ));
         assert!(text.contains("REVDMP_FIELD_TYPES v1"));
         assert!(text.contains(
             "obj_00008000,0x10000000,0x8000,0x20,vfptr,vtable,vtable_00005000,AudioService,1,high,vfptr_points_to_module_vtable"
@@ -2909,6 +3439,8 @@ mod tests {
         assert!(text.contains("REVDMP_RUNTIME_RELATIONSHIPS v3"));
         assert!(text.contains("vfptr_to_vtable,obj_00008000,vtable_00005000"));
         assert!(text.contains("function_pointer_slot,fptr_00006000,func_00004560"));
+        assert!(text.contains("vtable_slot_to_function,vslot_00005000_000,func_00007200"));
+        assert!(text.contains("thunk_to_function,thunk_00007100,func_00007200"));
         assert!(text.contains("msvc_inheritance,type_AudioService,type_IService"));
         assert!(
             text.contains("global_indirect_call,call_00001234,func_00004560,instruction,0x1234")
@@ -3114,6 +3646,100 @@ mod tests {
         assert_eq!(pointers[0].table_id.as_deref(), Some("fptable_00000400"));
         assert_eq!(pointers[2].kind, "callback_slot");
         assert_eq!(pointers[2].target_rva, 0x130);
+    }
+
+    #[test]
+    fn test_vtable_slot_analysis_normalizes_adjustor_thunk() {
+        let mut module = vec![0u8; 0x1000];
+        let image_base = module.as_ptr() as u64;
+        let text_rva = 0x100u32;
+        let thunk_rva = 0x120u32;
+        let target_rva = 0x180u32;
+        let direct_rva = 0x190u32;
+        let vtable_rva = 0x400u32;
+
+        module[vtable_rva as usize..vtable_rva as usize + 8]
+            .copy_from_slice(&(image_base + thunk_rva as u64).to_le_bytes());
+        module[vtable_rva as usize + 8..vtable_rva as usize + 16]
+            .copy_from_slice(&(image_base + direct_rva as u64).to_le_bytes());
+
+        module[thunk_rva as usize..thunk_rva as usize + 4]
+            .copy_from_slice(&[0x48, 0x83, 0xE9, 0x08]);
+        let jump_rva = thunk_rva + 4;
+        let rel = target_rva as i32 - (jump_rva as i32 + 5);
+        module[jump_rva as usize] = 0xE9;
+        module[jump_rva as usize + 1..jump_rva as usize + 5].copy_from_slice(&rel.to_le_bytes());
+        module[target_rva as usize] = 0xC3;
+        module[direct_rva as usize] = 0xC3;
+
+        let pe = PeParser {
+            base: module.as_ptr(),
+            size: module.len(),
+            pe_offset: 0,
+            machine: 0x8664,
+            number_of_sections: 2,
+            time_date_stamp: 0,
+            pointer_to_symbol_table: 0,
+            number_of_symbols: 0,
+            size_of_optional_header: 0,
+            characteristics: 0,
+            image_base,
+            section_alignment: 0x1000,
+            file_alignment: 0x200,
+            size_of_image: module.len() as u32,
+            size_of_headers: 0,
+            is_64bit: true,
+            optional_header_raw: Vec::new(),
+            coff_symbol_table_raw: Vec::new(),
+            sections: vec![
+                SectionInfo {
+                    name: ".text".to_string(),
+                    virtual_size: 0x200,
+                    virtual_address: text_rva,
+                    size_of_raw_data: 0x200,
+                    pointer_to_raw_data: 0,
+                    characteristics: IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE,
+                    new_pointer_to_raw_data: 0,
+                    new_size_of_raw_data: 0,
+                },
+                SectionInfo {
+                    name: ".rdata".to_string(),
+                    virtual_size: 0x100,
+                    virtual_address: vtable_rva,
+                    size_of_raw_data: 0x100,
+                    pointer_to_raw_data: 0,
+                    characteristics: 0,
+                    new_pointer_to_raw_data: 0,
+                    new_size_of_raw_data: 0,
+                },
+            ],
+        };
+        let facts = vec![EnrichedVtableFact {
+            type_name: Some("AudioService".to_string()),
+            msvc_rtti: None,
+            fact: VtableFact {
+                source_rva: Some(0x500),
+                heap_addr: 0x1000_0000,
+                stub_rva: 0x8000,
+                vfptr_offset: 0,
+                vtable_rva,
+            },
+        }];
+
+        let (slots, thunks) = analyze_vtable_slots(&pe, &facts);
+
+        assert_eq!(slots.len(), 2);
+        assert_eq!(slots[0].entry_rva, thunk_rva);
+        assert_eq!(slots[0].normalized_target_rva, target_rva);
+        assert_eq!(slots[0].slot_kind, "adjustor_thunk");
+        assert_eq!(slots[0].target_kind, "normalized_function");
+        assert_eq!(slots[1].entry_rva, direct_rva);
+        assert_eq!(slots[1].slot_kind, "virtual_function");
+        assert_eq!(thunks.len(), 1);
+        assert_eq!(thunks[0].thunk_rva, thunk_rva);
+        assert_eq!(thunks[0].normalized_target_rva, target_rva);
+        assert_eq!(thunks[0].this_adjustment, Some(-8));
+        assert_eq!(thunks[0].instruction_len, 9);
     }
 
     #[test]
