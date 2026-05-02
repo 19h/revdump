@@ -115,6 +115,42 @@ pub struct ThunkNormalizationFact {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CfgFunctionFact {
+    table_rva: u32,
+    entry_index: usize,
+    entry_rva: u32,
+    raw_entry: u32,
+    target_rva: u32,
+    target_va: u64,
+    suppressed: bool,
+    export_suppressed: bool,
+    guard_flags: u32,
+    confidence: &'static str,
+    reason: &'static str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExceptionFunctionFact {
+    entry_rva: u32,
+    begin_rva: u32,
+    end_rva: u32,
+    unwind_info_rva: u32,
+    unwind_flags: u8,
+    unwind_flag_names: String,
+    prolog_size: u8,
+    unwind_code_count: u8,
+    frame_register: u8,
+    frame_offset: u8,
+    handler_rva: Option<u32>,
+    handler_va: Option<u64>,
+    chained_begin_rva: Option<u32>,
+    chained_end_rva: Option<u32>,
+    chained_unwind_info_rva: Option<u32>,
+    confidence: &'static str,
+    reason: &'static str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ThunkAnalysis {
     normalized_target_rva: u32,
     thunk_kind: &'static str,
@@ -808,6 +844,214 @@ fn analyze_vtable_slots(
     (slots, thunks.into_values().collect())
 }
 
+const IMAGE_DIRECTORY_ENTRY_EXCEPTION: usize = 3;
+const IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG: usize = 10;
+const MAX_CFG_FUNCTIONS: usize = 200_000;
+const MAX_EXCEPTION_FUNCTIONS: usize = 200_000;
+
+fn optional_header_u32(pe: &PeParser, offset: usize) -> Option<u32> {
+    let bytes = pe.optional_header_raw.get(offset..offset + 4)?;
+    Some(u32::from_le_bytes(bytes.try_into().ok()?))
+}
+
+fn pe_data_directory(pe: &PeParser, index: usize) -> Option<(u32, u32)> {
+    let directory_start = if pe.is_64bit { 112usize } else { 96usize };
+    let number_of_rva_and_sizes_offset = if pe.is_64bit { 108usize } else { 92usize };
+    let number_of_rva_and_sizes = optional_header_u32(pe, number_of_rva_and_sizes_offset)? as usize;
+    if index >= number_of_rva_and_sizes {
+        return None;
+    }
+
+    let offset = directory_start.checked_add(index.checked_mul(8)?)?;
+    let rva = optional_header_u32(pe, offset)?;
+    let size = optional_header_u32(pe, offset + 4)?;
+    (rva != 0 && size != 0).then_some((rva, size))
+}
+
+fn analyze_cfg_functions(pe: &PeParser) -> Vec<CfgFunctionFact> {
+    let Some((load_config_rva, load_config_size)) =
+        pe_data_directory(pe, IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG)
+    else {
+        return Vec::new();
+    };
+    if !rva_in_image(pe, load_config_rva, 4) {
+        return Vec::new();
+    }
+
+    let declared_size = read_u32_at_rva(pe, load_config_rva).unwrap_or(load_config_size);
+    let code_ranges = executable_ranges(pe);
+    let (table_va, function_count, guard_flags) = if pe.is_64bit {
+        if declared_size < 148 || !rva_in_image(pe, load_config_rva, 148) {
+            return Vec::new();
+        }
+        (
+            read_u64_at_rva(pe, load_config_rva + 128).unwrap_or_default(),
+            read_u64_at_rva(pe, load_config_rva + 136).unwrap_or_default(),
+            read_u32_at_rva(pe, load_config_rva + 144).unwrap_or_default(),
+        )
+    } else {
+        if declared_size < 92 || !rva_in_image(pe, load_config_rva, 92) {
+            return Vec::new();
+        }
+        (
+            read_u32_at_rva(pe, load_config_rva + 80)
+                .map(u64::from)
+                .unwrap_or_default(),
+            read_u32_at_rva(pe, load_config_rva + 84)
+                .map(u64::from)
+                .unwrap_or_default(),
+            read_u32_at_rva(pe, load_config_rva + 88).unwrap_or_default(),
+        )
+    };
+
+    let Some(table_rva) = ptr_to_rva(pe, table_va) else {
+        return Vec::new();
+    };
+    let extra_entry_bytes = ((guard_flags >> 28) & 0xF) as usize;
+    let stride = 4usize.saturating_add(extra_entry_bytes).max(4);
+    let count = (function_count as usize).min(MAX_CFG_FUNCTIONS);
+    let mut functions = Vec::new();
+    for entry_index in 0..count {
+        let Some(entry_offset) = entry_index.checked_mul(stride) else {
+            break;
+        };
+        let Some(entry_rva) = table_rva.checked_add(entry_offset as u32) else {
+            break;
+        };
+        if !rva_in_image(pe, entry_rva, 4) {
+            break;
+        }
+        let Some(raw_entry) = read_u32_at_rva(pe, entry_rva) else {
+            break;
+        };
+        let target_rva = raw_entry & !0x3;
+        if !code_ranges.is_empty() && !rva_in_ranges(target_rva, &code_ranges) {
+            continue;
+        }
+        functions.push(CfgFunctionFact {
+            table_rva,
+            entry_index,
+            entry_rva,
+            raw_entry,
+            target_rva,
+            target_va: pe.image_base + target_rva as u64,
+            suppressed: (raw_entry & 0x1) != 0,
+            export_suppressed: (raw_entry & 0x2) != 0,
+            guard_flags,
+            confidence: "high",
+            reason: "pe_load_config_guard_cf_function_table",
+        });
+    }
+
+    functions
+}
+
+fn unwind_flag_names(flags: u8) -> String {
+    let mut names = Vec::new();
+    if (flags & 0x1) != 0 {
+        names.push("EHANDLER");
+    }
+    if (flags & 0x2) != 0 {
+        names.push("UHANDLER");
+    }
+    if (flags & 0x4) != 0 {
+        names.push("CHAININFO");
+    }
+    if names.is_empty() {
+        "none".to_string()
+    } else {
+        names.join(";")
+    }
+}
+
+fn analyze_exception_functions(pe: &PeParser) -> Vec<ExceptionFunctionFact> {
+    if !pe.is_64bit {
+        return Vec::new();
+    }
+    let Some((exception_rva, exception_size)) =
+        pe_data_directory(pe, IMAGE_DIRECTORY_ENTRY_EXCEPTION)
+    else {
+        return Vec::new();
+    };
+
+    let count = (exception_size as usize / 12).min(MAX_EXCEPTION_FUNCTIONS);
+    let mut functions = Vec::new();
+    for index in 0..count {
+        let Some(entry_offset) = index.checked_mul(12) else {
+            break;
+        };
+        let Some(entry_rva) = exception_rva.checked_add(entry_offset as u32) else {
+            break;
+        };
+        if !rva_in_image(pe, entry_rva, 12) {
+            break;
+        }
+
+        let begin_rva = read_u32_at_rva(pe, entry_rva).unwrap_or_default();
+        let end_rva = read_u32_at_rva(pe, entry_rva + 4).unwrap_or_default();
+        let unwind_info_rva = read_u32_at_rva(pe, entry_rva + 8).unwrap_or_default();
+        if begin_rva == 0 && end_rva == 0 || !rva_in_image(pe, unwind_info_rva, 4) {
+            continue;
+        }
+        let Some(unwind_header) = read_bytes_at_rva(pe, unwind_info_rva, 4) else {
+            continue;
+        };
+
+        let unwind_flags = unwind_header[0] >> 3;
+        let prolog_size = unwind_header[1];
+        let unwind_code_count = unwind_header[2];
+        let frame_register = unwind_header[3] & 0xF;
+        let frame_offset = unwind_header[3] >> 4;
+        let aligned_unwind_codes = (unwind_code_count as usize + 1) & !1;
+        let handler_offset = 4usize.saturating_add(aligned_unwind_codes.saturating_mul(2));
+        let handler_field_rva = unwind_info_rva.saturating_add(handler_offset as u32);
+
+        let mut handler_rva = None;
+        let mut chained_begin_rva = None;
+        let mut chained_end_rva = None;
+        let mut chained_unwind_info_rva = None;
+        if (unwind_flags & 0x4) != 0 {
+            if rva_in_image(pe, handler_field_rva, 12) {
+                chained_begin_rva = read_u32_at_rva(pe, handler_field_rva);
+                chained_end_rva = read_u32_at_rva(pe, handler_field_rva + 4);
+                chained_unwind_info_rva = read_u32_at_rva(pe, handler_field_rva + 8);
+            }
+        } else if (unwind_flags & 0x3) != 0 && rva_in_image(pe, handler_field_rva, 4) {
+            handler_rva = read_u32_at_rva(pe, handler_field_rva);
+        }
+
+        let reason = if handler_rva.is_some() {
+            "x64_unwind_info_with_handler"
+        } else if chained_begin_rva.is_some() {
+            "x64_chained_unwind_info"
+        } else {
+            "x64_runtime_function"
+        };
+
+        functions.push(ExceptionFunctionFact {
+            entry_rva,
+            begin_rva,
+            end_rva,
+            unwind_info_rva,
+            unwind_flags,
+            unwind_flag_names: unwind_flag_names(unwind_flags),
+            prolog_size,
+            unwind_code_count,
+            frame_register,
+            frame_offset,
+            handler_rva,
+            handler_va: handler_rva.map(|rva| pe.image_base + rva as u64),
+            chained_begin_rva,
+            chained_end_rva,
+            chained_unwind_info_rva,
+            confidence: "high",
+            reason,
+        });
+    }
+
+    functions
+}
+
 /// Build an IDA-friendly metadata section that lists every flattened vtable fact.
 pub fn build_revdmp_metadata(
     facts: &[EnrichedVtableFact],
@@ -819,6 +1063,8 @@ pub fn build_revdmp_metadata(
     function_pointer_tables: &[FunctionPointerTableFact],
     vtable_slots: &[VtableSlotFact],
     thunk_normalizations: &[ThunkNormalizationFact],
+    cfg_functions: &[CfgFunctionFact],
+    exception_functions: &[ExceptionFunctionFact],
     image_base: u64,
     stub_generator: &StubGenerator,
 ) -> Vec<u8> {
@@ -980,6 +1226,80 @@ pub fn build_revdmp_metadata(
             this_adjustment,
             thunk.confidence,
             thunk.reason,
+        );
+    }
+
+    let _ = writeln!(text);
+    let _ = writeln!(text, "REVDMP_CFG_FUNCTIONS v1");
+    let _ = writeln!(
+        text,
+        "table_rva,entry_index,entry_rva,raw_entry,target_rva,target_va,suppressed,export_suppressed,guard_flags,confidence,reason"
+    );
+    for cfg in cfg_functions {
+        let _ = writeln!(
+            text,
+            "0x{:X},{},0x{:X},0x{:X},0x{:X},0x{:X},{},{},0x{:X},{},{}",
+            cfg.table_rva,
+            cfg.entry_index,
+            cfg.entry_rva,
+            cfg.raw_entry,
+            cfg.target_rva,
+            cfg.target_va,
+            cfg.suppressed,
+            cfg.export_suppressed,
+            cfg.guard_flags,
+            cfg.confidence,
+            cfg.reason,
+        );
+    }
+
+    let _ = writeln!(text);
+    let _ = writeln!(text, "REVDMP_EXCEPTION_FUNCTIONS v1");
+    let _ = writeln!(
+        text,
+        "entry_rva,begin_rva,end_rva,unwind_info_rva,unwind_flags,unwind_flag_names,prolog_size,unwind_code_count,frame_register,frame_offset,handler_rva,handler_va,chained_begin_rva,chained_end_rva,chained_unwind_info_rva,confidence,reason"
+    );
+    for function in exception_functions {
+        let handler_rva = function
+            .handler_rva
+            .map(|rva| format!("0x{rva:X}"))
+            .unwrap_or_default();
+        let handler_va = function
+            .handler_va
+            .map(|va| format!("0x{va:X}"))
+            .unwrap_or_default();
+        let chained_begin_rva = function
+            .chained_begin_rva
+            .map(|rva| format!("0x{rva:X}"))
+            .unwrap_or_default();
+        let chained_end_rva = function
+            .chained_end_rva
+            .map(|rva| format!("0x{rva:X}"))
+            .unwrap_or_default();
+        let chained_unwind_info_rva = function
+            .chained_unwind_info_rva
+            .map(|rva| format!("0x{rva:X}"))
+            .unwrap_or_default();
+        let _ = writeln!(
+            text,
+            "0x{:X},0x{:X},0x{:X},0x{:X},0x{:X},{},0x{:X},0x{:X},0x{:X},0x{:X},{},{},{},{},{},{},{}",
+            function.entry_rva,
+            function.begin_rva,
+            function.end_rva,
+            function.unwind_info_rva,
+            function.unwind_flags,
+            function.unwind_flag_names,
+            function.prolog_size,
+            function.unwind_code_count,
+            function.frame_register,
+            function.frame_offset,
+            handler_rva,
+            handler_va,
+            chained_begin_rva,
+            chained_end_rva,
+            chained_unwind_info_rva,
+            function.confidence,
+            function.reason,
         );
     }
 
@@ -1472,6 +1792,50 @@ pub fn build_revdmp_metadata(
             thunk.confidence,
             thunk.reason,
         );
+    }
+    for cfg in cfg_functions {
+        relationship_id += 1;
+        let _ = writeln!(
+            text,
+            "{},cfg_valid_indirect_target,cfg_{:08X}_{:06},func_{:08X},cfg_table,0x{:X},,,0x{:X},function,0x{:X},0x{:X},,,{},{},pe_load_config",
+            relationship_id,
+            cfg.table_rva,
+            cfg.entry_index,
+            cfg.target_rva,
+            cfg.table_rva,
+            cfg.entry_index,
+            cfg.target_rva,
+            cfg.target_va,
+            cfg.confidence,
+            cfg.reason,
+        );
+    }
+    for function in exception_functions {
+        relationship_id += 1;
+        let _ = writeln!(
+            text,
+            "{},exception_function_unwind,func_{:08X},unwind_{:08X},function,0x{:X},,,0x0,unwind_info,0x{:X},,,,high,{},x64_exception_directory",
+            relationship_id,
+            function.begin_rva,
+            function.unwind_info_rva,
+            function.begin_rva,
+            function.unwind_info_rva,
+            function.reason,
+        );
+        if let (Some(handler_rva), Some(handler_va)) = (function.handler_rva, function.handler_va) {
+            relationship_id += 1;
+            let _ = writeln!(
+                text,
+                "{},exception_handler,func_{:08X},func_{:08X},function,0x{:X},,,0x0,function,0x{:X},0x{:X},,,high,{},x64_unwind_info",
+                relationship_id,
+                function.begin_rva,
+                handler_rva,
+                function.begin_rva,
+                handler_rva,
+                handler_va,
+                function.reason,
+            );
+        }
     }
     for rtti in msvc_rtti_by_vtable.values() {
         for base in &rtti.base_classes {
@@ -2492,6 +2856,16 @@ impl Dumper {
         } else {
             (Vec::new(), Vec::new())
         };
+        let cfg_functions = if config.emit_revdmp {
+            analyze_cfg_functions(pe)
+        } else {
+            Vec::new()
+        };
+        let exception_functions = if config.emit_revdmp {
+            analyze_exception_functions(pe)
+        } else {
+            Vec::new()
+        };
         let metadata_data = if config.emit_revdmp {
             build_revdmp_metadata(
                 &enriched_facts,
@@ -2503,6 +2877,8 @@ impl Dumper {
                 &function_pointer_tables,
                 &vtable_slots,
                 &thunk_normalizations,
+                &cfg_functions,
+                &exception_functions,
                 pe.image_base,
                 &stub_generator,
             )
@@ -3358,6 +3734,38 @@ mod tests {
             confidence: "high",
             reason: "this_adjustment_then_jump",
         }];
+        let cfg_functions = vec![CfgFunctionFact {
+            table_rva: 0x7300,
+            entry_index: 0,
+            entry_rva: 0x7300,
+            raw_entry: 0x7200,
+            target_rva: 0x7200,
+            target_va: 0x1400_7200,
+            suppressed: false,
+            export_suppressed: false,
+            guard_flags: 0x500,
+            confidence: "high",
+            reason: "pe_load_config_guard_cf_function_table",
+        }];
+        let exception_functions = vec![ExceptionFunctionFact {
+            entry_rva: 0x7400,
+            begin_rva: 0x7200,
+            end_rva: 0x7250,
+            unwind_info_rva: 0x7500,
+            unwind_flags: 1,
+            unwind_flag_names: "EHANDLER".to_string(),
+            prolog_size: 4,
+            unwind_code_count: 0,
+            frame_register: 0,
+            frame_offset: 0,
+            handler_rva: Some(0x7600),
+            handler_va: Some(0x1400_7600),
+            chained_begin_rva: None,
+            chained_end_rva: None,
+            chained_unwind_info_rva: None,
+            confidence: "high",
+            reason: "x64_unwind_info_with_handler",
+        }];
 
         let metadata = build_revdmp_metadata(
             &facts,
@@ -3382,6 +3790,8 @@ mod tests {
             &function_pointer_tables,
             &vtable_slots,
             &thunk_normalizations,
+            &cfg_functions,
+            &exception_functions,
             0x1400_0000,
             &stub_generator,
         );
@@ -3412,6 +3822,14 @@ mod tests {
         assert!(text.contains(
             "0x7100,0x14007100,0x7200,0x14007200,adjustor_thunk,0x9,-8,high,this_adjustment_then_jump"
         ));
+        assert!(text.contains("REVDMP_CFG_FUNCTIONS v1"));
+        assert!(text.contains(
+            "0x7300,0,0x7300,0x7200,0x7200,0x14007200,false,false,0x500,high,pe_load_config_guard_cf_function_table"
+        ));
+        assert!(text.contains("REVDMP_EXCEPTION_FUNCTIONS v1"));
+        assert!(text.contains(
+            "0x7400,0x7200,0x7250,0x7500,0x1,EHANDLER,0x4,0x0,0x0,0x0,0x7600,0x14007600,,,,high,x64_unwind_info_with_handler"
+        ));
         assert!(text.contains("REVDMP_FIELD_TYPES v1"));
         assert!(text.contains(
             "obj_00008000,0x10000000,0x8000,0x20,vfptr,vtable,vtable_00005000,AudioService,1,high,vfptr_points_to_module_vtable"
@@ -3441,6 +3859,8 @@ mod tests {
         assert!(text.contains("function_pointer_slot,fptr_00006000,func_00004560"));
         assert!(text.contains("vtable_slot_to_function,vslot_00005000_000,func_00007200"));
         assert!(text.contains("thunk_to_function,thunk_00007100,func_00007200"));
+        assert!(text.contains("cfg_valid_indirect_target,cfg_00007300_000000,func_00007200"));
+        assert!(text.contains("exception_handler,func_00007200,func_00007600"));
         assert!(text.contains("msvc_inheritance,type_AudioService,type_IService"));
         assert!(
             text.contains("global_indirect_call,call_00001234,func_00004560,instruction,0x1234")
@@ -3740,6 +4160,134 @@ mod tests {
         assert_eq!(thunks[0].normalized_target_rva, target_rva);
         assert_eq!(thunks[0].this_adjustment, Some(-8));
         assert_eq!(thunks[0].instruction_len, 9);
+    }
+
+    #[test]
+    fn test_cfg_and_exception_metadata_analysis() {
+        fn write_u32(buf: &mut [u8], offset: usize, value: u32) {
+            buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        fn write_u64(buf: &mut [u8], offset: usize, value: u64) {
+            buf[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        }
+
+        let mut module = vec![0u8; 0x1000];
+        let image_base = module.as_ptr() as u64;
+        let load_config_rva = 0x500usize;
+        let cfg_table_rva = 0x600usize;
+        let exception_rva = 0x700usize;
+        let unwind_info_rva = 0x800usize;
+
+        write_u32(&mut module, load_config_rva, 148);
+        write_u64(
+            &mut module,
+            load_config_rva + 128,
+            image_base + cfg_table_rva as u64,
+        );
+        write_u64(&mut module, load_config_rva + 136, 2);
+        write_u32(&mut module, load_config_rva + 144, 0x500);
+        write_u32(&mut module, cfg_table_rva, 0x120);
+        write_u32(&mut module, cfg_table_rva + 4, 0x181);
+
+        write_u32(&mut module, exception_rva, 0x120);
+        write_u32(&mut module, exception_rva + 4, 0x150);
+        write_u32(&mut module, exception_rva + 8, unwind_info_rva as u32);
+        module[unwind_info_rva] = 0x09;
+        module[unwind_info_rva + 1] = 4;
+        module[unwind_info_rva + 2] = 0;
+        module[unwind_info_rva + 3] = 0;
+        write_u32(&mut module, unwind_info_rva + 4, 0x190);
+
+        let mut optional_header_raw = vec![0u8; 112 + 16 * 8];
+        write_u32(&mut optional_header_raw, 108, 16);
+        write_u32(
+            &mut optional_header_raw,
+            112 + IMAGE_DIRECTORY_ENTRY_EXCEPTION * 8,
+            exception_rva as u32,
+        );
+        write_u32(
+            &mut optional_header_raw,
+            112 + IMAGE_DIRECTORY_ENTRY_EXCEPTION * 8 + 4,
+            12,
+        );
+        write_u32(
+            &mut optional_header_raw,
+            112 + IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG * 8,
+            load_config_rva as u32,
+        );
+        write_u32(
+            &mut optional_header_raw,
+            112 + IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG * 8 + 4,
+            148,
+        );
+
+        let pe = PeParser {
+            base: module.as_ptr(),
+            size: module.len(),
+            pe_offset: 0,
+            machine: 0x8664,
+            number_of_sections: 3,
+            time_date_stamp: 0,
+            pointer_to_symbol_table: 0,
+            number_of_symbols: 0,
+            size_of_optional_header: optional_header_raw.len() as u16,
+            characteristics: 0,
+            image_base,
+            section_alignment: 0x1000,
+            file_alignment: 0x200,
+            size_of_image: module.len() as u32,
+            size_of_headers: 0,
+            is_64bit: true,
+            optional_header_raw,
+            coff_symbol_table_raw: Vec::new(),
+            sections: vec![
+                SectionInfo {
+                    name: ".text".to_string(),
+                    virtual_size: 0x200,
+                    virtual_address: 0x100,
+                    size_of_raw_data: 0x200,
+                    pointer_to_raw_data: 0,
+                    characteristics: IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE,
+                    new_pointer_to_raw_data: 0,
+                    new_size_of_raw_data: 0,
+                },
+                SectionInfo {
+                    name: ".rdata".to_string(),
+                    virtual_size: 0x200,
+                    virtual_address: load_config_rva as u32,
+                    size_of_raw_data: 0x200,
+                    pointer_to_raw_data: 0,
+                    characteristics: 0,
+                    new_pointer_to_raw_data: 0,
+                    new_size_of_raw_data: 0,
+                },
+                SectionInfo {
+                    name: ".pdata".to_string(),
+                    virtual_size: 0x100,
+                    virtual_address: exception_rva as u32,
+                    size_of_raw_data: 0x100,
+                    pointer_to_raw_data: 0,
+                    characteristics: 0,
+                    new_pointer_to_raw_data: 0,
+                    new_size_of_raw_data: 0,
+                },
+            ],
+        };
+
+        let cfg = analyze_cfg_functions(&pe);
+        assert_eq!(cfg.len(), 2);
+        assert_eq!(cfg[0].target_rva, 0x120);
+        assert_eq!(cfg[1].target_rva, 0x180);
+        assert!(cfg[1].suppressed);
+        assert_eq!(cfg[0].guard_flags, 0x500);
+
+        let exception_functions = analyze_exception_functions(&pe);
+        assert_eq!(exception_functions.len(), 1);
+        assert_eq!(exception_functions[0].begin_rva, 0x120);
+        assert_eq!(exception_functions[0].end_rva, 0x150);
+        assert_eq!(exception_functions[0].unwind_flags, 1);
+        assert_eq!(exception_functions[0].unwind_flag_names, "EHANDLER");
+        assert_eq!(exception_functions[0].handler_rva, Some(0x190));
     }
 
     #[test]
