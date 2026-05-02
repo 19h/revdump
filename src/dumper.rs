@@ -13,7 +13,7 @@ use crate::fixup::{apply_fixups, generate_fixups, SectionMapping};
 use crate::memory::{is_memory_readable, strip_pointer_tags};
 use crate::pe::{
     FileHeader, OptionalHeader32, OptionalHeader64, PeParser, SectionHeader, SectionInfo,
-    HEAP_SECTION_CHARACTERISTICS, PE_SIGNATURE,
+    HEAP_SECTION_CHARACTERISTICS, IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE, PE_SIGNATURE,
 };
 use crate::scanner::{PointerScanner, ScanResult};
 use crate::stub::{
@@ -56,6 +56,32 @@ struct MsvcRttiFact {
     hierarchy_rva: Option<u32>,
     hierarchy_attributes: u32,
     base_classes: Vec<MsvcBaseClassFact>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FunctionPointerFact {
+    location_rva: u32,
+    location_va: u64,
+    section_name: String,
+    kind: &'static str,
+    table_id: Option<String>,
+    index: Option<usize>,
+    target_rva: u32,
+    target_va: u64,
+    confidence: &'static str,
+    reason: &'static str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FunctionPointerTableFact {
+    id: String,
+    start_rva: u32,
+    start_va: u64,
+    section_name: String,
+    entry_count: usize,
+    target_rvas: Vec<u32>,
+    confidence: &'static str,
+    reason: &'static str,
 }
 
 #[derive(Clone, Debug)]
@@ -298,6 +324,128 @@ fn build_runtime_objects(
         .collect()
 }
 
+fn executable_ranges(pe: &PeParser) -> Vec<(u32, u32)> {
+    pe.sections
+        .iter()
+        .filter(|section| {
+            (section.characteristics & IMAGE_SCN_CNT_CODE) != 0
+                || (section.characteristics & IMAGE_SCN_MEM_EXECUTE) != 0
+        })
+        .map(|section| {
+            (
+                section.virtual_address,
+                section.virtual_size.max(section.size_of_raw_data),
+            )
+        })
+        .collect()
+}
+
+fn rva_in_ranges(rva: u32, ranges: &[(u32, u32)]) -> bool {
+    ranges.iter().any(|&(start, size)| {
+        let end = start.saturating_add(size);
+        rva >= start && rva < end
+    })
+}
+
+fn analyze_function_pointer_tables(
+    pe: &PeParser,
+) -> (Vec<FunctionPointerFact>, Vec<FunctionPointerTableFact>) {
+    let code_ranges = executable_ranges(pe);
+    if code_ranges.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let mut pointers = Vec::new();
+    let mut tables = Vec::new();
+
+    for section in &pe.sections {
+        if (section.characteristics & IMAGE_SCN_MEM_EXECUTE) != 0
+            || (section.characteristics & IMAGE_SCN_CNT_CODE) != 0
+        {
+            continue;
+        }
+        let scan_size = section.virtual_size.max(section.size_of_raw_data);
+        if scan_size < 8 || !rva_in_image(pe, section.virtual_address, scan_size as usize) {
+            continue;
+        }
+
+        let section_ptr = unsafe { pe.base.add(section.virtual_address as usize) };
+        #[cfg(not(test))]
+        if !is_memory_readable(section_ptr, scan_size as usize) {
+            continue;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(section_ptr, scan_size as usize) };
+        let mut entries = Vec::new();
+        for (idx, chunk) in bytes.chunks_exact(8).enumerate() {
+            let raw = u64::from_le_bytes(chunk.try_into().unwrap());
+            let Some(target_rva) = ptr_to_rva(pe, raw) else {
+                continue;
+            };
+            if !rva_in_ranges(target_rva, &code_ranges) {
+                continue;
+            }
+            entries.push((section.virtual_address + (idx * 8) as u32, target_rva));
+        }
+
+        let mut run_start = 0usize;
+        while run_start < entries.len() {
+            let mut run_end = run_start + 1;
+            while run_end < entries.len() && entries[run_end].0 == entries[run_end - 1].0 + 8 {
+                run_end += 1;
+            }
+
+            let run = &entries[run_start..run_end];
+            if run.len() >= 2 {
+                let table_id = format!("fptable_{:08X}", run[0].0);
+                tables.push(FunctionPointerTableFact {
+                    id: table_id.clone(),
+                    start_rva: run[0].0,
+                    start_va: pe.image_base + run[0].0 as u64,
+                    section_name: section.name.clone(),
+                    entry_count: run.len(),
+                    target_rvas: run.iter().map(|(_, target_rva)| *target_rva).collect(),
+                    confidence: "high",
+                    reason: "contiguous_code_pointer_run",
+                });
+                for (idx, &(location_rva, target_rva)) in run.iter().enumerate() {
+                    pointers.push(FunctionPointerFact {
+                        location_rva,
+                        location_va: pe.image_base + location_rva as u64,
+                        section_name: section.name.clone(),
+                        kind: "table_entry",
+                        table_id: Some(table_id.clone()),
+                        index: Some(idx),
+                        target_rva,
+                        target_va: pe.image_base + target_rva as u64,
+                        confidence: "high",
+                        reason: "contiguous_code_pointer_run",
+                    });
+                }
+            } else {
+                let (location_rva, target_rva) = run[0];
+                pointers.push(FunctionPointerFact {
+                    location_rva,
+                    location_va: pe.image_base + location_rva as u64,
+                    section_name: section.name.clone(),
+                    kind: "callback_slot",
+                    table_id: None,
+                    index: None,
+                    target_rva,
+                    target_va: pe.image_base + target_rva as u64,
+                    confidence: "medium",
+                    reason: "isolated_code_pointer",
+                });
+            }
+
+            run_start = run_end;
+        }
+    }
+
+    pointers.sort_by_key(|pointer| pointer.location_rva);
+    tables.sort_by_key(|table| table.start_rva);
+    (pointers, tables)
+}
+
 /// Build an IDA-friendly metadata section that lists every flattened vtable fact.
 pub fn build_revdmp_metadata(
     facts: &[EnrichedVtableFact],
@@ -305,6 +453,8 @@ pub fn build_revdmp_metadata(
     heap_edges: &[HeapPointerEdge],
     containers: &[ContainerFact],
     indirect_calls: &[IndirectCallFact],
+    function_pointers: &[FunctionPointerFact],
+    function_pointer_tables: &[FunctionPointerTableFact],
     image_base: u64,
     stub_generator: &StubGenerator,
 ) -> Vec<u8> {
@@ -521,6 +671,52 @@ pub fn build_revdmp_metadata(
     }
 
     let _ = writeln!(text);
+    let _ = writeln!(text, "REVDMP_FUNCTION_POINTERS v1");
+    let _ = writeln!(
+        text,
+        "location_rva,location_va,section,kind,table_id,index,target_rva,target_va,confidence,reason"
+    );
+    for pointer in function_pointers {
+        let table_id = pointer.table_id.as_deref().unwrap_or("");
+        let index = pointer.index.map(|idx| idx.to_string()).unwrap_or_default();
+        let _ = writeln!(
+            text,
+            "0x{:X},0x{:X},{},{},{},{},0x{:X},0x{:X},{},{}",
+            pointer.location_rva,
+            pointer.location_va,
+            pointer.section_name,
+            pointer.kind,
+            table_id,
+            index,
+            pointer.target_rva,
+            pointer.target_va,
+            pointer.confidence,
+            pointer.reason,
+        );
+    }
+
+    let _ = writeln!(text);
+    let _ = writeln!(text, "REVDMP_FUNCTION_POINTER_TABLES v1");
+    let _ = writeln!(
+        text,
+        "table_id,start_rva,start_va,section,entry_count,target_rvas,confidence,reason"
+    );
+    for table in function_pointer_tables {
+        let _ = writeln!(
+            text,
+            "{},0x{:X},0x{:X},{},{},{},{},{}",
+            table.id,
+            table.start_rva,
+            table.start_va,
+            table.section_name,
+            table.entry_count,
+            join_hex_u32(&table.target_rvas),
+            table.confidence,
+            table.reason,
+        );
+    }
+
+    let _ = writeln!(text);
     let _ = writeln!(text, "REVDMP_RUNTIME_RELATIONSHIPS v3");
     let _ = writeln!(
         text,
@@ -675,6 +871,24 @@ pub fn build_revdmp_metadata(
             call.target_va,
             call.confidence,
             call.reason,
+        );
+    }
+    for pointer in function_pointers {
+        relationship_id += 1;
+        let _ = writeln!(
+            text,
+            "{},function_pointer_slot,fptr_{:08X},func_{:08X},data_pointer,0x{:X},,,{},function,0x{:X},0x{:X},,,{},{},function_pointer_scan",
+            relationship_id,
+            pointer.location_rva,
+            pointer.target_rva,
+            pointer.location_rva,
+            pointer.index
+                .map(|idx| idx.to_string())
+                .unwrap_or_default(),
+            pointer.target_rva,
+            pointer.target_va,
+            pointer.confidence,
+            pointer.reason,
         );
     }
     for rtti in msvc_rtti_by_vtable.values() {
@@ -1638,6 +1852,11 @@ impl Dumper {
         } else {
             Vec::new()
         };
+        let (function_pointers, function_pointer_tables) = if config.emit_revdmp {
+            analyze_function_pointer_tables(pe)
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let metadata_data = if config.emit_revdmp {
             build_revdmp_metadata(
                 &enriched_facts,
@@ -1645,6 +1864,8 @@ impl Dumper {
                 stub_generator.heap_edges(),
                 stub_generator.containers(),
                 &indirect_calls,
+                &function_pointers,
+                &function_pointer_tables,
                 pe.image_base,
                 &stub_generator,
             )
@@ -2439,6 +2660,28 @@ mod tests {
             confidence: "high",
             reason: "rip_relative_global_function_pointer",
         }];
+        let function_pointers = vec![FunctionPointerFact {
+            location_rva: 0x6000,
+            location_va: 0x1400_6000,
+            section_name: ".rdata".to_string(),
+            kind: "callback_slot",
+            table_id: None,
+            index: None,
+            target_rva: 0x4560,
+            target_va: 0x1400_4560,
+            confidence: "medium",
+            reason: "isolated_code_pointer",
+        }];
+        let function_pointer_tables = vec![FunctionPointerTableFact {
+            id: "fptable_00006100".to_string(),
+            start_rva: 0x6100,
+            start_va: 0x1400_6100,
+            section_name: ".rdata".to_string(),
+            entry_count: 2,
+            target_rvas: vec![0x4560, 0x4570],
+            confidence: "high",
+            reason: "contiguous_code_pointer_run",
+        }];
 
         let metadata = build_revdmp_metadata(
             &facts,
@@ -2453,6 +2696,8 @@ mod tests {
             }],
             &[],
             &indirect_calls,
+            &function_pointers,
+            &function_pointer_tables,
             0x1400_0000,
             &stub_generator,
         );
@@ -2476,8 +2721,17 @@ mod tests {
         assert!(text.contains("REVDMP_CONTAINERS v1"));
         assert!(text.contains("REVDMP_INDIRECT_CALLS v1"));
         assert!(text.contains("0x1234,0x6,call,0x3000,0x4560,0x14004560,false,high"));
+        assert!(text.contains("REVDMP_FUNCTION_POINTERS v1"));
+        assert!(text.contains(
+            "0x6000,0x14006000,.rdata,callback_slot,,,0x4560,0x14004560,medium,isolated_code_pointer"
+        ));
+        assert!(text.contains("REVDMP_FUNCTION_POINTER_TABLES v1"));
+        assert!(text.contains(
+            "fptable_00006100,0x6100,0x14006100,.rdata,2,0x4560;0x4570,high,contiguous_code_pointer_run"
+        ));
         assert!(text.contains("REVDMP_RUNTIME_RELATIONSHIPS v3"));
         assert!(text.contains("vfptr_to_vtable,obj_00008000,vtable_00005000"));
+        assert!(text.contains("function_pointer_slot,fptr_00006000,func_00004560"));
         assert!(text.contains("msvc_inheritance,type_AudioService,type_IService"));
         assert!(
             text.contains("global_indirect_call,call_00001234,func_00004560,instruction,0x1234")
@@ -2614,6 +2868,75 @@ mod tests {
         assert_eq!(rtti.base_classes[1].type_name, "Base");
         assert_eq!(rtti.base_classes[1].mdisp, 0x10);
         assert_eq!(rtti.base_classes[1].attributes, 0x40);
+    }
+
+    #[test]
+    fn test_function_pointer_table_analysis() {
+        let mut module = vec![0u8; 0x1000];
+        let image_base = module.as_ptr() as u64;
+        let text_rva = 0x100u32;
+        let rdata_rva = 0x400u32;
+
+        module[rdata_rva as usize..rdata_rva as usize + 8]
+            .copy_from_slice(&(image_base + 0x110).to_le_bytes());
+        module[rdata_rva as usize + 8..rdata_rva as usize + 16]
+            .copy_from_slice(&(image_base + 0x120).to_le_bytes());
+        module[rdata_rva as usize + 0x20..rdata_rva as usize + 0x28]
+            .copy_from_slice(&(image_base + 0x130).to_le_bytes());
+
+        let pe = PeParser {
+            base: module.as_ptr(),
+            size: module.len(),
+            pe_offset: 0,
+            machine: 0x8664,
+            number_of_sections: 2,
+            time_date_stamp: 0,
+            pointer_to_symbol_table: 0,
+            number_of_symbols: 0,
+            size_of_optional_header: 0,
+            characteristics: 0,
+            image_base,
+            section_alignment: 0x1000,
+            file_alignment: 0x200,
+            size_of_image: module.len() as u32,
+            size_of_headers: 0,
+            is_64bit: true,
+            optional_header_raw: Vec::new(),
+            coff_symbol_table_raw: Vec::new(),
+            sections: vec![
+                SectionInfo {
+                    name: ".text".to_string(),
+                    virtual_size: 0x100,
+                    virtual_address: text_rva,
+                    size_of_raw_data: 0x100,
+                    pointer_to_raw_data: 0,
+                    characteristics: IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE,
+                    new_pointer_to_raw_data: 0,
+                    new_size_of_raw_data: 0,
+                },
+                SectionInfo {
+                    name: ".rdata".to_string(),
+                    virtual_size: 0x80,
+                    virtual_address: rdata_rva,
+                    size_of_raw_data: 0x80,
+                    pointer_to_raw_data: 0,
+                    characteristics: 0,
+                    new_pointer_to_raw_data: 0,
+                    new_size_of_raw_data: 0,
+                },
+            ],
+        };
+
+        let (pointers, tables) = analyze_function_pointer_tables(&pe);
+
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].id, "fptable_00000400");
+        assert_eq!(tables[0].target_rvas, vec![0x110, 0x120]);
+        assert_eq!(pointers.len(), 3);
+        assert_eq!(pointers[0].kind, "table_entry");
+        assert_eq!(pointers[0].table_id.as_deref(), Some("fptable_00000400"));
+        assert_eq!(pointers[2].kind, "callback_slot");
+        assert_eq!(pointers[2].target_rva, 0x130);
     }
 
     #[test]
