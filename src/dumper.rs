@@ -13,7 +13,8 @@ use crate::fixup::{apply_fixups, generate_fixups, SectionMapping};
 use crate::memory::{is_memory_readable, strip_pointer_tags};
 use crate::pe::{
     FileHeader, OptionalHeader32, OptionalHeader64, PeParser, SectionHeader, SectionInfo,
-    HEAP_SECTION_CHARACTERISTICS, IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE, PE_SIGNATURE,
+    HEAP_SECTION_CHARACTERISTICS, IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_WRITE,
+    PE_SIGNATURE,
 };
 use crate::scanner::{PointerScanner, ScanResult};
 use crate::stub::{
@@ -280,6 +281,11 @@ fn object_id_map(stub_generator: &StubGenerator) -> BTreeMap<u64, String> {
         .stubs()
         .map(|stub| (stub.original_addr, runtime_object_id(stub.new_rva)))
         .collect()
+}
+
+fn should_scan_for_heap_pointers(section: &SectionInfo) -> bool {
+    (section.characteristics & IMAGE_SCN_MEM_WRITE) != 0
+        && (section.characteristics & IMAGE_SCN_MEM_EXECUTE) == 0
 }
 
 fn join_hex_u32(values: &[u32]) -> String {
@@ -2517,7 +2523,7 @@ impl Dumper {
         let mut sections_to_scan = 0usize;
 
         for (idx, section) in pe.sections.iter().enumerate() {
-            if config.skip_sections.contains(&idx) {
+            if config.skip_sections.contains(&idx) || !should_scan_for_heap_pointers(section) {
                 continue;
             }
             total_bytes += section.virtual_size.min(0x2000_0000) as usize;
@@ -2534,7 +2540,7 @@ impl Dumper {
 
         let mut section_idx = 0;
         for (idx, section) in pe.sections.iter().enumerate() {
-            if config.skip_sections.contains(&idx) {
+            if config.skip_sections.contains(&idx) || !should_scan_for_heap_pointers(section) {
                 continue;
             }
 
@@ -3218,6 +3224,30 @@ mod tests {
     fn test_dump_config_skip_code() {
         let config = DumpConfig::skip_code();
         assert_eq!(config.skip_sections, vec![0]);
+    }
+
+    #[test]
+    fn test_heap_pointer_scan_only_uses_writable_data_sections() {
+        let mut section = SectionInfo {
+            name: ".data".to_string(),
+            virtual_size: 0x1000,
+            virtual_address: 0x1000,
+            size_of_raw_data: 0x1000,
+            pointer_to_raw_data: 0x400,
+            characteristics: IMAGE_SCN_MEM_WRITE,
+            new_pointer_to_raw_data: 0,
+            new_size_of_raw_data: 0,
+        };
+
+        assert!(should_scan_for_heap_pointers(&section));
+
+        section.name = ".pdata".to_string();
+        section.characteristics = 0;
+        assert!(!should_scan_for_heap_pointers(&section));
+
+        section.name = ".text".to_string();
+        section.characteristics = IMAGE_SCN_MEM_WRITE | IMAGE_SCN_MEM_EXECUTE;
+        assert!(!should_scan_for_heap_pointers(&section));
     }
 
     #[test]
