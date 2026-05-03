@@ -121,21 +121,8 @@ pub fn apply_fixups(
             continue;
         }
 
-        // Find containing section
-        let section = sections.iter().find(|s| {
-            fix.rva >= s.virtual_address
-                && fix.rva < s.virtual_address + s.virtual_size.max(s.raw_size)
-        });
-
-        let file_offset = match section {
-            Some(sec) if sec.raw_offset > 0 && sec.allows_heap_pointer_fixups() => {
-                // Ensure no underflow
-                if fix.rva < sec.virtual_address {
-                    stats.skipped += 1;
-                    continue;
-                }
-                sec.raw_offset + (fix.rva - sec.virtual_address)
-            }
+        let file_offset = match section_file_offset_for_rva(sections, fix.rva) {
+            Some(sec) if sec.section.allows_heap_pointer_fixups() => sec.file_offset,
             _ => {
                 stats.skipped += 1;
                 continue;
@@ -178,6 +165,13 @@ pub struct SectionMapping {
     pub characteristics: u32,
 }
 
+/// Resolved file offset for an RVA inside an output section.
+#[derive(Clone, Copy, Debug)]
+pub struct SectionFileOffset<'a> {
+    pub section: &'a SectionMapping,
+    pub file_offset: u32,
+}
+
 impl SectionMapping {
     /// Create from PE section info.
     pub fn new(va: u32, vsize: u32, raw_size: u32, raw_offset: u32, characteristics: u32) -> Self {
@@ -194,15 +188,37 @@ impl SectionMapping {
     pub fn allows_heap_pointer_fixups(&self) -> bool {
         (self.characteristics & IMAGE_SCN_MEM_EXECUTE) == 0
     }
+
+    fn contains_rva(&self, rva: u32) -> bool {
+        let end = self
+            .virtual_address
+            .saturating_add(self.virtual_size.max(self.raw_size));
+        rva >= self.virtual_address && rva < end
+    }
+}
+
+/// Map an RVA to an output file offset using a binary search over section RVAs.
+pub fn section_file_offset_for_rva(
+    sections: &[SectionMapping],
+    rva: u32,
+) -> Option<SectionFileOffset<'_>> {
+    let idx = sections.partition_point(|section| section.virtual_address <= rva);
+    let section = idx.checked_sub(1).and_then(|idx| sections.get(idx))?;
+    if !section.contains_rva(rva) || section.raw_offset == 0 {
+        return None;
+    }
+    Some(SectionFileOffset {
+        section,
+        file_offset: section.raw_offset + (rva - section.virtual_address),
+    })
 }
 
 fn rva_range_overlaps(ranges: &[Range<u32>], rva: u32, len: u32) -> bool {
     let Some(end) = rva.checked_add(len) else {
         return true;
     };
-    ranges
-        .iter()
-        .any(|range| rva < range.end && end > range.start)
+    let idx = ranges.partition_point(|range| range.start < end);
+    idx > 0 && ranges[idx - 1].end > rva
 }
 
 #[cfg(test)]
@@ -223,6 +239,20 @@ mod tests {
         assert_eq!(mapping.virtual_address, 0x1000);
         assert_eq!(mapping.raw_offset, 0x400);
         assert!(mapping.allows_heap_pointer_fixups());
+    }
+
+    #[test]
+    fn test_section_file_offset_binary_search() {
+        let sections = vec![
+            SectionMapping::new(0x1000, 0x100, 0x100, 0x400, 0),
+            SectionMapping::new(0x3000, 0x200, 0x200, 0x800, 0),
+            SectionMapping::new(0x8000, 0x100, 0x100, 0xC00, 0),
+        ];
+
+        let resolved = section_file_offset_for_rva(&sections, 0x3018).unwrap();
+        assert_eq!(resolved.section.virtual_address, 0x3000);
+        assert_eq!(resolved.file_offset, 0x818);
+        assert!(section_file_offset_for_rva(&sections, 0x2500).is_none());
     }
 
     #[test]

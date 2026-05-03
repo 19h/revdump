@@ -9,7 +9,7 @@
 
 use crate::devirt::{self, DevirtConfig, DevirtProgress, DevirtStats, IndirectCallFact, VcallKind};
 use crate::error::{Error, Result};
-use crate::fixup::{apply_fixups, generate_fixups, SectionMapping};
+use crate::fixup::{apply_fixups, generate_fixups, section_file_offset_for_rva, SectionMapping};
 use crate::memory::{is_memory_readable, strip_pointer_tags};
 use crate::pe::{
     FileHeader, OptionalHeader32, OptionalHeader64, PeParser, SectionHeader, SectionInfo,
@@ -301,7 +301,7 @@ fn runtime_object_id(stub_rva: u32) -> String {
     format!("obj_{stub_rva:08X}")
 }
 
-fn object_id_map(stub_generator: &StubGenerator) -> BTreeMap<u64, String> {
+fn object_id_map(stub_generator: &StubGenerator) -> HashMap<u64, String> {
     stub_generator
         .stubs()
         .map(|stub| (stub.original_addr, runtime_object_id(stub.new_rva)))
@@ -336,6 +336,10 @@ fn section_rva_end(section: &SectionInfo) -> u32 {
     section
         .virtual_address
         .saturating_add(section.virtual_size.max(section.size_of_raw_data))
+}
+
+fn section_dump_size(section: &SectionInfo) -> usize {
+    section.virtual_size.max(section.size_of_raw_data) as usize
 }
 
 fn rva_section(sections: &[SectionInfo], rva: u32) -> Option<&SectionInfo> {
@@ -528,19 +532,16 @@ fn output_file_range_for_rva(
     rva: u32,
     size: usize,
 ) -> Option<std::ops::Range<usize>> {
-    let end_rva = rva.checked_add(size.try_into().ok()?)?;
-    let section = section_mappings.iter().find(|section| {
-        let section_end = section
-            .virtual_address
-            .saturating_add(section.virtual_size.max(section.raw_size));
-        rva >= section.virtual_address && end_rva <= section_end
-    })?;
-    if section.raw_offset == 0 {
+    if size == 0 {
         return None;
     }
-    let start = section
-        .raw_offset
-        .checked_add(rva.checked_sub(section.virtual_address)?)? as usize;
+    let end_rva = rva.checked_add(size.try_into().ok()?)?;
+    let start = section_file_offset_for_rva(section_mappings, rva)?;
+    let end = section_file_offset_for_rva(section_mappings, end_rva.saturating_sub(1))?;
+    if !std::ptr::eq(start.section, end.section) {
+        return None;
+    }
+    let start = start.file_offset as usize;
     Some(start..start.checked_add(size)?)
 }
 
@@ -593,10 +594,10 @@ fn build_runtime_objects(
 ) -> Vec<RuntimeObjectFact> {
     let type_names_by_heap = collect_type_names_by_heap(facts);
     let mut roots_by_heap: BTreeMap<u64, BTreeSet<u32>> = BTreeMap::new();
-    let mut incoming_by_heap: BTreeMap<u64, usize> = BTreeMap::new();
-    let mut outgoing_by_heap: BTreeMap<u64, usize> = BTreeMap::new();
-    let mut container_owner_by_heap: BTreeMap<u64, usize> = BTreeMap::new();
-    let mut container_element_by_heap: BTreeMap<u64, usize> = BTreeMap::new();
+    let mut incoming_by_heap: HashMap<u64, usize> = HashMap::new();
+    let mut outgoing_by_heap: HashMap<u64, usize> = HashMap::new();
+    let mut container_owner_by_heap: HashMap<u64, usize> = HashMap::new();
+    let mut container_element_by_heap: HashMap<u64, usize> = HashMap::new();
 
     for &(source_rva, heap_addr) in heap_ptr_locs {
         roots_by_heap
@@ -1052,7 +1053,8 @@ fn analyze_vtable_slots(
     }
 
     let mut slots = Vec::new();
-    let mut thunks = BTreeMap::<u32, ThunkNormalizationFact>::new();
+    let mut thunk_analysis_cache = HashMap::<u32, Option<ThunkAnalysis>>::new();
+    let mut thunks = HashMap::<u32, ThunkNormalizationFact>::new();
     for (vtable_rva, type_name) in vtables {
         for slot_index in 0..MAX_VTABLE_SLOTS {
             let Some(slot_offset) = (slot_index * pointer_size).try_into().ok() else {
@@ -1074,7 +1076,10 @@ fn analyze_vtable_slots(
                 break;
             }
 
-            let thunk = analyze_thunk(pe, entry_rva, &code_ranges);
+            let thunk = thunk_analysis_cache
+                .entry(entry_rva)
+                .or_insert_with(|| analyze_thunk(pe, entry_rva, &code_ranges))
+                .clone();
             let normalized_target_rva = thunk
                 .as_ref()
                 .map(|analysis| analysis.normalized_target_rva)
@@ -1121,7 +1126,9 @@ fn analyze_vtable_slots(
         }
     }
 
-    (slots, thunks.into_values().collect())
+    let mut thunks = thunks.into_values().collect::<Vec<_>>();
+    thunks.sort_by_key(|thunk| thunk.thunk_rva);
+    (slots, thunks)
 }
 
 const IMAGE_DIRECTORY_ENTRY_EXCEPTION: usize = 3;
@@ -1396,13 +1403,13 @@ struct RevdmpBlock {
 
 struct RevdmpBinaryBuilder {
     strings: Vec<u8>,
-    string_offsets: BTreeMap<String, u32>,
+    string_offsets: HashMap<String, u32>,
     blocks: BTreeMap<u32, RevdmpBlock>,
 }
 
 impl RevdmpBinaryBuilder {
     fn new() -> Self {
-        let mut string_offsets = BTreeMap::new();
+        let mut string_offsets = HashMap::new();
         string_offsets.insert(String::new(), 0);
         Self {
             strings: vec![0],
@@ -2562,9 +2569,28 @@ impl Dumper {
         report(&progress);
         let mut stub_generator = StubGenerator::new(self.base, self.size, config.to_stub_config())?;
 
+        progress.stage = ProgressStage::ProtectingExceptionData;
+        progress.current_item = Some("heap scan/fixup exclusions".to_string());
+        progress.eh_progress = None;
+        report(&progress);
+        let protected_ranges = protected_exception_ranges_with_progress(pe, |eh_progress| {
+            progress.stage = ProgressStage::ProtectingExceptionData;
+            progress.current = eh_progress.current;
+            progress.total = eh_progress.total;
+            progress.eh_progress = Some(eh_progress);
+            report(&progress);
+        });
+        progress.eh_progress = None;
+
         // Scan sections for heap pointers
-        let heap_ptr_locs =
-            self.scan_sections(pe, config, &stub_generator, &mut progress, &report)?;
+        let heap_ptr_locs = self.scan_sections(
+            pe,
+            config,
+            &stub_generator,
+            &protected_ranges,
+            &mut progress,
+            &report,
+        )?;
 
         if heap_ptr_locs.is_empty() {
             // No heap pointers found, do standard dump
@@ -2727,6 +2753,7 @@ impl Dumper {
             heap_section_size,
             metadata_section_va,
             config.emit_revdmp.then_some(metadata_data.as_slice()),
+            &protected_ranges,
             &mut progress,
             &report,
         )?;
@@ -2791,6 +2818,7 @@ impl Dumper {
         pe: &PeParser,
         config: &DumpConfig,
         stub_generator: &StubGenerator,
+        protected_ranges: &[Range<u32>],
         progress: &mut ProgressInfo,
         report: &F,
     ) -> Result<Vec<ScanResult>>
@@ -2801,37 +2829,30 @@ impl Dumper {
         let scanner_config = stub_generator.scanner_config();
         let scanner = PointerScanner::new(scanner_config);
         let cache = stub_generator.cache();
-        progress.stage = ProgressStage::ProtectingExceptionData;
-        progress.current_item = Some("heap scan exclusions".to_string());
-        progress.eh_progress = None;
-        report(progress);
-        let protected_ranges = protected_exception_ranges_with_progress(pe, |eh_progress| {
-            progress.stage = ProgressStage::ProtectingExceptionData;
-            progress.current = eh_progress.current;
-            progress.total = eh_progress.total;
-            progress.eh_progress = Some(eh_progress);
-            report(progress);
-        });
-        progress.eh_progress = None;
 
-        // Calculate total bytes to scan
+        // Calculate scan plan once so protected-range subtraction is not repeated.
+        let mut scan_plan = Vec::new();
         let mut total_bytes = 0usize;
-        let mut sections_to_scan = 0usize;
 
         for (idx, section) in pe.sections.iter().enumerate() {
             if config.skip_sections.contains(&idx) || !should_scan_for_heap_pointers(section) {
                 continue;
             }
-            let scan_ranges = unprotected_section_ranges(section, &protected_ranges);
+            let scan_ranges = unprotected_section_ranges(section, protected_ranges);
             if scan_ranges.is_empty() {
                 continue;
             }
-            total_bytes += scan_ranges
+            let section_bytes = scan_ranges
                 .iter()
                 .map(|range| (range.end - range.start).min(0x2000_0000) as usize)
                 .sum::<usize>();
-            sections_to_scan += 1;
+            if section_bytes == 0 {
+                continue;
+            }
+            total_bytes += section_bytes;
+            scan_plan.push((section, scan_ranges));
         }
+        let sections_to_scan = scan_plan.len();
 
         progress.stage = ProgressStage::ScanningSection;
         progress.total = sections_to_scan;
@@ -2841,16 +2862,7 @@ impl Dumper {
 
         const CHUNK_SIZE: usize = 0x40_0000; // 4MB chunks
 
-        let mut section_idx = 0;
-        for (idx, section) in pe.sections.iter().enumerate() {
-            if config.skip_sections.contains(&idx) || !should_scan_for_heap_pointers(section) {
-                continue;
-            }
-            let scan_ranges = unprotected_section_ranges(section, &protected_ranges);
-            if scan_ranges.is_empty() {
-                continue;
-            }
-
+        for (section_idx, (section, scan_ranges)) in scan_plan.into_iter().enumerate() {
             progress.current_item = Some(section.name.clone());
             progress.current = section_idx;
             report(progress);
@@ -2868,8 +2880,7 @@ impl Dumper {
                         let buffer = unsafe { std::slice::from_raw_parts(chunk_ptr, read_size) };
                         let base_rva = scan_range.start + chunk_off as u32;
 
-                        let chunk_results = scanner.scan_buffer(buffer, base_rva, cache);
-                        results.extend(chunk_results);
+                        scanner.scan_buffer_into(buffer, base_rva, cache, &mut results);
                     }
 
                     progress.bytes_processed += read_size;
@@ -2883,8 +2894,6 @@ impl Dumper {
                     chunk_off += CHUNK_SIZE;
                 }
             }
-
-            section_idx += 1;
         }
 
         progress.current = sections_to_scan;
@@ -2905,6 +2914,7 @@ impl Dumper {
         heap_section_size: usize,
         metadata_section_va: u32,
         metadata_data: Option<&[u8]>,
+        protected_ranges: &[Range<u32>],
         progress: &mut ProgressInfo,
         report: &impl Fn(&ProgressInfo),
     ) -> Result<(Vec<u8>, Vec<SectionMapping>)> {
@@ -2919,29 +2929,23 @@ impl Dumper {
             + num_sections * std::mem::size_of::<SectionHeader>();
         let aligned_headers = PeParser::align_up(headers_size, pe.file_alignment as usize);
 
-        // Dump original sections and compute their new offsets
-        let mut section_data: Vec<Vec<u8>> = Vec::with_capacity(pe.sections.len());
+        // Compute section output layout first, then copy directly into final buffer.
         let mut sections_info: Vec<SectionInfo> = pe.sections.clone();
         let mut current_raw_offset = aligned_headers;
 
         for (i, section) in sections_info.iter_mut().enumerate() {
-            let data = self.dump_section(&pe.sections[i]);
-            let raw_size = PeParser::align_up(data.len(), pe.file_alignment as usize);
+            let data_size = section_dump_size(&pe.sections[i]);
+            let raw_size = PeParser::align_up(data_size, pe.file_alignment as usize);
 
-            section.new_pointer_to_raw_data = if data.is_empty() {
+            section.new_pointer_to_raw_data = if data_size == 0 {
                 0
             } else {
                 current_raw_offset as u32
             };
             section.new_size_of_raw_data = raw_size as u32;
 
-            if !data.is_empty() {
-                let mut padded = data;
-                padded.resize(raw_size, 0);
-                section_data.push(padded);
+            if data_size != 0 {
                 current_raw_offset += raw_size;
-            } else {
-                section_data.push(Vec::new());
             }
         }
 
@@ -3113,26 +3117,23 @@ impl Dumper {
 
         // Write section data
         for (i, section) in sections_info.iter().enumerate() {
-            if section.new_pointer_to_raw_data > 0 && !section_data[i].is_empty() {
+            if section.new_pointer_to_raw_data > 0 && section.new_size_of_raw_data > 0 {
                 let offset = section.new_pointer_to_raw_data as usize;
-                output[offset..offset + section_data[i].len()].copy_from_slice(&section_data[i]);
+                let len = section.new_size_of_raw_data as usize;
+                self.dump_section_into(&pe.sections[i], &mut output[offset..offset + len]);
             }
         }
 
         // Write heap section data (vtable stubs)
         {
             let offset = heap_raw_offset as usize;
-            let mut padded_heap = heap_data;
-            padded_heap.resize(heap_raw_size, 0);
-            output[offset..offset + padded_heap.len()].copy_from_slice(&padded_heap);
+            output[offset..offset + heap_data.len()].copy_from_slice(&heap_data);
         }
 
         // Write metadata section data.
         if has_metadata {
             let offset = metadata_raw_offset as usize;
-            let mut padded_metadata = metadata_data.to_vec();
-            padded_metadata.resize(metadata_raw_size, 0);
-            output[offset..offset + padded_metadata.len()].copy_from_slice(&padded_metadata);
+            output[offset..offset + metadata_data.len()].copy_from_slice(metadata_data);
         }
 
         if !coff_symbol_table_raw.is_empty() {
@@ -3157,18 +3158,6 @@ impl Dumper {
             })
             .collect();
 
-        progress.stage = ProgressStage::ProtectingExceptionData;
-        progress.current_item = Some("fixup exclusions".to_string());
-        progress.eh_progress = None;
-        report(progress);
-        let protected_ranges = protected_exception_ranges_with_progress(pe, |eh_progress| {
-            progress.stage = ProgressStage::ProtectingExceptionData;
-            progress.current = eh_progress.current;
-            progress.total = eh_progress.total;
-            progress.eh_progress = Some(eh_progress);
-            report(progress);
-        });
-        progress.eh_progress = None;
         let exception_snapshot = exception_directory_file_range(pe, &section_mappings)
             .filter(|range| range.end <= output.len())
             .map(|range| (range.clone(), output[range].to_vec()));
@@ -3192,7 +3181,7 @@ impl Dumper {
             &mut output,
             &fixups,
             &section_mappings,
-            &protected_ranges,
+            protected_ranges,
             first_section_rva,
             aligned_headers,
         );
@@ -3212,14 +3201,12 @@ impl Dumper {
         Ok((output, section_mappings))
     }
 
-    /// Dump a section's data from memory.
-    fn dump_section(&self, section: &SectionInfo) -> Vec<u8> {
-        let size = section.virtual_size.max(section.size_of_raw_data) as usize;
+    /// Dump a section directly into an already zero-initialized output slice.
+    fn dump_section_into(&self, section: &SectionInfo, result: &mut [u8]) {
+        let size = section_dump_size(section).min(result.len());
         if size == 0 {
-            return Vec::new();
+            return;
         }
-
-        let mut result = vec![0u8; size];
         let sec_addr = unsafe { self.base.add(section.virtual_address as usize) };
 
         // Try to read the entire section at once first
@@ -3243,8 +3230,6 @@ impl Dumper {
                 off += PAGE_SIZE;
             }
         }
-
-        result
     }
 
     /// Apply devirtualization to the output PE.
@@ -3319,29 +3304,22 @@ impl Dumper {
             + pe.sections.len() * std::mem::size_of::<SectionHeader>();
         let aligned_headers = PeParser::align_up(headers_size, pe.file_alignment as usize);
 
-        // Dump sections
-        let mut section_data: Vec<Vec<u8>> = Vec::with_capacity(pe.sections.len());
         let mut sections_info: Vec<SectionInfo> = pe.sections.clone();
         let mut current_raw_offset = aligned_headers;
 
         for (i, section) in sections_info.iter_mut().enumerate() {
-            let data = self.dump_section(&pe.sections[i]);
-            let raw_size = PeParser::align_up(data.len(), pe.file_alignment as usize);
+            let data_size = section_dump_size(&pe.sections[i]);
+            let raw_size = PeParser::align_up(data_size, pe.file_alignment as usize);
 
-            section.new_pointer_to_raw_data = if data.is_empty() {
+            section.new_pointer_to_raw_data = if data_size == 0 {
                 0
             } else {
                 current_raw_offset as u32
             };
             section.new_size_of_raw_data = raw_size as u32;
 
-            if !data.is_empty() {
-                let mut padded = data;
-                padded.resize(raw_size, 0);
-                section_data.push(padded);
+            if data_size != 0 {
                 current_raw_offset += raw_size;
-            } else {
-                section_data.push(Vec::new());
             }
         }
 
@@ -3426,9 +3404,10 @@ impl Dumper {
 
         // Section data
         for (i, section) in sections_info.iter().enumerate() {
-            if section.new_pointer_to_raw_data > 0 && !section_data[i].is_empty() {
+            if section.new_pointer_to_raw_data > 0 && section.new_size_of_raw_data > 0 {
                 let offset = section.new_pointer_to_raw_data as usize;
-                output[offset..offset + section_data[i].len()].copy_from_slice(&section_data[i]);
+                let len = section.new_size_of_raw_data as usize;
+                self.dump_section_into(&pe.sections[i], &mut output[offset..offset + len]);
             }
         }
 

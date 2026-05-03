@@ -745,7 +745,8 @@ impl StubGenerator {
     /// Deduplicate heap graph edges, score them, apply config limits, and derive
     /// conservative container facts from the retained high-confidence graph.
     fn finalize_heap_graph(&mut self) {
-        let mut unique: BTreeMap<(u64, u32, u64), HeapPointerEdge> = BTreeMap::new();
+        let mut unique: HashMap<(u64, u32, u64), HeapPointerEdge> =
+            HashMap::with_capacity(self.heap_edges.len());
         for mut edge in self.heap_edges.drain(..) {
             edge.source_heap_addr = strip_pointer_tags(edge.source_heap_addr);
             edge.target_heap_addr = strip_pointer_tags(edge.target_heap_addr);
@@ -918,7 +919,7 @@ impl StubGenerator {
                 continue;
             }
             let byte_len = (end - begin) as usize;
-            if byte_len < 16 || byte_len % 8 != 0 || !self.is_valid_heap_ptr(begin) {
+            if byte_len < 16 || !byte_len.is_multiple_of(8) || !self.is_valid_heap_ptr(begin) {
                 continue;
             }
 
@@ -976,8 +977,8 @@ impl StubGenerator {
         let qwords: &[u64] =
             unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u64, num_qwords) };
 
-        let mut results = Vec::new();
-        let mut seen = HashSet::new();
+        let mut results = Vec::with_capacity(num_qwords.min(64));
+        let mut seen = HashSet::with_capacity(num_qwords.min(64));
         for (idx, &raw_val) in qwords.iter().enumerate() {
             let val = strip_pointer_tags(raw_val);
             if seen.insert(val) && self.is_cached_heap_ptr(val) {

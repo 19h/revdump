@@ -64,11 +64,28 @@ impl PointerScanner {
         cache: &MemoryRegionCache,
     ) -> Vec<ScanResult> {
         let mut results = Vec::new();
+        self.scan_buffer_into(buffer, base_rva, cache, &mut results);
+        results
+    }
+
+    /// Scan a buffer and append matches to an existing result vector.
+    #[inline]
+    pub fn scan_buffer_into(
+        &self,
+        buffer: &[u8],
+        base_rva: u32,
+        cache: &MemoryRegionCache,
+        results: &mut Vec<ScanResult>,
+    ) {
+        let expected_hits = buffer.len() / 4096;
+        if results.capacity().saturating_sub(results.len()) < expected_hits {
+            results.reserve(expected_hits);
+        }
 
         // Dispatch to best available implementation
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
         {
-            self.scan_buffer_avx2(buffer, base_rva, cache, &mut results);
+            self.scan_buffer_avx2(buffer, base_rva, cache, results);
         }
 
         #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
@@ -77,23 +94,21 @@ impl PointerScanner {
             if is_x86_feature_detected!("avx2") {
                 // SAFETY: We just checked that AVX2 is available
                 unsafe {
-                    self.scan_buffer_avx2_unchecked(buffer, base_rva, cache, &mut results);
+                    self.scan_buffer_avx2_unchecked(buffer, base_rva, cache, results);
                 }
             } else if is_x86_feature_detected!("sse4.2") {
                 unsafe {
-                    self.scan_buffer_sse42_unchecked(buffer, base_rva, cache, &mut results);
+                    self.scan_buffer_sse42_unchecked(buffer, base_rva, cache, results);
                 }
             } else {
-                self.scan_buffer_scalar(buffer, base_rva, cache, &mut results);
+                self.scan_buffer_scalar(buffer, base_rva, cache, results);
             }
         }
 
         #[cfg(not(target_arch = "x86_64"))]
         {
-            self.scan_buffer_scalar(buffer, base_rva, cache, &mut results);
+            self.scan_buffer_scalar(buffer, base_rva, cache, results);
         }
-
-        results
     }
 
     /// Scalar fallback implementation with manual loop unrolling.

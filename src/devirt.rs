@@ -17,7 +17,7 @@
 //! This improves static analysis in decompilers like IDA and Ghidra.
 
 use crate::error::Result;
-use crate::fixup::SectionMapping;
+use crate::fixup::{section_file_offset_for_rva, SectionMapping};
 use crate::memory::{safe_read_memory, strip_pointer_tags};
 use crate::stub::{HeapPointerEdge, VtableFact};
 
@@ -2309,24 +2309,8 @@ pub fn apply_code_patches(
     let mut skipped = 0;
 
     for patch in patches {
-        // Find containing section
-        let section = section_mappings.iter().find(|s| {
-            patch.rva >= s.virtual_address
-                && patch.rva < s.virtual_address + s.virtual_size.max(s.raw_size)
-        });
-
-        let file_offset = match section {
-            Some(sec) if sec.raw_offset > 0 => {
-                if patch.rva < sec.virtual_address {
-                    skipped += 1;
-                    continue;
-                }
-                sec.raw_offset + (patch.rva - sec.virtual_address)
-            }
-            Some(_sec) => {
-                skipped += 1;
-                continue;
-            }
+        let file_offset = match section_file_offset_for_rva(section_mappings, patch.rva) {
+            Some(sec) => sec.file_offset,
             None => {
                 skipped += 1;
                 continue;
