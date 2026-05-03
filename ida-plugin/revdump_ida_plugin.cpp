@@ -373,10 +373,14 @@ private:
     }
 
     void progress(std::string_view label, std::uint32_t index, std::uint32_t total) const {
+        if (total == 0) return;
         if (index != 0 && index != total && (index % 128) != 0) return;
         const auto text = fmt("RevDump: %.*s %u/%u",
                               static_cast<int>(label.size()), label.data(), index, total);
         replace_wait_box("%s", text.c_str());
+        if (index == 0 || index == total || (index % 1024) == 0) {
+            ida::ui::message(fmt("[%s]\n", text.c_str()));
+        }
     }
 
     void name_ea(ida::Address ea, std::string name) {
