@@ -4,6 +4,7 @@
 //! from their runtime values to their new locations in the dumped PE.
 
 use crate::memory::strip_pointer_tags;
+use crate::pe::{IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_WRITE};
 use crate::stub::StubGenerator;
 
 /// The kind of pointer fixup.
@@ -113,7 +114,7 @@ pub fn apply_fixups(
         });
 
         let file_offset = match section {
-            Some(sec) if sec.raw_offset > 0 => {
+            Some(sec) if sec.raw_offset > 0 && sec.allows_heap_pointer_fixups() => {
                 // Ensure no underflow
                 if fix.rva < sec.virtual_address {
                     skipped += 1;
@@ -159,17 +160,26 @@ pub struct SectionMapping {
     pub raw_size: u32,
     /// File offset.
     pub raw_offset: u32,
+    /// Section characteristics.
+    pub characteristics: u32,
 }
 
 impl SectionMapping {
     /// Create from PE section info.
-    pub fn new(va: u32, vsize: u32, raw_size: u32, raw_offset: u32) -> Self {
+    pub fn new(va: u32, vsize: u32, raw_size: u32, raw_offset: u32, characteristics: u32) -> Self {
         Self {
             virtual_address: va,
             virtual_size: vsize,
             raw_size,
             raw_offset,
+            characteristics,
         }
+    }
+
+    /// Heap pointer fixups should only rewrite writable data, never code or PE metadata.
+    pub fn allows_heap_pointer_fixups(&self) -> bool {
+        (self.characteristics & IMAGE_SCN_MEM_WRITE) != 0
+            && (self.characteristics & IMAGE_SCN_MEM_EXECUTE) == 0
     }
 }
 
@@ -187,8 +197,31 @@ mod tests {
 
     #[test]
     fn test_section_mapping() {
-        let mapping = SectionMapping::new(0x1000, 0x500, 0x600, 0x400);
+        let mapping = SectionMapping::new(0x1000, 0x500, 0x600, 0x400, IMAGE_SCN_MEM_WRITE);
         assert_eq!(mapping.virtual_address, 0x1000);
         assert_eq!(mapping.raw_offset, 0x400);
+        assert!(mapping.allows_heap_pointer_fixups());
+    }
+
+    #[test]
+    fn test_apply_fixups_skips_read_only_metadata_sections() {
+        let mut output = vec![0u8; 0x800];
+        output[0x400..0x408].copy_from_slice(&0x1111_2222_3333_4444u64.to_le_bytes());
+        let fixups = vec![PointerFixup {
+            kind: FixupKind::ModuleToStub,
+            rva: 0x1000,
+            old_value: 0x1111_2222_3333_4444,
+            new_value: 0x5555_6666_7777_8888,
+        }];
+        let sections = vec![SectionMapping::new(0x1000, 0x100, 0x100, 0x400, 0)];
+
+        let (applied, skipped) = apply_fixups(&mut output, &fixups, &sections, 0x1000, 0x400);
+
+        assert_eq!(applied, 0);
+        assert_eq!(skipped, 1);
+        assert_eq!(
+            u64::from_le_bytes(output[0x400..0x408].try_into().unwrap()),
+            0x1111_2222_3333_4444
+        );
     }
 }

@@ -288,6 +288,35 @@ fn should_scan_for_heap_pointers(section: &SectionInfo) -> bool {
         && (section.characteristics & IMAGE_SCN_MEM_EXECUTE) == 0
 }
 
+fn output_file_range_for_rva(
+    section_mappings: &[SectionMapping],
+    rva: u32,
+    size: usize,
+) -> Option<std::ops::Range<usize>> {
+    let end_rva = rva.checked_add(size.try_into().ok()?)?;
+    let section = section_mappings.iter().find(|section| {
+        let section_end = section
+            .virtual_address
+            .saturating_add(section.virtual_size.max(section.raw_size));
+        rva >= section.virtual_address && end_rva <= section_end
+    })?;
+    if section.raw_offset == 0 {
+        return None;
+    }
+    let start = section
+        .raw_offset
+        .checked_add(rva.checked_sub(section.virtual_address)?)? as usize;
+    Some(start..start.checked_add(size)?)
+}
+
+fn exception_directory_file_range(
+    pe: &PeParser,
+    section_mappings: &[SectionMapping],
+) -> Option<std::ops::Range<usize>> {
+    let (rva, size) = pe_data_directory(pe, IMAGE_DIRECTORY_ENTRY_EXCEPTION)?;
+    output_file_range_for_rva(section_mappings, rva, size as usize)
+}
+
 fn join_hex_u32(values: &[u32]) -> String {
     values
         .iter()
@@ -2841,9 +2870,14 @@ impl Dumper {
                     s.virtual_size,
                     s.new_size_of_raw_data,
                     s.new_pointer_to_raw_data,
+                    s.characteristics,
                 )
             })
             .collect();
+
+        let exception_snapshot = exception_directory_file_range(pe, &section_mappings)
+            .filter(|range| range.end <= output.len())
+            .map(|range| (range.clone(), output[range].to_vec()));
 
         let first_section_rva = sections_info
             .iter()
@@ -2858,6 +2892,13 @@ impl Dumper {
             first_section_rva,
             aligned_headers,
         );
+
+        if let Some((range, original_bytes)) = exception_snapshot {
+            if output[range.clone()] != original_bytes[..] {
+                output[range].copy_from_slice(&original_bytes);
+                eprintln!("Restored exception directory after blocked unsafe heap fixups");
+            }
+        }
 
         Ok((output, section_mappings))
     }
