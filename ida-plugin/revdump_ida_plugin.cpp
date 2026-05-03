@@ -2,6 +2,7 @@
 
 #include <bytes.hpp>
 #include <kernwin.hpp>
+#include <ua.hpp>
 #include <xref.hpp>
 #include <offset.hpp>
 
@@ -170,7 +171,7 @@ struct Sha256 {
     }
 };
 
-std::array<std::uint8_t, kChecksumSize> metadata_checksum(const std::vector<std::uint8_t>& bytes) {
+std::array<std::uint8_t, kChecksumSize> metadata_checksum(std::span<const std::uint8_t> bytes) {
     Sha256 sha;
     sha.update(bytes.data(), kChecksumOffset);
     std::array<std::uint8_t, kChecksumSize> zeros{};
@@ -344,12 +345,6 @@ std::optional<Metadata> parse_metadata(std::vector<std::uint8_t> bytes, std::str
         error = "metadata authentication header is unsupported";
         return std::nullopt;
     }
-    const auto computed = metadata_checksum(md.bytes);
-    if (!constant_time_equal(md.bytes.data() + kChecksumOffset, computed.data(), computed.size())) {
-        error = "metadata SHA-256 checksum mismatch; refusing to import unverified .revdmp data";
-        return std::nullopt;
-    }
-
     offset = kHeaderSize;
 
     for (std::uint32_t i = 0; i < block_count; ++i) {
@@ -392,12 +387,22 @@ std::optional<Metadata> parse_metadata(std::vector<std::uint8_t> bytes, std::str
         error = "metadata string table extends past section bounds";
         return std::nullopt;
     }
-    if (offset + string_len != md.bytes.size()) {
-        error = "metadata section contains trailing bytes outside the authenticated layout";
+    const auto authenticated_len = offset + string_len;
+    const auto authenticated_bytes = std::span<const std::uint8_t>(md.bytes.data(), authenticated_len);
+    const auto computed = metadata_checksum(authenticated_bytes);
+    if (!constant_time_equal(md.bytes.data() + kChecksumOffset, computed.data(), computed.size())) {
+        error = "metadata SHA-256 checksum mismatch; refusing to import unverified .revdmp data";
+        return std::nullopt;
+    }
+    if (std::any_of(md.bytes.begin() + authenticated_len, md.bytes.end(), [](std::uint8_t byte) {
+            return byte != 0;
+        })) {
+        error = "metadata section contains nonzero trailing bytes outside the authenticated layout";
         return std::nullopt;
     }
     md.string_offset = offset;
     md.string_len = string_len;
+    md.bytes.resize(authenticated_len);
     return md;
 }
 
@@ -637,9 +642,30 @@ private:
         }
     }
 
+    bool ensure_data_head(ida::Address ea) {
+        if (!mapped(ea)) return false;
+        if (ida::address::is_head(ea) && ida::address::is_data(ea)) return true;
+        if (!ida::address::is_unknown(ea)) {
+            ida::data::undefine(ea, 8);
+        }
+        if (ida::data::define_qword(ea)) {
+            ++stats_.offsets;
+        }
+        return ida::address::is_head(ea) && ida::address::is_data(ea);
+    }
+
+    bool ensure_code_head(ida::Address ea) {
+        if (!mapped(ea)) return false;
+        if (ida::address::is_head(ea) && ida::address::is_code(ea)) return true;
+        if (!ida::address::is_unknown(ea)) return false;
+        if (create_insn(static_cast<ea_t>(ea)) > 0) {
+            return ida::address::is_head(ea) && ida::address::is_code(ea);
+        }
+        return false;
+    }
+
     void define_qword_offset(ida::Address from, ida::Address to) {
-        if (!mapped(from)) return;
-        if (auto st = ida::data::define_qword(from); st) ++stats_.offsets;
+        if (!ensure_data_head(from)) return;
         op_plain_offset(static_cast<ea_t>(from), 0, 0);
         if (mapped(to)) {
             if (auto st = ida::xref::add_data(from, to, ida::xref::DataType::Offset); st) {
@@ -650,6 +676,7 @@ private:
 
     void add_code_xref(ida::Address from, ida::Address to, const std::string& kind) {
         if (!mapped(from) || !mapped(to)) return;
+        if (!ensure_code_head(from)) return;
         const auto type = kind == "jmp" ? ida::xref::CodeType::JumpNear : ida::xref::CodeType::CallNear;
         if (auto st = ida::xref::add_code(from, to, type); st) {
             ++stats_.xrefs;
