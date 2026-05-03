@@ -35,6 +35,14 @@ pub struct FixupStats {
     pub module_to_stub: usize,
 }
 
+/// Statistics about applied fixups.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FixupApplyStats {
+    pub applied: usize,
+    pub skipped: usize,
+    pub protected_skipped: usize,
+}
+
 impl FixupStats {
     /// Total number of fixups.
     pub fn total(&self) -> usize {
@@ -98,18 +106,18 @@ pub fn apply_fixups(
     protected_ranges: &[Range<u32>],
     first_section_rva: u32,
     headers_size: usize,
-) -> (usize, usize) {
-    let mut applied = 0;
-    let mut skipped = 0;
+) -> FixupApplyStats {
+    let mut stats = FixupApplyStats::default();
 
     for fix in fixups {
         // Skip fixups in header region
         if fix.rva < first_section_rva {
-            skipped += 1;
+            stats.skipped += 1;
             continue;
         }
         if rva_range_overlaps(protected_ranges, fix.rva, 8) {
-            skipped += 1;
+            stats.skipped += 1;
+            stats.protected_skipped += 1;
             continue;
         }
 
@@ -123,36 +131,36 @@ pub fn apply_fixups(
             Some(sec) if sec.raw_offset > 0 && sec.allows_heap_pointer_fixups() => {
                 // Ensure no underflow
                 if fix.rva < sec.virtual_address {
-                    skipped += 1;
+                    stats.skipped += 1;
                     continue;
                 }
                 sec.raw_offset + (fix.rva - sec.virtual_address)
             }
             _ => {
-                skipped += 1;
+                stats.skipped += 1;
                 continue;
             }
         };
 
         // Universal header protection
         if (file_offset as usize) < headers_size {
-            skipped += 1;
+            stats.skipped += 1;
             continue;
         }
 
         // Bounds check
         let offset = file_offset as usize;
         if offset + 8 > output.len() {
-            skipped += 1;
+            stats.skipped += 1;
             continue;
         }
 
         // Write the new pointer value (little-endian)
         output[offset..offset + 8].copy_from_slice(&fix.new_value.to_le_bytes());
-        applied += 1;
+        stats.applied += 1;
     }
 
-    (applied, skipped)
+    stats
 }
 
 /// Mapping information for a section (for fixup application).
@@ -230,7 +238,7 @@ mod tests {
         let sections = vec![SectionMapping::new(0x1000, 0x100, 0x100, 0x400, 0)];
         let protected_range = 0x1000..0x1100;
 
-        let (applied, skipped) = apply_fixups(
+        let stats = apply_fixups(
             &mut output,
             &fixups,
             &sections,
@@ -239,8 +247,9 @@ mod tests {
             0x400,
         );
 
-        assert_eq!(applied, 0);
-        assert_eq!(skipped, 1);
+        assert_eq!(stats.applied, 0);
+        assert_eq!(stats.skipped, 1);
+        assert_eq!(stats.protected_skipped, 1);
         assert_eq!(
             u64::from_le_bytes(output[0x400..0x408].try_into().unwrap()),
             0x1111_2222_3333_4444
@@ -259,10 +268,11 @@ mod tests {
         }];
         let sections = vec![SectionMapping::new(0x1000, 0x100, 0x100, 0x400, 0)];
 
-        let (applied, skipped) = apply_fixups(&mut output, &fixups, &sections, &[], 0x1000, 0x400);
+        let stats = apply_fixups(&mut output, &fixups, &sections, &[], 0x1000, 0x400);
 
-        assert_eq!(applied, 1);
-        assert_eq!(skipped, 0);
+        assert_eq!(stats.applied, 1);
+        assert_eq!(stats.skipped, 0);
+        assert_eq!(stats.protected_skipped, 0);
         assert_eq!(
             u64::from_le_bytes(output[0x400..0x408].try_into().unwrap()),
             0x5555_6666_7777_8888

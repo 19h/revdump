@@ -1166,7 +1166,30 @@ fn print_progress(info: &ProgressInfo) {
             }
         }
         ProgressStage::ApplyingFixups => {
-            format!("{}/{} fixups", info.current, info.total)
+            format!(
+                "{}/{} fixups | applied={} skipped={} protected_eh={}",
+                info.current,
+                info.total,
+                info.fixups_applied,
+                info.fixups_skipped,
+                info.protected_fixups_skipped,
+            )
+        }
+        ProgressStage::ProtectingExceptionData => {
+            if let Some(eh) = info.eh_progress.as_ref() {
+                let protected_mb = eh.protected_bytes as f64 / (1024.0 * 1024.0);
+                format!(
+                    "{} {}/{} | ranges={} protected={:.1} MB unwind={}",
+                    eh.phase,
+                    eh.current,
+                    eh.total,
+                    eh.protected_ranges,
+                    protected_mb,
+                    eh.unwind_infos,
+                )
+            } else {
+                info.current_item.as_deref().unwrap_or("").to_string()
+            }
         }
         ProgressStage::AnalyzingMetadata | ProgressStage::BuildingMetadata => {
             let item = info.current_item.as_deref().unwrap_or("");

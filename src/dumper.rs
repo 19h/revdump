@@ -201,6 +201,7 @@ pub enum ProgressStage {
     AnalyzingMetadata,
     BuildingMetadata,
     BuildingOutput,
+    ProtectingExceptionData,
     ApplyingFixups,
     Devirtualizing,
     WritingFile,
@@ -219,6 +220,7 @@ impl ProgressStage {
             Self::AnalyzingMetadata => "Analyzing .revdmp metadata",
             Self::BuildingMetadata => "Building .revdmp metadata",
             Self::BuildingOutput => "Building output PE",
+            Self::ProtectingExceptionData => "Protecting exception data",
             Self::ApplyingFixups => "Applying fixups",
             Self::Devirtualizing => "Devirtualizing vcalls",
             Self::WritingFile => "Writing file",
@@ -250,6 +252,25 @@ pub struct ProgressInfo {
     pub stub_debug: Option<StubDebugProgress>,
     /// Detailed devirtualization progress for vcall scanning and patching.
     pub devirt_progress: Option<DevirtProgress>,
+    /// Detailed progress for exception/unwind protection.
+    pub eh_progress: Option<EhProtectionProgress>,
+    /// Heap pointer fixups applied so far.
+    pub fixups_applied: usize,
+    /// Heap pointer fixups skipped so far.
+    pub fixups_skipped: usize,
+    /// Heap pointer fixups skipped because they overlap protected EH metadata.
+    pub protected_fixups_skipped: usize,
+}
+
+/// Progress snapshot emitted while building EH protection ranges.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EhProtectionProgress {
+    pub current: usize,
+    pub total: usize,
+    pub protected_ranges: usize,
+    pub protected_bytes: usize,
+    pub unwind_infos: usize,
+    pub phase: &'static str,
 }
 
 impl Default for ProgressInfo {
@@ -265,6 +286,10 @@ impl Default for ProgressInfo {
             total_bytes: 0,
             stub_debug: None,
             devirt_progress: None,
+            eh_progress: None,
+            fixups_applied: 0,
+            fixups_skipped: 0,
+            protected_fixups_skipped: 0,
         }
     }
 }
@@ -333,7 +358,26 @@ fn unwind_info_size(pe: &PeParser, unwind_rva: u32) -> Option<u32> {
     Some(size)
 }
 
-fn protected_exception_ranges(pe: &PeParser) -> Vec<Range<u32>> {
+fn protected_exception_ranges_with_progress<F>(pe: &PeParser, mut progress: F) -> Vec<Range<u32>>
+where
+    F: FnMut(EhProtectionProgress),
+{
+    protected_exception_ranges_inner(pe, Some(&mut progress))
+}
+
+fn emit_eh_progress(
+    progress: &mut Option<&mut dyn FnMut(EhProtectionProgress)>,
+    snapshot: EhProtectionProgress,
+) {
+    if let Some(progress) = progress.as_mut() {
+        (*progress)(snapshot);
+    }
+}
+
+fn protected_exception_ranges_inner(
+    pe: &PeParser,
+    mut progress: Option<&mut dyn FnMut(EhProtectionProgress)>,
+) -> Vec<Range<u32>> {
     let Some((exception_rva, exception_size)) =
         pe_data_directory(pe, IMAGE_DIRECTORY_ENTRY_EXCEPTION)
     else {
@@ -348,6 +392,17 @@ fn protected_exception_ranges(pe: &PeParser) -> Vec<Range<u32>> {
         std::iter::once(exception_rva..exception_rva.saturating_add(exception_size)).collect();
     let entry_count = exception_size / 12;
     let mut unwind_rvas = Vec::new();
+    emit_eh_progress(
+        &mut progress,
+        EhProtectionProgress {
+            current: 0,
+            total: entry_count as usize,
+            protected_ranges: ranges.len(),
+            protected_bytes: exception_size as usize,
+            unwind_infos: 0,
+            phase: "reading .pdata",
+        },
+    );
     for idx in 0..entry_count {
         let entry_rva = exception_rva.saturating_add(idx.saturating_mul(12));
         if let Some(unwind_rva) = read_u32_at_rva(pe, entry_rva + 8) {
@@ -355,9 +410,33 @@ fn protected_exception_ranges(pe: &PeParser) -> Vec<Range<u32>> {
                 unwind_rvas.push(unwind_rva);
             }
         }
+        if idx % 65_536 == 0 && idx != 0 {
+            emit_eh_progress(
+                &mut progress,
+                EhProtectionProgress {
+                    current: idx as usize,
+                    total: entry_count as usize,
+                    protected_ranges: ranges.len(),
+                    protected_bytes: exception_size as usize,
+                    unwind_infos: unwind_rvas.len(),
+                    phase: "reading .pdata",
+                },
+            );
+        }
     }
     unwind_rvas.sort_unstable();
     unwind_rvas.dedup();
+    emit_eh_progress(
+        &mut progress,
+        EhProtectionProgress {
+            current: entry_count as usize,
+            total: entry_count as usize,
+            protected_ranges: ranges.len(),
+            protected_bytes: exception_size as usize,
+            unwind_infos: unwind_rvas.len(),
+            phase: "reading .pdata",
+        },
+    );
 
     for (idx, &unwind_rva) in unwind_rvas.iter().enumerate() {
         let Some(section) = rva_section(&pe.sections, unwind_rva) else {
@@ -380,9 +459,40 @@ fn protected_exception_ranges(pe: &PeParser) -> Vec<Range<u32>> {
             .max(min_end)
             .min(section_rva_end(section));
         ranges.push(unwind_rva..end);
+        if idx % 65_536 == 0 && idx != 0 {
+            emit_eh_progress(
+                &mut progress,
+                EhProtectionProgress {
+                    current: idx,
+                    total: unwind_rvas.len(),
+                    protected_ranges: ranges.len(),
+                    protected_bytes: ranges
+                        .iter()
+                        .map(|range| (range.end - range.start) as usize)
+                        .sum(),
+                    unwind_infos: unwind_rvas.len(),
+                    phase: "protecting unwind info",
+                },
+            );
+        }
     }
 
-    merge_rva_ranges(ranges)
+    let ranges = merge_rva_ranges(ranges);
+    emit_eh_progress(
+        &mut progress,
+        EhProtectionProgress {
+            current: unwind_rvas.len(),
+            total: unwind_rvas.len(),
+            protected_ranges: ranges.len(),
+            protected_bytes: ranges
+                .iter()
+                .map(|range| (range.end - range.start) as usize)
+                .sum(),
+            unwind_infos: unwind_rvas.len(),
+            phase: "complete",
+        },
+    );
+    ranges
 }
 
 fn unprotected_section_ranges(
@@ -2612,6 +2722,8 @@ impl Dumper {
             heap_section_size,
             metadata_section_va,
             config.emit_revdmp.then_some(metadata_data.as_slice()),
+            &mut progress,
+            &report,
         )?;
 
         // Devirtualize vcalls if enabled
@@ -2671,7 +2783,18 @@ impl Dumper {
         let scanner_config = stub_generator.scanner_config();
         let scanner = PointerScanner::new(scanner_config);
         let cache = stub_generator.cache();
-        let protected_ranges = protected_exception_ranges(pe);
+        progress.stage = ProgressStage::ProtectingExceptionData;
+        progress.current_item = Some("heap scan exclusions".to_string());
+        progress.eh_progress = None;
+        report(progress);
+        let protected_ranges = protected_exception_ranges_with_progress(pe, |eh_progress| {
+            progress.stage = ProgressStage::ProtectingExceptionData;
+            progress.current = eh_progress.current;
+            progress.total = eh_progress.total;
+            progress.eh_progress = Some(eh_progress);
+            report(progress);
+        });
+        progress.eh_progress = None;
 
         // Calculate total bytes to scan
         let mut total_bytes = 0usize;
@@ -2764,6 +2887,8 @@ impl Dumper {
         heap_section_size: usize,
         metadata_section_va: u32,
         metadata_data: Option<&[u8]>,
+        progress: &mut ProgressInfo,
+        report: &impl Fn(&ProgressInfo),
     ) -> Result<(Vec<u8>, Vec<SectionMapping>)> {
         // Calculate sizes
         let has_metadata = metadata_data.is_some();
@@ -3014,7 +3139,18 @@ impl Dumper {
             })
             .collect();
 
-        let protected_ranges = protected_exception_ranges(pe);
+        progress.stage = ProgressStage::ProtectingExceptionData;
+        progress.current_item = Some("fixup exclusions".to_string());
+        progress.eh_progress = None;
+        report(progress);
+        let protected_ranges = protected_exception_ranges_with_progress(pe, |eh_progress| {
+            progress.stage = ProgressStage::ProtectingExceptionData;
+            progress.current = eh_progress.current;
+            progress.total = eh_progress.total;
+            progress.eh_progress = Some(eh_progress);
+            report(progress);
+        });
+        progress.eh_progress = None;
         let exception_snapshot = exception_directory_file_range(pe, &section_mappings)
             .filter(|range| range.end <= output.len())
             .map(|range| (range.clone(), output[range].to_vec()));
@@ -3025,7 +3161,16 @@ impl Dumper {
             .min()
             .unwrap_or(0);
 
-        let (_applied, _skipped) = apply_fixups(
+        progress.stage = ProgressStage::ApplyingFixups;
+        progress.current_item = Some("heap pointer fixups".to_string());
+        progress.current = 0;
+        progress.total = fixups.len();
+        progress.fixups_applied = 0;
+        progress.fixups_skipped = 0;
+        progress.protected_fixups_skipped = 0;
+        report(progress);
+
+        let fixup_stats = apply_fixups(
             &mut output,
             &fixups,
             &section_mappings,
@@ -3033,6 +3178,11 @@ impl Dumper {
             first_section_rva,
             aligned_headers,
         );
+        progress.current = fixups.len();
+        progress.fixups_applied = fixup_stats.applied;
+        progress.fixups_skipped = fixup_stats.skipped;
+        progress.protected_fixups_skipped = fixup_stats.protected_skipped;
+        report(progress);
 
         if let Some((range, original_bytes)) = exception_snapshot {
             if output[range.clone()] != original_bytes[..] {

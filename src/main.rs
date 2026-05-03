@@ -263,6 +263,32 @@ fn dump_with_heap(
                     let item = info.current_item.as_deref().unwrap_or("");
                     format!("{} - {}", info.stage.name(), item)
                 }
+                ProgressStage::ProtectingExceptionData => {
+                    if let Some(eh) = info.eh_progress.as_ref() {
+                        format!(
+                            "{} - {} {}/{} (ranges {}, bytes {}, unwind {})",
+                            info.stage.name(),
+                            eh.phase,
+                            eh.current,
+                            eh.total,
+                            eh.protected_ranges,
+                            ByteSize::b(eh.protected_bytes as u64),
+                            eh.unwind_infos,
+                        )
+                    } else {
+                        let item = info.current_item.as_deref().unwrap_or("");
+                        format!("{} - {}", info.stage.name(), item)
+                    }
+                }
+                ProgressStage::ApplyingFixups => format!(
+                    "{} - {}/{} (applied {}, skipped {}, protected {})",
+                    info.stage.name(),
+                    info.current,
+                    info.total,
+                    info.fixups_applied,
+                    info.fixups_skipped,
+                    info.protected_fixups_skipped,
+                ),
                 ProgressStage::Devirtualizing => {
                     if let Some(devirt) = info.devirt_progress.as_ref() {
                         format!(
