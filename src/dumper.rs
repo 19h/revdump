@@ -19,6 +19,7 @@ use crate::scanner::{PointerScanner, ScanResult};
 use crate::stub::{
     ContainerFact, EdgeConfidence, HeapPointerEdge, StubConfig, StubGenerator, VtableFact,
 };
+use sha2::{Digest, Sha256};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
@@ -1055,9 +1056,13 @@ fn analyze_exception_functions(pe: &PeParser) -> Vec<ExceptionFunctionFact> {
 }
 
 const REVDMP_BINARY_MAGIC: &[u8; 8] = b"REVDMPB\0";
-const REVDMP_BINARY_VERSION: u32 = 1;
+const REVDMP_BINARY_VERSION: u32 = 2;
 const REVDMP_ENDIAN_MARKER: u32 = 0x0102_0304;
 const REVDMP_NONE_U32: u32 = u32::MAX;
+const REVDMP_CHECKSUM_KIND_SHA256: u32 = 1;
+const REVDMP_CHECKSUM_OFFSET: usize = 40;
+const REVDMP_CHECKSUM_SIZE: usize = 32;
+const REVDMP_HEADER_SIZE: usize = REVDMP_CHECKSUM_OFFSET + REVDMP_CHECKSUM_SIZE;
 
 const BLOCK_OBJECTS: u32 = 1;
 const BLOCK_VTABLE_FACTS: u32 = 2;
@@ -1166,6 +1171,9 @@ impl RevdmpBinaryBuilder {
         out.extend_from_slice(&(self.blocks.len() as u32).to_le_bytes());
         out.extend_from_slice(&(self.strings.len() as u32).to_le_bytes());
         out.extend_from_slice(&image_base.to_le_bytes());
+        out.extend_from_slice(&REVDMP_CHECKSUM_KIND_SHA256.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&[0u8; REVDMP_CHECKSUM_SIZE]);
 
         for (&kind, block) in &self.blocks {
             out.extend_from_slice(&kind.to_le_bytes());
@@ -1176,8 +1184,18 @@ impl RevdmpBinaryBuilder {
         }
 
         out.extend_from_slice(&self.strings);
+        let checksum = revdmp_checksum(&out);
+        out[REVDMP_CHECKSUM_OFFSET..REVDMP_HEADER_SIZE].copy_from_slice(&checksum);
         out
     }
+}
+
+fn revdmp_checksum(data: &[u8]) -> [u8; REVDMP_CHECKSUM_SIZE] {
+    let mut hasher = Sha256::new();
+    hasher.update(&data[..REVDMP_CHECKSUM_OFFSET]);
+    hasher.update([0u8; REVDMP_CHECKSUM_SIZE]);
+    hasher.update(&data[REVDMP_HEADER_SIZE..]);
+    hasher.finalize().into()
 }
 
 fn opt_rva(value: Option<u32>) -> u32 {
@@ -2131,13 +2149,13 @@ impl Default for DumpConfig {
             max_vfptr_probe: 256,
             skip_sections: Vec::new(),
             progress_callback: None,
-            enable_devirt: false,
+            enable_devirt: true,
             devirt_config: DevirtConfig::default(),
             max_heap_scan_size: 0x1000,
-            recursive_heap_scan_depth: 2,
+            recursive_heap_scan_depth: 4,
             emit_revdmp: true,
             parse_rtti: true,
-            max_graph_edges: 50_000,
+            max_graph_edges: 100_000,
             min_edge_confidence: EdgeConfidence::Low,
             detect_containers: true,
             strong_devirt: true,
@@ -3102,6 +3120,11 @@ mod tests {
 
     fn parse_revdmp(data: &[u8]) -> ParsedRevdmp {
         assert!(data.starts_with(REVDMP_BINARY_MAGIC));
+        assert!(data.len() >= REVDMP_HEADER_SIZE);
+        assert_eq!(
+            data[REVDMP_CHECKSUM_OFFSET..REVDMP_HEADER_SIZE],
+            revdmp_checksum(data)
+        );
         let mut offset = REVDMP_BINARY_MAGIC.len();
         assert_eq!(read_u32(data, offset), REVDMP_BINARY_VERSION);
         offset += 4;
@@ -3113,6 +3136,10 @@ mod tests {
         offset += 4;
         let image_base = read_u64(data, offset);
         offset += 8;
+        assert_eq!(read_u32(data, offset), REVDMP_CHECKSUM_KIND_SHA256);
+        offset += 4;
+        assert_eq!(read_u32(data, offset), 0);
+        offset = REVDMP_HEADER_SIZE;
 
         let mut blocks = BTreeMap::new();
         for _ in 0..block_count {
@@ -3148,6 +3175,9 @@ mod tests {
         let config = DumpConfig::default();
         assert_eq!(config.max_vfptr_probe, 256);
         assert!(config.skip_sections.is_empty());
+        assert!(config.enable_devirt);
+        assert_eq!(config.recursive_heap_scan_depth, 4);
+        assert_eq!(config.max_graph_edges, 100_000);
         assert!(config.strong_devirt);
     }
 
@@ -3351,6 +3381,13 @@ mod tests {
         );
         let parsed = parse_revdmp(&metadata);
         assert_eq!(parsed.image_base, 0x1400_0000);
+
+        let mut corrupted = metadata.clone();
+        corrupted[REVDMP_HEADER_SIZE] ^= 0x80;
+        assert_ne!(
+            corrupted[REVDMP_CHECKSUM_OFFSET..REVDMP_HEADER_SIZE],
+            revdmp_checksum(&corrupted)
+        );
 
         let objects = parsed.block(BLOCK_OBJECTS);
         assert_eq!(objects.len(), 2);

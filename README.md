@@ -74,6 +74,7 @@ revdump bridges that gap:
 
 ### Analysis Metadata
 - **Embedded `.revdmp` section** - Stores a binary schema manifest, vtable facts, object graph edges, containers, resolved global indirect calls, normalized runtime relationships, and synthetic structs
+- **Authenticated metadata header** - `.revdmp` v2 stores a SHA-256 digest over the whole metadata section and native importers verify it before parsing records
 - **No external metadata file required** - `.revdmp` is the authoritative in-PE representation for tooling
 - **Native IDA importer** - A C++23 `idax` plugin reads `.revdmp` from the loaded binary, previews available categories, and imports only the selected data
 - **RTTI recovery** - Resolves MSVC and Itanium-style type names where metadata is available
@@ -141,12 +142,12 @@ revdump list-modules
 revdump dump \
   --module target.exe \
   --output out.exe \
-  --max-depth 2 \
+  --max-depth 4 \
   --max-region-size 4096 \
   --skip-sections 0,1 \
-  --devirt \
+  --no-devirt \
   --no-strong-devirt \
-  --max-graph-edges 50000 \
+  --max-graph-edges 100000 \
   --min-edge-confidence medium
 ```
 
@@ -154,11 +155,11 @@ Useful toggles:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--devirt` | off | Rewrite resolved virtual calls to direct calls |
+| `--no-devirt` | off | Disable resolved virtual-call and function-pointer call rewriting |
 | `--no-strong-devirt` | off | Disable stronger object-field and stack-alias devirt analysis |
 | `--no-revdmp` | off | Disable embedded `.revdmp` metadata section |
 | `--no-rtti` | off | Disable RTTI parsing for type names |
-| `--max-graph-edges <n>` | `50000` | Limit retained heap graph edges after scoring |
+| `--max-graph-edges <n>` | `100000` | Limit retained heap graph edges after scoring |
 | `--min-edge-confidence <low|medium|high>` | `low` | Drop lower-confidence heap graph edges |
 | `--no-containers` | off | Disable conservative container detection |
 
@@ -171,7 +172,7 @@ Useful toggles:
 ```
 revdump> target                   # Prompt for target module
 revdump> output                   # Prompt for output path
-revdump> devirt                   # Toggle devirtualization
+revdump> devirt                   # Toggle devirtualization (enabled by default)
 revdump> strongdevirt             # Toggle stronger devirtualization analysis (enabled by default)
 revdump> dump                     # Execute dump
 
@@ -200,7 +201,7 @@ Auto-dump uses `DumpConfig::default()` plus devirtualization enabled by the libr
 |---------|---------|-------------|
 | `target <module>` | `module`, `t` | Set target module to dump |
 | `output <path>` | `out`, `o` | Set output file path |
-| `depth <n>` | `d` | Set recursive heap scan depth (default: 2) |
+| `depth <n>` | `d` | Set recursive heap scan depth (default: 4) |
 | `regionsize <kb>` | `region`, `r` | Set max heap bytes scanned per object in KB (default: 4) |
 | `skipcode` | `sc` | Toggle skip .text section |
 | `skipsections <n,n>` | `ss` | Set section indices to skip |
@@ -316,7 +317,7 @@ It also tracks simple stack aliases such as `mov [rsp+X], rcx` followed by `mov 
 
 ### Phase 6: Native Metadata Import
 
-The embedded `.revdmp` section is a binary block stream with fixed-size records and an interned UTF-8 string table. The native IDA plugin reads this section from the loaded database, shows the categories and record counts it found, then imports only the selected data while reporting progress in the IDA wait box and output console:
+The embedded `.revdmp` section is a binary block stream with fixed-size records, an interned UTF-8 string table, and a SHA-256 digest in the fixed header. The native IDA plugin verifies the digest across the entire section before parsing any block records, shows the categories and record counts it found, then imports only the selected data while reporting progress in the IDA wait box and output console:
 
 - Names synthetic heap instances, vtables, function-pointer slots, thunks, CFG targets, and exception functions
 - Converts vfptr, global pointer, heap-edge, and callback-slot qwords to offsets where possible
@@ -350,12 +351,12 @@ src/
 | `max_ptr_value` | `0x7FFF_FFFF_FFFF` | Maximum valid pointer value |
 | `max_vfptr_probe` | `256` | Max bytes to probe for multiple vtables |
 | `skip_sections` | `[]` | Section indices to skip during scanning |
-| `enable_devirt` | `false` | Enable vcall devirtualization |
+| `enable_devirt` | `true` | Enable vcall devirtualization |
 | `max_heap_scan_size` | `0x1000` | Max bytes to scan per heap allocation for embedded heap pointers |
-| `recursive_heap_scan_depth` | `2` | Max recursive heap-pointer scan depth |
+| `recursive_heap_scan_depth` | `4` | Max recursive heap-pointer scan depth |
 | `emit_revdmp` | `true` | Embed `.revdmp` metadata section |
 | `parse_rtti` | `true` | Parse RTTI/type names for metadata and importer annotations |
-| `max_graph_edges` | `50000` | Max retained heap graph edges after dedup/scoring |
+| `max_graph_edges` | `100000` | Max retained heap graph edges after dedup/scoring |
 | `min_edge_confidence` | `Low` | Minimum retained heap graph confidence |
 | `detect_containers` | `true` | Enable conservative container detection |
 | `strong_devirt` | `true` | Enable stronger bounded devirt tracking |

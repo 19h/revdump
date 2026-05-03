@@ -30,9 +30,162 @@ std::string fmt(const char* pattern, Args&&... args) {
 }
 
 constexpr std::array<std::uint8_t, 8> kMagic{'R', 'E', 'V', 'D', 'M', 'P', 'B', 0};
-constexpr std::uint32_t kVersion = 1;
+constexpr std::uint32_t kVersion = 2;
 constexpr std::uint32_t kEndianMarker = 0x01020304;
 constexpr std::uint32_t kNoneU32 = 0xFFFF'FFFFu;
+constexpr std::uint32_t kChecksumKindSha256 = 1;
+constexpr std::size_t kChecksumOffset = 40;
+constexpr std::size_t kChecksumSize = 32;
+constexpr std::size_t kHeaderSize = kChecksumOffset + kChecksumSize;
+
+struct Sha256 {
+    std::array<std::uint32_t, 8> state{
+        0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
+        0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u,
+    };
+    std::array<std::uint8_t, 64> buffer{};
+    std::uint64_t bit_len{};
+    std::size_t buffer_len{};
+
+    static std::uint32_t rotr(std::uint32_t value, std::uint32_t bits) noexcept {
+        return (value >> bits) | (value << (32 - bits));
+    }
+
+    static std::uint32_t load_be32(const std::uint8_t* data) noexcept {
+        return (static_cast<std::uint32_t>(data[0]) << 24) |
+               (static_cast<std::uint32_t>(data[1]) << 16) |
+               (static_cast<std::uint32_t>(data[2]) << 8) |
+               static_cast<std::uint32_t>(data[3]);
+    }
+
+    static void store_be32(std::uint8_t* out, std::uint32_t value) noexcept {
+        out[0] = static_cast<std::uint8_t>(value >> 24);
+        out[1] = static_cast<std::uint8_t>(value >> 16);
+        out[2] = static_cast<std::uint8_t>(value >> 8);
+        out[3] = static_cast<std::uint8_t>(value);
+    }
+
+    static void store_be64(std::uint8_t* out, std::uint64_t value) noexcept {
+        for (int i = 7; i >= 0; --i) {
+            out[7 - i] = static_cast<std::uint8_t>(value >> (i * 8));
+        }
+    }
+
+    void transform(const std::uint8_t* chunk) {
+        static constexpr std::array<std::uint32_t, 64> k{
+            0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u,
+            0x3956c25bu, 0x59f111f1u, 0x923f82a4u, 0xab1c5ed5u,
+            0xd807aa98u, 0x12835b01u, 0x243185beu, 0x550c7dc3u,
+            0x72be5d74u, 0x80deb1feu, 0x9bdc06a7u, 0xc19bf174u,
+            0xe49b69c1u, 0xefbe4786u, 0x0fc19dc6u, 0x240ca1ccu,
+            0x2de92c6fu, 0x4a7484aau, 0x5cb0a9dcu, 0x76f988dau,
+            0x983e5152u, 0xa831c66du, 0xb00327c8u, 0xbf597fc7u,
+            0xc6e00bf3u, 0xd5a79147u, 0x06ca6351u, 0x14292967u,
+            0x27b70a85u, 0x2e1b2138u, 0x4d2c6dfcu, 0x53380d13u,
+            0x650a7354u, 0x766a0abbu, 0x81c2c92eu, 0x92722c85u,
+            0xa2bfe8a1u, 0xa81a664bu, 0xc24b8b70u, 0xc76c51a3u,
+            0xd192e819u, 0xd6990624u, 0xf40e3585u, 0x106aa070u,
+            0x19a4c116u, 0x1e376c08u, 0x2748774cu, 0x34b0bcb5u,
+            0x391c0cb3u, 0x4ed8aa4au, 0x5b9cca4fu, 0x682e6ff3u,
+            0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u,
+            0x90befffau, 0xa4506cebu, 0xbef9a3f7u, 0xc67178f2u,
+        };
+
+        std::array<std::uint32_t, 64> w{};
+        for (std::size_t i = 0; i < 16; ++i) w[i] = load_be32(chunk + i * 4);
+        for (std::size_t i = 16; i < 64; ++i) {
+            const auto s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+            const auto s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+        }
+
+        auto a = state[0];
+        auto b = state[1];
+        auto c = state[2];
+        auto d = state[3];
+        auto e = state[4];
+        auto f = state[5];
+        auto g = state[6];
+        auto h = state[7];
+
+        for (std::size_t i = 0; i < 64; ++i) {
+            const auto s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+            const auto ch = (e & f) ^ ((~e) & g);
+            const auto temp1 = h + s1 + ch + k[i] + w[i];
+            const auto s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+            const auto maj = (a & b) ^ (a & c) ^ (b & c);
+            const auto temp2 = s0 + maj;
+            h = g;
+            g = f;
+            f = e;
+            e = d + temp1;
+            d = c;
+            c = b;
+            b = a;
+            a = temp1 + temp2;
+        }
+
+        state[0] += a;
+        state[1] += b;
+        state[2] += c;
+        state[3] += d;
+        state[4] += e;
+        state[5] += f;
+        state[6] += g;
+        state[7] += h;
+    }
+
+    void update(const std::uint8_t* data, std::size_t len) {
+        if (data == nullptr || len == 0) return;
+        bit_len += static_cast<std::uint64_t>(len) * 8;
+        while (len > 0) {
+            const auto take = std::min(len, buffer.size() - buffer_len);
+            std::memcpy(buffer.data() + buffer_len, data, take);
+            buffer_len += take;
+            data += take;
+            len -= take;
+            if (buffer_len == buffer.size()) {
+                transform(buffer.data());
+                buffer_len = 0;
+            }
+        }
+    }
+
+    [[nodiscard]] std::array<std::uint8_t, kChecksumSize> final() {
+        buffer[buffer_len++] = 0x80;
+        if (buffer_len > 56) {
+            while (buffer_len < 64) buffer[buffer_len++] = 0;
+            transform(buffer.data());
+            buffer_len = 0;
+        }
+        while (buffer_len < 56) buffer[buffer_len++] = 0;
+        store_be64(buffer.data() + 56, bit_len);
+        transform(buffer.data());
+
+        std::array<std::uint8_t, kChecksumSize> digest{};
+        for (std::size_t i = 0; i < state.size(); ++i) {
+            store_be32(digest.data() + i * 4, state[i]);
+        }
+        return digest;
+    }
+};
+
+std::array<std::uint8_t, kChecksumSize> metadata_checksum(const std::vector<std::uint8_t>& bytes) {
+    Sha256 sha;
+    sha.update(bytes.data(), kChecksumOffset);
+    std::array<std::uint8_t, kChecksumSize> zeros{};
+    sha.update(zeros.data(), zeros.size());
+    if (bytes.size() > kHeaderSize) {
+        sha.update(bytes.data() + kHeaderSize, bytes.size() - kHeaderSize);
+    }
+    return sha.final();
+}
+
+bool constant_time_equal(const std::uint8_t* a, const std::uint8_t* b, std::size_t len) {
+    std::uint8_t diff = 0;
+    for (std::size_t i = 0; i < len; ++i) diff |= static_cast<std::uint8_t>(a[i] ^ b[i]);
+    return diff == 0;
+}
 
 enum BlockId : std::uint32_t {
     BlockObjects = 1,
@@ -126,6 +279,12 @@ struct Metadata {
     }
 };
 
+struct MetadataLoadResult {
+    std::optional<Metadata> metadata;
+    bool found{};
+    std::string error;
+};
+
 bool read_u32_at(const std::vector<std::uint8_t>& bytes, std::size_t offset, std::uint32_t& out) {
     if (offset > bytes.size() || bytes.size() - offset < 4) return false;
     std::memcpy(&out, bytes.data() + offset, sizeof(out));
@@ -138,9 +297,15 @@ bool read_u64_at(const std::vector<std::uint8_t>& bytes, std::size_t offset, std
     return true;
 }
 
-std::optional<Metadata> parse_metadata(std::vector<std::uint8_t> bytes) {
-    if (bytes.size() < 32) return std::nullopt;
-    if (std::memcmp(bytes.data(), kMagic.data(), kMagic.size()) != 0) return std::nullopt;
+std::optional<Metadata> parse_metadata(std::vector<std::uint8_t> bytes, std::string& error) {
+    if (bytes.size() < kHeaderSize) {
+        error = "metadata section is smaller than the authenticated header";
+        return std::nullopt;
+    }
+    if (std::memcmp(bytes.data(), kMagic.data(), kMagic.size()) != 0) {
+        error = "metadata section has an invalid magic value";
+        return std::nullopt;
+    }
 
     Metadata md;
     md.bytes = std::move(bytes);
@@ -160,8 +325,32 @@ std::optional<Metadata> parse_metadata(std::vector<std::uint8_t> bytes) {
     offset += 4;
     if (!read_u64_at(md.bytes, offset, md.image_base)) return std::nullopt;
     offset += 8;
+    std::uint32_t checksum_kind{};
+    std::uint32_t reserved{};
+    if (!read_u32_at(md.bytes, offset, checksum_kind)) return std::nullopt;
+    offset += 4;
+    if (!read_u32_at(md.bytes, offset, reserved)) return std::nullopt;
+    offset += 4;
 
-    if (version != kVersion || endian != kEndianMarker) return std::nullopt;
+    if (version != kVersion) {
+        error = fmt("unsupported .revdmp metadata version %u; expected %u", version, kVersion);
+        return std::nullopt;
+    }
+    if (endian != kEndianMarker) {
+        error = "metadata endian marker mismatch";
+        return std::nullopt;
+    }
+    if (checksum_kind != kChecksumKindSha256 || reserved != 0) {
+        error = "metadata authentication header is unsupported";
+        return std::nullopt;
+    }
+    const auto computed = metadata_checksum(md.bytes);
+    if (!constant_time_equal(md.bytes.data() + kChecksumOffset, computed.data(), computed.size())) {
+        error = "metadata SHA-256 checksum mismatch; refusing to import unverified .revdmp data";
+        return std::nullopt;
+    }
+
+    offset = kHeaderSize;
 
     for (std::uint32_t i = 0; i < block_count; ++i) {
         std::uint32_t kind{};
@@ -177,9 +366,18 @@ std::optional<Metadata> parse_metadata(std::vector<std::uint8_t> bytes) {
         if (!read_u32_at(md.bytes, offset, data_len)) return std::nullopt;
         offset += 4;
 
-        if (record_size == 0 && count != 0) return std::nullopt;
-        if (static_cast<std::uint64_t>(record_size) * count != data_len) return std::nullopt;
-        if (offset > md.bytes.size() || md.bytes.size() - offset < data_len) return std::nullopt;
+        if (record_size == 0 && count != 0) {
+            error = "metadata block has zero-sized records with nonzero count";
+            return std::nullopt;
+        }
+        if (static_cast<std::uint64_t>(record_size) * count != data_len) {
+            error = "metadata block length does not match record size and count";
+            return std::nullopt;
+        }
+        if (offset > md.bytes.size() || md.bytes.size() - offset < data_len) {
+            error = "metadata block extends past section bounds";
+            return std::nullopt;
+        }
 
         md.blocks.emplace(kind, BlockView{
             .record_size = record_size,
@@ -190,21 +388,48 @@ std::optional<Metadata> parse_metadata(std::vector<std::uint8_t> bytes) {
         offset += data_len;
     }
 
-    if (offset > md.bytes.size() || md.bytes.size() - offset < string_len) return std::nullopt;
+    if (offset > md.bytes.size() || md.bytes.size() - offset < string_len) {
+        error = "metadata string table extends past section bounds";
+        return std::nullopt;
+    }
+    if (offset + string_len != md.bytes.size()) {
+        error = "metadata section contains trailing bytes outside the authenticated layout";
+        return std::nullopt;
+    }
     md.string_offset = offset;
     md.string_len = string_len;
     return md;
 }
 
-std::optional<Metadata> load_from_segment(const ida::segment::Segment& segment) {
+MetadataLoadResult load_from_segment(const ida::segment::Segment& segment) {
     auto bytes = ida::data::read_bytes(segment.start(), segment.size());
-    if (!bytes) return std::nullopt;
-    return parse_metadata(std::move(*bytes));
+    if (!bytes) {
+        return {
+            .metadata = std::nullopt,
+            .found = true,
+            .error = "failed to read .revdmp segment bytes",
+        };
+    }
+
+    std::string error;
+    auto metadata = parse_metadata(std::move(*bytes), error);
+    if (!metadata) {
+        return {
+            .metadata = std::nullopt,
+            .found = true,
+            .error = std::move(error),
+        };
+    }
+    return {
+        .metadata = std::move(metadata),
+        .found = true,
+        .error = {},
+    };
 }
 
-std::optional<Metadata> load_revdmp_metadata() {
+MetadataLoadResult load_revdmp_metadata() {
     if (auto segment = ida::segment::by_name(".revdmp")) {
-        if (auto md = load_from_segment(*segment)) return md;
+        return load_from_segment(*segment);
     }
 
     for (auto segment : ida::segment::all()) {
@@ -212,11 +437,11 @@ std::optional<Metadata> load_revdmp_metadata() {
         auto head = ida::data::read_bytes(segment.start(), kMagic.size());
         if (!head || head->size() != kMagic.size()) continue;
         if (std::memcmp(head->data(), kMagic.data(), kMagic.size()) == 0) {
-            if (auto md = load_from_segment(segment)) return md;
+            return load_from_segment(segment);
         }
     }
 
-    return std::nullopt;
+    return {};
 }
 
 std::string lower(std::string text) {
@@ -885,13 +1110,19 @@ struct RevDumpImporterPlugin : ida::plugin::Plugin {
     }
 
     ida::Status run(std::size_t) override {
-        auto metadata = load_revdmp_metadata();
-        if (!metadata) {
+        auto load = load_revdmp_metadata();
+        if (!load.metadata) {
+            if (load.found) {
+                ida::ui::warning("RevDump: embedded .revdmp metadata failed authentication: " + load.error);
+                return ida::ok();
+            }
             ida::ui::warning("RevDump: no embedded .revdmp metadata was found in this database.");
             return ida::ok();
         }
 
-        Importer importer(*metadata);
+        const auto& metadata = *load.metadata;
+
+        Importer importer(metadata);
         std::vector<Category> available;
         for (const auto& category : categories()) {
             if (importer.category_count(category) != 0) available.push_back(category);
@@ -902,7 +1133,7 @@ struct RevDumpImporterPlugin : ida::plugin::Plugin {
             return ida::ok();
         }
 
-        const auto summary = category_summary(*metadata, importer);
+        const auto summary = category_summary(metadata, importer);
         ida::ui::info(summary);
 
         auto answer = ida::ui::ask_string(

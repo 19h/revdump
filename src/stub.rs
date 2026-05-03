@@ -166,8 +166,8 @@ impl Default for StubConfig {
             // Probe up to 256 bytes for multiple vfptrs (typical MI depth)
             max_vfptr_probe: 256,
             max_heap_scan_size: 0x1000,
-            recursive_heap_scan_depth: 2,
-            max_graph_edges: 50_000,
+            recursive_heap_scan_depth: 4,
+            max_graph_edges: 100_000,
             min_edge_confidence: EdgeConfidence::Low,
             detect_containers: true,
         }

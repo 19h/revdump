@@ -35,7 +35,7 @@ enum Commands {
         output: PathBuf,
 
         /// Maximum recursive heap pointer scan depth
-        #[arg(long, default_value = "2")]
+        #[arg(long, default_value = "4")]
         max_depth: usize,
 
         /// Maximum bytes to scan per heap object for embedded pointers
@@ -51,8 +51,12 @@ enum Commands {
         skip_sections: Vec<usize>,
 
         /// Enable vcall devirtualization (rewrite indirect calls to direct calls)
-        #[arg(long)]
+        #[arg(long, action = ArgAction::SetTrue, hide = true)]
         devirt: bool,
+
+        /// Disable vcall devirtualization
+        #[arg(long, action = ArgAction::SetTrue)]
+        no_devirt: bool,
 
         /// Disable embedded .revdmp metadata section
         #[arg(long)]
@@ -63,7 +67,7 @@ enum Commands {
         no_rtti: bool,
 
         /// Maximum heap graph edges to emit after scoring
-        #[arg(long, default_value = "50000")]
+        #[arg(long, default_value = "100000")]
         max_graph_edges: usize,
 
         /// Minimum graph edge confidence: low, medium, high
@@ -119,6 +123,7 @@ fn main() -> anyhow::Result<()> {
             skip_code,
             skip_sections,
             devirt,
+            no_devirt,
             no_revdmp,
             no_rtti,
             max_graph_edges,
@@ -134,7 +139,7 @@ fn main() -> anyhow::Result<()> {
                 max_region_size,
                 skip_code,
                 skip_sections,
-                devirt,
+                devirt || !no_devirt,
                 no_revdmp,
                 no_rtti,
                 max_graph_edges,
