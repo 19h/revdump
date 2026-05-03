@@ -869,7 +869,7 @@ impl ConsoleState {
 
     fn cmd_debug_heap_analysis(&mut self) {
         use crate::pe::PeParser;
-        use crate::stub::{StubConfig, StubGenerator};
+        use crate::stub::{StubConfig, StubDebugProgress, StubGenerator};
 
         println!();
         println!("=== Debug Heap Analysis ===");
@@ -971,11 +971,24 @@ impl ConsoleState {
         println!("Scanning for heap pointers...");
         let scanner_config = stub_gen.scanner_config();
         let mut heap_ptr_locs = Vec::new();
+        let scan_started = std::time::Instant::now();
+        let scan_total: usize = pe
+            .sections
+            .iter()
+            .filter(|section| section.name != ".text")
+            .map(|section| section.virtual_size as usize)
+            .sum();
+        let mut scanned_bytes = 0usize;
 
         for section in &pe.sections {
             if section.name == ".text" {
                 continue; // Skip code
             }
+
+            println!(
+                "  Section {:<8} RVA 0x{:08X} size 0x{:X}",
+                section.name, section.virtual_address, section.virtual_size
+            );
 
             let sec_data = unsafe {
                 std::slice::from_raw_parts(
@@ -986,6 +999,16 @@ impl ConsoleState {
 
             // Simple scan for pointers
             for offset in (0..sec_data.len().saturating_sub(8)).step_by(8) {
+                if (offset & 0xFFFF) == 0 {
+                    print_debug_scan_progress(
+                        &section.name,
+                        scanned_bytes + offset,
+                        scan_total,
+                        heap_ptr_locs.len(),
+                        scan_started,
+                    );
+                }
+
                 let ptr = strip_pointer_tags(u64::from_le_bytes(
                     sec_data[offset..offset + 8].try_into().unwrap(),
                 ));
@@ -1001,20 +1024,49 @@ impl ConsoleState {
                     }
                 }
             }
+            scanned_bytes += sec_data.len();
+            print_debug_scan_progress(
+                &section.name,
+                scanned_bytes,
+                scan_total,
+                heap_ptr_locs.len(),
+                scan_started,
+            );
         }
 
-        println!("Found {} heap pointers\n", heap_ptr_locs.len());
+        print!("\r\x1B[K");
+        let _ = io::stdout().flush();
+
+        println!(
+            "Found {} heap pointers in {:.2}s\n",
+            heap_ptr_locs.len(),
+            scan_started.elapsed().as_secs_f64()
+        );
 
         if heap_ptr_locs.is_empty() {
             println!("[WARN] No heap pointers found!");
             return;
         }
 
-        // Process with verbose output
-        stub_gen.process_heap_pointers_verbose(&heap_ptr_locs);
+        // Process with verbose output and progress snapshots.
+        let stub_started = std::time::Instant::now();
+        stub_gen.process_heap_pointers_verbose_with_progress(&heap_ptr_locs, |progress| {
+            print_debug_stub_progress(progress, stub_started);
+        });
+        print!("\r\x1B[K");
+        let _ = io::stdout().flush();
 
         println!();
-        println!("Analysis complete.");
+        println!(
+            "Analysis complete in {:.2}s.",
+            scan_started.elapsed().as_secs_f64()
+        );
+        println!(
+            "Created {} stubs, retained {} heap graph edges, detected {} containers.",
+            stub_gen.stubs().count(),
+            stub_gen.heap_edges().len(),
+            stub_gen.containers().len()
+        );
         println!();
     }
 
@@ -1110,6 +1162,99 @@ fn print_progress(info: &ProgressInfo) {
         percent,
         stats
     );
+    let _ = io::stdout().flush();
+}
+
+#[cfg(target_os = "windows")]
+fn debug_bar(current: usize, total: usize, width: usize) -> (String, f64) {
+    let percent = if total > 0 {
+        (current as f64 / total as f64 * 100.0).min(100.0)
+    } else {
+        0.0
+    };
+    let filled = ((percent / 100.0) * width as f64) as usize;
+    let bar = (0..width)
+        .map(|i| {
+            if i < filled {
+                '#'
+            } else if i == filled && filled < width {
+                '>'
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    (bar, percent)
+}
+
+#[cfg(target_os = "windows")]
+fn print_debug_scan_progress(
+    section_name: &str,
+    current_bytes: usize,
+    total_bytes: usize,
+    heap_ptrs: usize,
+    started: std::time::Instant,
+) {
+    let (bar, percent) = debug_bar(current_bytes, total_bytes, 36);
+    let elapsed = started.elapsed().as_secs_f64().max(0.001);
+    let mb_done = current_bytes as f64 / (1024.0 * 1024.0);
+    let mb_total = total_bytes as f64 / (1024.0 * 1024.0);
+    let mb_per_sec = mb_done / elapsed;
+
+    print!(
+        "\r  DBG scan {:<8} [{}] {:5.1}% {:6.1}/{:6.1} MB {:6.1} MB/s heap_ptrs={}",
+        section_name, bar, percent, mb_done, mb_total, mb_per_sec, heap_ptrs
+    );
+    let _ = io::stdout().flush();
+}
+
+#[cfg(target_os = "windows")]
+fn print_debug_stub_progress(
+    progress: crate::stub::StubDebugProgress,
+    started: std::time::Instant,
+) {
+    if progress.total > 0 && progress.current < progress.total && (progress.current % 32) != 0 {
+        return;
+    }
+
+    let (bar, percent) = debug_bar(progress.current, progress.total, 36);
+    let elapsed = started.elapsed().as_secs_f64().max(0.001);
+    let per_sec = if progress.current > 0 {
+        progress.current as f64 / elapsed
+    } else {
+        0.0
+    };
+
+    if progress.total == 0 {
+        print!(
+            "\r  DBG {:<20} [recursive scan running] roots={} created={} dup={} invalid={} no_vfptr={} no_module_vtbl={}",
+            progress.phase,
+            progress.current,
+            progress.created,
+            progress.already_visited,
+            progress.invalid_heap_ptr,
+            progress.no_vfptr_found,
+            progress.vtable_not_in_module
+        );
+    } else {
+        print!(
+            "\r  DBG {:<20} [{}] {:5.1}% {}/{} {:6.1}/s created={} dup={} invalid={} no_vfptr={} no_module_vtbl={} rec={} rva=0x{:X} heap=0x{:X}",
+            progress.phase,
+            bar,
+            percent,
+            progress.current,
+            progress.total,
+            per_sec,
+            progress.created,
+            progress.already_visited,
+            progress.invalid_heap_ptr,
+            progress.no_vfptr_found,
+            progress.vtable_not_in_module,
+            progress.recursive_discovered,
+            progress.current_rva,
+            progress.current_heap_addr
+        );
+    }
     let _ = io::stdout().flush();
 }
 

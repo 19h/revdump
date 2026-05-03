@@ -42,6 +42,48 @@ struct StubCreationStats {
     created: usize,
 }
 
+/// Progress snapshot emitted by verbose heap-stub debugging.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StubDebugProgress {
+    pub current: usize,
+    pub total: usize,
+    pub current_rva: u32,
+    pub current_heap_addr: u64,
+    pub created: usize,
+    pub already_visited: usize,
+    pub invalid_heap_ptr: usize,
+    pub no_vfptr_found: usize,
+    pub vtable_not_in_module: usize,
+    pub recursive_discovered: usize,
+    pub phase: &'static str,
+}
+
+fn emit_stub_debug_progress(
+    progress: &mut Option<&mut dyn FnMut(StubDebugProgress)>,
+    stats: &StubCreationStats,
+    total: usize,
+    current_rva: u32,
+    current_heap_addr: u64,
+    recursive_discovered: usize,
+    phase: &'static str,
+) {
+    if let Some(progress) = progress.as_deref_mut() {
+        progress(StubDebugProgress {
+            current: stats.total,
+            total,
+            current_rva,
+            current_heap_addr,
+            created: stats.created,
+            already_visited: stats.already_visited,
+            invalid_heap_ptr: stats.invalid_heap_ptr,
+            no_vfptr_found: stats.no_vfptr_found,
+            vtable_not_in_module: stats.vtable_not_in_module,
+            recursive_discovered,
+            phase,
+        });
+    }
+}
+
 /// Information about a vtable pointer within a stub.
 #[derive(Clone, Debug)]
 pub struct VtableRef {
@@ -446,15 +488,31 @@ impl StubGenerator {
 
     /// Process all heap pointer locations and create stubs.
     pub fn process_heap_pointers(&mut self, heap_ptr_locs: &[(u32, u64)]) {
-        self.process_heap_pointers_inner(heap_ptr_locs, false)
+        self.process_heap_pointers_inner(heap_ptr_locs, false, None)
     }
 
     /// Process heap pointers with optional verbose debugging.
     pub fn process_heap_pointers_verbose(&mut self, heap_ptr_locs: &[(u32, u64)]) {
-        self.process_heap_pointers_inner(heap_ptr_locs, true)
+        self.process_heap_pointers_inner(heap_ptr_locs, true, None)
     }
 
-    fn process_heap_pointers_inner(&mut self, heap_ptr_locs: &[(u32, u64)], verbose: bool) {
+    /// Process heap pointers with verbose debugging and progress snapshots.
+    pub fn process_heap_pointers_verbose_with_progress<F>(
+        &mut self,
+        heap_ptr_locs: &[(u32, u64)],
+        mut progress: F,
+    ) where
+        F: FnMut(StubDebugProgress),
+    {
+        self.process_heap_pointers_inner(heap_ptr_locs, true, Some(&mut progress))
+    }
+
+    fn process_heap_pointers_inner(
+        &mut self,
+        heap_ptr_locs: &[(u32, u64)],
+        verbose: bool,
+        mut progress: Option<&mut dyn FnMut(StubDebugProgress)>,
+    ) {
         let mut stats = StubCreationStats::default();
 
         if verbose {
@@ -480,6 +538,15 @@ impl StubGenerator {
                 if verbose {
                     eprintln!("      SKIP: already visited");
                 }
+                emit_stub_debug_progress(
+                    &mut progress,
+                    &stats,
+                    heap_ptr_locs.len(),
+                    rva,
+                    target_addr,
+                    0,
+                    "heap roots",
+                );
                 continue;
             }
 
@@ -489,6 +556,15 @@ impl StubGenerator {
                     eprintln!("      SKIP: not a valid heap pointer");
                     eprintln!("        reason: {}", self.debug_check_pointer(target_addr));
                 }
+                emit_stub_debug_progress(
+                    &mut progress,
+                    &stats,
+                    heap_ptr_locs.len(),
+                    rva,
+                    target_addr,
+                    0,
+                    "heap roots",
+                );
                 continue;
             }
 
@@ -505,6 +581,15 @@ impl StubGenerator {
                 if verbose {
                     eprintln!("      SKIP: no vfptr found at any offset");
                 }
+                emit_stub_debug_progress(
+                    &mut progress,
+                    &stats,
+                    heap_ptr_locs.len(),
+                    rva,
+                    target_addr,
+                    0,
+                    "heap roots",
+                );
                 continue;
             }
 
@@ -523,6 +608,15 @@ impl StubGenerator {
                     eprintln!("      SKIP: vtable not in module");
                 }
             }
+            emit_stub_debug_progress(
+                &mut progress,
+                &stats,
+                heap_ptr_locs.len(),
+                rva,
+                target_addr,
+                0,
+                "heap roots",
+            );
         }
 
         // Log summary
@@ -532,7 +626,34 @@ impl StubGenerator {
         );
 
         if self.config.recursive_heap_scan_depth > 0 {
+            if let Some(progress) = progress.as_mut() {
+                (*progress)(StubDebugProgress {
+                    current: 0,
+                    total: 0,
+                    created: stats.created,
+                    already_visited: stats.already_visited,
+                    invalid_heap_ptr: stats.invalid_heap_ptr,
+                    no_vfptr_found: stats.no_vfptr_found,
+                    vtable_not_in_module: stats.vtable_not_in_module,
+                    phase: "recursive heap graph",
+                    ..Default::default()
+                });
+            }
             let discovered = self.discover_recursive_stubs(heap_ptr_locs);
+            if let Some(progress) = progress.as_mut() {
+                (*progress)(StubDebugProgress {
+                    current: 1,
+                    total: 1,
+                    created: stats.created,
+                    already_visited: stats.already_visited,
+                    invalid_heap_ptr: stats.invalid_heap_ptr,
+                    no_vfptr_found: stats.no_vfptr_found,
+                    vtable_not_in_module: stats.vtable_not_in_module,
+                    recursive_discovered: discovered,
+                    phase: "recursive heap graph",
+                    ..Default::default()
+                });
+            }
             if discovered > 0 {
                 eprintln!(
                     "Stubs: {} recursively discovered from heap data",
