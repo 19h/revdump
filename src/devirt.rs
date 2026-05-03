@@ -139,6 +139,32 @@ pub struct DevirtStats {
     pub strong_stack_aliases: usize,
 }
 
+/// Progress snapshot emitted during devirtualization.
+#[derive(Clone, Debug, Default)]
+pub struct DevirtProgress {
+    pub current: usize,
+    pub total: usize,
+    pub phase: &'static str,
+    pub stats: DevirtStats,
+}
+
+fn emit_devirt_progress(
+    progress: &mut Option<&mut dyn FnMut(DevirtProgress)>,
+    current: usize,
+    total: usize,
+    phase: &'static str,
+    stats: &DevirtStats,
+) {
+    if let Some(progress) = progress.as_mut() {
+        (*progress)(DevirtProgress {
+            current,
+            total,
+            phase,
+            stats: stats.clone(),
+        });
+    }
+}
+
 /// A thunk placed in code padding for vcall redirection.
 #[derive(Clone, Debug)]
 pub struct Thunk {
@@ -754,10 +780,33 @@ impl<'a> VcallScanner<'a> {
 
     /// Scan a code section for vcall patterns.
     pub fn scan_section(&self, code: &[u8], section_rva: u32) -> (Vec<VcallSite>, DevirtStats) {
+        self.scan_section_inner(code, section_rva, None)
+    }
+
+    /// Scan a code section for vcall patterns with progress snapshots.
+    pub fn scan_section_with_progress<F>(
+        &self,
+        code: &[u8],
+        section_rva: u32,
+        mut progress: F,
+    ) -> (Vec<VcallSite>, DevirtStats)
+    where
+        F: FnMut(DevirtProgress),
+    {
+        self.scan_section_inner(code, section_rva, Some(&mut progress))
+    }
+
+    fn scan_section_inner(
+        &self,
+        code: &[u8],
+        section_rva: u32,
+        mut progress: Option<&mut dyn FnMut(DevirtProgress)>,
+    ) -> (Vec<VcallSite>, DevirtStats) {
         let mut sites = Vec::new();
         let mut stats = DevirtStats::default();
         let mut reg_state = RegisterState::new();
         let mut block_instr_count = 0usize;
+        let mut next_progress_byte = 0x10_0000usize;
 
         let start_ip = self.image_base + section_rva as u64;
         let mut decoder = Decoder::with_ip(64, code, start_ip, DecoderOptions::NONE);
@@ -766,6 +815,18 @@ impl<'a> VcallScanner<'a> {
             let instr = decoder.decode();
             let instr_rva = (instr.ip() - self.image_base) as u32;
             stats.instructions_scanned += 1;
+
+            let decoded_bytes = decoder.position();
+            if decoded_bytes >= next_progress_byte || decoded_bytes == code.len() {
+                emit_devirt_progress(
+                    &mut progress,
+                    decoded_bytes,
+                    code.len(),
+                    "scanning vcalls",
+                    &stats,
+                );
+                next_progress_byte = decoded_bytes.saturating_add(0x10_0000);
+            }
 
             // Reset at control flow boundaries or after too many instructions
             block_instr_count += 1;
@@ -976,6 +1037,13 @@ impl<'a> VcallScanner<'a> {
             self.update_reg_state(&instr, &mut reg_state);
         }
 
+        emit_devirt_progress(
+            &mut progress,
+            code.len(),
+            code.len(),
+            "scanning vcalls",
+            &stats,
+        );
         (sites, stats)
     }
 
@@ -2427,10 +2495,8 @@ pub(crate) fn analyze_global_indirect_calls(
         .collect()
 }
 
-/// Perform devirtualization on a dumped PE.
-///
-/// This is the main entry point called from the dumper.
-pub(crate) fn devirtualize(
+/// Perform devirtualization on a dumped PE with progress snapshots.
+pub(crate) fn devirtualize_with_progress<F>(
     output: &mut [u8],
     mod_base: *const u8,
     image_base: u64,
@@ -2441,6 +2507,38 @@ pub(crate) fn devirtualize(
     section_mappings: &[SectionMapping],
     headers_size: usize,
     config: &DevirtConfig,
+    mut progress: F,
+) -> Result<DevirtStats>
+where
+    F: FnMut(DevirtProgress),
+{
+    devirtualize_inner(
+        output,
+        mod_base,
+        image_base,
+        text_section_rva,
+        text_section_size,
+        vtable_facts,
+        heap_edges,
+        section_mappings,
+        headers_size,
+        config,
+        Some(&mut progress),
+    )
+}
+
+fn devirtualize_inner(
+    output: &mut [u8],
+    mod_base: *const u8,
+    image_base: u64,
+    text_section_rva: u32,
+    text_section_size: u32,
+    vtable_facts: &[VtableFact],
+    heap_edges: &[HeapPointerEdge],
+    section_mappings: &[SectionMapping],
+    headers_size: usize,
+    config: &DevirtConfig,
+    mut progress: Option<&mut dyn FnMut(DevirtProgress)>,
 ) -> Result<DevirtStats> {
     // Build global-to-vtable mapping
     let global_map = GlobalVtableMap::build(vtable_facts, heap_edges, image_base);
@@ -2452,33 +2550,84 @@ pub(crate) fn devirtualize(
     // Scan for vcall patterns
     let scanner = VcallScanner::new(mod_base, image_base, &global_map, config)
         .with_code_target_ranges(vec![(text_section_rva, text_section_size)]);
-    let (sites, mut stats) = scanner.scan_section(text_data, text_section_rva);
+    let (sites, mut stats) = if let Some(progress) = progress.as_mut() {
+        scanner.scan_section_with_progress(text_data, text_section_rva, |snapshot| {
+            (*progress)(snapshot);
+        })
+    } else {
+        scanner.scan_section(text_data, text_section_rva)
+    };
 
     if config.dry_run {
         return Ok(stats);
     }
 
+    emit_devirt_progress(&mut progress, 0, sites.len(), "generating patches", &stats);
+
     // Generate inline patches
     let patch_gen = PatchGenerator::new(image_base);
     let (mut patches, needs_thunk) = patch_gen.generate_patches(&sites);
+    emit_devirt_progress(
+        &mut progress,
+        sites.len(),
+        sites.len(),
+        "generating patches",
+        &stats,
+    );
 
     // Scan for padding regions in .text to place thunks
     // Minimum 7 bytes for a thunk (call rel32 + jmp rel8)
+    emit_devirt_progress(
+        &mut progress,
+        0,
+        text_data.len(),
+        "scanning thunk padding",
+        &stats,
+    );
     let mut thunk_allocator = ThunkAllocator::scan_for_padding(text_data, text_section_rva, 7);
+    emit_devirt_progress(
+        &mut progress,
+        text_data.len(),
+        text_data.len(),
+        "scanning thunk padding",
+        &stats,
+    );
 
     // Generate thunk-based patches for vcalls that couldn't be inlined
     if !needs_thunk.is_empty() {
+        emit_devirt_progress(
+            &mut progress,
+            0,
+            needs_thunk.len(),
+            "creating thunks",
+            &stats,
+        );
         let (thunk_patches, thunks_created) =
             generate_thunk_patches(&needs_thunk, &mut thunk_allocator, image_base);
         patches.extend(thunk_patches);
         stats.thunks_created = thunks_created;
+        emit_devirt_progress(
+            &mut progress,
+            needs_thunk.len(),
+            needs_thunk.len(),
+            "creating thunks",
+            &stats,
+        );
     }
 
     // Apply all patches
+    emit_devirt_progress(&mut progress, 0, patches.len(), "applying patches", &stats);
     let (applied, skipped) = apply_code_patches(output, &patches, section_mappings, headers_size);
 
     stats.patches_applied = applied;
     stats.patches_skipped = skipped;
+    emit_devirt_progress(
+        &mut progress,
+        patches.len(),
+        patches.len(),
+        "applying patches",
+        &stats,
+    );
 
     Ok(stats)
 }

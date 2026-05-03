@@ -264,7 +264,21 @@ fn dump_with_heap(
                     format!("{} - {}", info.stage.name(), item)
                 }
                 ProgressStage::Devirtualizing => {
-                    format!("{}", info.stage.name())
+                    if let Some(devirt) = info.devirt_progress.as_ref() {
+                        format!(
+                            "{} - {} {}/{} (sites {}, global {}, resolved {}, patched {})",
+                            info.stage.name(),
+                            devirt.phase,
+                            devirt.current,
+                            devirt.total,
+                            devirt.stats.vcalls_detected,
+                            devirt.stats.global_indirect_calls_detected,
+                            devirt.stats.vcalls_resolved,
+                            devirt.stats.patches_applied,
+                        )
+                    } else {
+                        info.stage.name().to_string()
+                    }
                 }
                 _ => info.stage.name().to_string(),
             };

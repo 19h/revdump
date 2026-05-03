@@ -1172,7 +1172,25 @@ fn print_progress(info: &ProgressInfo) {
             let item = info.current_item.as_deref().unwrap_or("");
             format!("{}/{} {}", info.current, info.total, item)
         }
-        ProgressStage::Devirtualizing => "scanning vcalls...".to_string(),
+        ProgressStage::Devirtualizing => {
+            if let Some(devirt) = info.devirt_progress.as_ref() {
+                format!(
+                    "{} {}/{} | instr={} sites={} global={} resolved={} patched={} skipped={} thunks={}",
+                    devirt.phase,
+                    devirt.current,
+                    devirt.total,
+                    devirt.stats.instructions_scanned,
+                    devirt.stats.vcalls_detected,
+                    devirt.stats.global_indirect_calls_detected,
+                    devirt.stats.vcalls_resolved,
+                    devirt.stats.patches_applied,
+                    devirt.stats.patches_skipped,
+                    devirt.stats.thunks_created,
+                )
+            } else {
+                String::new()
+            }
+        }
         _ => {
             if info.total > 0 {
                 format!("{}/{}", info.current, info.total)

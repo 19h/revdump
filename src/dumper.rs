@@ -7,7 +7,7 @@
 //! 4. Generate fixups
 //! 5. Build and write the output PE
 
-use crate::devirt::{self, DevirtConfig, DevirtStats, IndirectCallFact, VcallKind};
+use crate::devirt::{self, DevirtConfig, DevirtProgress, DevirtStats, IndirectCallFact, VcallKind};
 use crate::error::{Error, Result};
 use crate::fixup::{apply_fixups, generate_fixups, SectionMapping};
 use crate::memory::{is_memory_readable, strip_pointer_tags};
@@ -247,6 +247,8 @@ pub struct ProgressInfo {
     pub total_bytes: usize,
     /// Detailed heap-stub progress for heap processing stages.
     pub stub_debug: Option<StubDebugProgress>,
+    /// Detailed devirtualization progress for vcall scanning and patching.
+    pub devirt_progress: Option<DevirtProgress>,
 }
 
 impl Default for ProgressInfo {
@@ -261,6 +263,7 @@ impl Default for ProgressInfo {
             bytes_processed: 0,
             total_bytes: 0,
             stub_debug: None,
+            devirt_progress: None,
         }
     }
 }
@@ -2463,6 +2466,8 @@ impl Dumper {
                 stub_generator.heap_edges(),
                 &section_mappings,
                 config,
+                &mut progress,
+                &report,
             )?;
 
             eprintln!(
@@ -2477,6 +2482,8 @@ impl Dumper {
         // Write to file
         progress.stage = ProgressStage::WritingFile;
         progress.total = output.len();
+        progress.current_item = None;
+        progress.devirt_progress = None;
         report(&progress);
 
         self.write_output(output_path.as_ref(), &output)?;
@@ -2893,6 +2900,8 @@ impl Dumper {
         heap_edges: &[HeapPointerEdge],
         section_mappings: &[SectionMapping],
         config: &DumpConfig,
+        progress: &mut ProgressInfo,
+        report: &impl Fn(&ProgressInfo),
     ) -> Result<DevirtStats> {
         // Find .text section (or first code section)
         let text_section = pe
@@ -2913,7 +2922,7 @@ impl Dumper {
         let aligned_headers = PeParser::align_up(headers_size, pe.file_alignment as usize);
 
         // Call devirtualization
-        devirt::devirtualize(
+        devirt::devirtualize_with_progress(
             output,
             self.base,
             pe.image_base,
@@ -2924,6 +2933,16 @@ impl Dumper {
             section_mappings,
             aligned_headers,
             &config.effective_devirt_config(),
+            |devirt_progress| {
+                progress.stage = ProgressStage::Devirtualizing;
+                progress.current_item = Some(devirt_progress.phase.to_string());
+                progress.current = devirt_progress.current;
+                progress.total = devirt_progress.total;
+                progress.bytes_processed = devirt_progress.current;
+                progress.total_bytes = devirt_progress.total;
+                progress.devirt_progress = Some(devirt_progress);
+                report(progress);
+            },
         )
     }
 
