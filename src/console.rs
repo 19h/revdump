@@ -31,9 +31,11 @@ use windows::Win32::System::ProcessStatus::{
 use windows::Win32::System::Threading::GetCurrentProcess;
 
 #[cfg(target_os = "windows")]
-use crate::dumper::{DumpConfig, Dumper, ProgressInfo, ProgressStage};
+use crate::dumper::{DumpConfig, Dumper, ProgressInfo};
 #[cfg(target_os = "windows")]
 use crate::memory::strip_pointer_tags;
+#[cfg(target_os = "windows")]
+use crate::progress::{progress_display, progress_percent};
 #[cfg(target_os = "windows")]
 use crate::stub::EdgeConfidence;
 
@@ -1099,14 +1101,12 @@ fn chrono_lite_timestamp() -> String {
 /// Print progress bar.
 #[cfg(target_os = "windows")]
 fn print_progress(info: &ProgressInfo) {
-    let percent = if info.total > 0 {
-        (info.current as f64 / info.total as f64) * 100.0
-    } else {
-        0.0
-    };
+    let percent = progress_percent(info).clamp(0.0, 100.0);
+    let display = progress_display(info);
+    let metrics = display.metrics_text();
 
     // Build progress bar
-    const BAR_WIDTH: usize = 40;
+    const BAR_WIDTH: usize = 28;
     let filled = ((percent / 100.0) * BAR_WIDTH as f64) as usize;
 
     let bar: String = (0..BAR_WIDTH)
@@ -1121,116 +1121,18 @@ fn print_progress(info: &ProgressInfo) {
         })
         .collect();
 
-    // Format stats based on stage
-    let stats = match info.stage {
-        ProgressStage::ScanningSection => {
-            let mb_scanned = info.bytes_processed as f64 / (1024.0 * 1024.0);
-            let mb_total = info.total_bytes as f64 / (1024.0 * 1024.0);
-            format!(
-                "{:.1}/{:.1} MB | {} ptrs",
-                mb_scanned, mb_total, info.pointers_found
-            )
-        }
-        ProgressStage::CreatingStubs => {
-            if let Some(stub) = info.stub_debug {
-                if stub.total == 0 {
-                    format!(
-                        "{} | stubs={} dup={} invalid={} no_vfptr={} no_module_vtbl={} rec={}",
-                        stub.phase,
-                        stub.created,
-                        stub.already_visited,
-                        stub.invalid_heap_ptr,
-                        stub.no_vfptr_found,
-                        stub.vtable_not_in_module,
-                        stub.recursive_discovered
-                    )
-                } else {
-                    format!(
-                        "{}/{} | stubs={} dup={} invalid={} no_vfptr={} no_module_vtbl={} rva=0x{:X} heap=0x{:X}",
-                        stub.current,
-                        stub.total,
-                        stub.created,
-                        stub.already_visited,
-                        stub.invalid_heap_ptr,
-                        stub.no_vfptr_found,
-                        stub.vtable_not_in_module,
-                        stub.current_rva,
-                        stub.current_heap_addr
-                    )
-                }
-            } else {
-                format!(
-                    "{}/{} | {} stubs",
-                    info.current, info.total, info.stubs_created
-                )
-            }
-        }
-        ProgressStage::ApplyingFixups => {
-            format!(
-                "{}/{} fixups | applied={} skipped={} protected_eh={}",
-                info.current,
-                info.total,
-                info.fixups_applied,
-                info.fixups_skipped,
-                info.protected_fixups_skipped,
-            )
-        }
-        ProgressStage::ProtectingExceptionData => {
-            if let Some(eh) = info.eh_progress.as_ref() {
-                let protected_mb = eh.protected_bytes as f64 / (1024.0 * 1024.0);
-                format!(
-                    "{} {}/{} | ranges={} protected={:.1} MB unwind={}",
-                    eh.phase,
-                    eh.current,
-                    eh.total,
-                    eh.protected_ranges,
-                    protected_mb,
-                    eh.unwind_infos,
-                )
-            } else {
-                info.current_item.as_deref().unwrap_or("").to_string()
-            }
-        }
-        ProgressStage::AnalyzingMetadata | ProgressStage::BuildingMetadata => {
-            let item = info.current_item.as_deref().unwrap_or("");
-            format!("{}/{} {}", info.current, info.total, item)
-        }
-        ProgressStage::Devirtualizing => {
-            if let Some(devirt) = info.devirt_progress.as_ref() {
-                format!(
-                    "{} {}/{} | instr={} sites={} global={} resolved={} patched={} skipped={} thunks={}",
-                    devirt.phase,
-                    devirt.current,
-                    devirt.total,
-                    devirt.stats.instructions_scanned,
-                    devirt.stats.vcalls_detected,
-                    devirt.stats.global_indirect_calls_detected,
-                    devirt.stats.vcalls_resolved,
-                    devirt.stats.patches_applied,
-                    devirt.stats.patches_skipped,
-                    devirt.stats.thunks_created,
-                )
-            } else {
-                String::new()
-            }
-        }
-        _ => {
-            if info.total > 0 {
-                format!("{}/{}", info.current, info.total)
-            } else {
-                String::new()
-            }
-        }
-    };
-
     // Print progress line
-    print!(
-        "\r  {:<20} [{}] {:5.1}% {}",
-        info.stage.name(),
-        bar,
-        percent,
-        stats
-    );
+    if metrics.is_empty() {
+        print!(
+            "\r  [{}] {:5.1}% | {:<26} | {:<24} | {}",
+            bar, percent, display.stage, display.step, display.progress
+        );
+    } else {
+        print!(
+            "\r  [{}] {:5.1}% | {:<26} | {:<24} | {:<18} | {}",
+            bar, percent, display.stage, display.step, display.progress, metrics
+        );
+    }
     let _ = io::stdout().flush();
 }
 

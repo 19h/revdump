@@ -8,7 +8,10 @@ use clap::{ArgAction, Parser, Subcommand};
 use std::path::PathBuf;
 
 #[cfg(target_os = "windows")]
-use revdump::{DumpConfig, Dumper, ProgressInfo, ProgressStage};
+use revdump::{DumpConfig, Dumper, ProgressInfo};
+
+#[cfg(target_os = "windows")]
+use revdump::progress::{progress_display, progress_percent};
 
 #[cfg(target_os = "windows")]
 use indicatif::{ProgressBar, ProgressStyle};
@@ -177,8 +180,6 @@ fn dump_with_heap(
     no_containers: bool,
     strong_devirt: bool,
 ) -> anyhow::Result<()> {
-    use bytesize::ByteSize;
-
     println!("Dumping module: {}", module);
     println!("Output: {}", output.display());
 
@@ -193,7 +194,9 @@ fn dump_with_heap(
     let pb = ProgressBar::new(100);
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}% {msg}")?
+            .template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:28.cyan/blue}] {pos:>3}% {wide_msg}",
+            )?
             .progress_chars("#>-"),
     );
 
@@ -210,107 +213,9 @@ fn dump_with_heap(
         detect_containers: !no_containers,
         strong_devirt,
         progress_callback: Some(Box::new(move |info: &ProgressInfo| {
-            let pct = if info.total > 0 {
-                (info.current as f64 / info.total as f64 * 100.0) as u64
-            } else {
-                0
-            };
-
-            let msg = match info.stage {
-                ProgressStage::ScanningSection => {
-                    let item = info.current_item.as_deref().unwrap_or("");
-                    let bytes = ByteSize::b(info.bytes_processed as u64);
-                    format!(
-                        "{} - {} ({}, {} ptrs)",
-                        info.stage.name(),
-                        item,
-                        bytes,
-                        info.pointers_found
-                    )
-                }
-                ProgressStage::CreatingStubs => {
-                    if let Some(stub) = info.stub_debug {
-                        if stub.total == 0 {
-                            format!(
-                                "{} - {} (stubs {}, dup {}, invalid {}, no vfptr {}, outside module {}, rec {})",
-                                info.stage.name(),
-                                stub.phase,
-                                stub.created,
-                                stub.already_visited,
-                                stub.invalid_heap_ptr,
-                                stub.no_vfptr_found,
-                                stub.vtable_not_in_module,
-                                stub.recursive_discovered,
-                            )
-                        } else {
-                            format!(
-                                "{} - {}/{} (stubs {}, dup {}, invalid {}, no vfptr {}, outside module {})",
-                                info.stage.name(),
-                                stub.current,
-                                stub.total,
-                                stub.created,
-                                stub.already_visited,
-                                stub.invalid_heap_ptr,
-                                stub.no_vfptr_found,
-                                stub.vtable_not_in_module,
-                            )
-                        }
-                    } else {
-                        format!("{} - {} stubs", info.stage.name(), info.stubs_created)
-                    }
-                }
-                ProgressStage::AnalyzingMetadata | ProgressStage::BuildingMetadata => {
-                    let item = info.current_item.as_deref().unwrap_or("");
-                    format!("{} - {}", info.stage.name(), item)
-                }
-                ProgressStage::ProtectingExceptionData => {
-                    if let Some(eh) = info.eh_progress.as_ref() {
-                        format!(
-                            "{} - {} {}/{} (ranges {}, bytes {}, unwind {})",
-                            info.stage.name(),
-                            eh.phase,
-                            eh.current,
-                            eh.total,
-                            eh.protected_ranges,
-                            ByteSize::b(eh.protected_bytes as u64),
-                            eh.unwind_infos,
-                        )
-                    } else {
-                        let item = info.current_item.as_deref().unwrap_or("");
-                        format!("{} - {}", info.stage.name(), item)
-                    }
-                }
-                ProgressStage::ApplyingFixups => format!(
-                    "{} - {}/{} (applied {}, skipped {}, protected {})",
-                    info.stage.name(),
-                    info.current,
-                    info.total,
-                    info.fixups_applied,
-                    info.fixups_skipped,
-                    info.protected_fixups_skipped,
-                ),
-                ProgressStage::Devirtualizing => {
-                    if let Some(devirt) = info.devirt_progress.as_ref() {
-                        format!(
-                            "{} - {} {}/{} (sites {}, global {}, resolved {}, patched {})",
-                            info.stage.name(),
-                            devirt.phase,
-                            devirt.current,
-                            devirt.total,
-                            devirt.stats.vcalls_detected,
-                            devirt.stats.global_indirect_calls_detected,
-                            devirt.stats.vcalls_resolved,
-                            devirt.stats.patches_applied,
-                        )
-                    } else {
-                        info.stage.name().to_string()
-                    }
-                }
-                _ => info.stage.name().to_string(),
-            };
-
+            let pct = progress_percent(info).round().clamp(0.0, 100.0) as u64;
             pb_clone.set_position(pct);
-            pb_clone.set_message(msg);
+            pb_clone.set_message(progress_display(info).compact());
         })),
         ..Default::default()
     };

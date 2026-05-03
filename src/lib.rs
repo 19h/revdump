@@ -37,6 +37,7 @@ pub mod error;
 pub mod fixup;
 pub mod memory;
 pub mod pe;
+pub mod progress;
 pub mod scanner;
 pub mod stub;
 
