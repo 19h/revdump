@@ -13,8 +13,7 @@ use crate::fixup::{apply_fixups, generate_fixups, SectionMapping};
 use crate::memory::{is_memory_readable, strip_pointer_tags};
 use crate::pe::{
     FileHeader, OptionalHeader32, OptionalHeader64, PeParser, SectionHeader, SectionInfo,
-    HEAP_SECTION_CHARACTERISTICS, IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_WRITE,
-    PE_SIGNATURE,
+    HEAP_SECTION_CHARACTERISTICS, IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE, PE_SIGNATURE,
 };
 use crate::scanner::{PointerScanner, ScanResult};
 use crate::stub::{
@@ -26,6 +25,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::io::Write;
+use std::ops::Range;
 use std::path::Path;
 
 #[derive(Clone, Debug)]
@@ -284,8 +284,133 @@ fn object_id_map(stub_generator: &StubGenerator) -> BTreeMap<u64, String> {
 }
 
 fn should_scan_for_heap_pointers(section: &SectionInfo) -> bool {
-    (section.characteristics & IMAGE_SCN_MEM_WRITE) != 0
-        && (section.characteristics & IMAGE_SCN_MEM_EXECUTE) == 0
+    (section.characteristics & IMAGE_SCN_MEM_EXECUTE) == 0
+}
+
+fn range_overlaps(range: &Range<u32>, other: &Range<u32>) -> bool {
+    range.start < other.end && range.end > other.start
+}
+
+fn merge_rva_ranges(mut ranges: Vec<Range<u32>>) -> Vec<Range<u32>> {
+    ranges.sort_by_key(|range| range.start);
+    let mut merged: Vec<Range<u32>> = Vec::new();
+    for range in ranges {
+        if range.start >= range.end {
+            continue;
+        }
+        if let Some(last) = merged.last_mut().filter(|last| range.start <= last.end) {
+            last.end = last.end.max(range.end);
+        } else {
+            merged.push(range);
+        }
+    }
+    merged
+}
+
+fn section_rva_end(section: &SectionInfo) -> u32 {
+    section
+        .virtual_address
+        .saturating_add(section.virtual_size.max(section.size_of_raw_data))
+}
+
+fn rva_section(sections: &[SectionInfo], rva: u32) -> Option<&SectionInfo> {
+    sections
+        .iter()
+        .find(|section| rva >= section.virtual_address && rva < section_rva_end(section))
+}
+
+fn unwind_info_size(pe: &PeParser, unwind_rva: u32) -> Option<u32> {
+    let header = read_bytes_at_rva(pe, unwind_rva, 4)?;
+    let flags = header[0] >> 3;
+    let code_count = header[2] as u32;
+    let aligned_code_count = (code_count + 1) & !1;
+    let mut size = 4u32.checked_add(aligned_code_count.checked_mul(2)?)?;
+    if (flags & 0x3) != 0 {
+        size = size.checked_add(4)?;
+    } else if (flags & 0x4) != 0 {
+        size = size.checked_add(12)?;
+    }
+    Some(size)
+}
+
+fn protected_exception_ranges(pe: &PeParser) -> Vec<Range<u32>> {
+    let Some((exception_rva, exception_size)) =
+        pe_data_directory(pe, IMAGE_DIRECTORY_ENTRY_EXCEPTION)
+    else {
+        return Vec::new();
+    };
+    if exception_size < 12 {
+        return std::iter::once(exception_rva..exception_rva.saturating_add(exception_size))
+            .collect();
+    }
+
+    let mut ranges: Vec<Range<u32>> =
+        std::iter::once(exception_rva..exception_rva.saturating_add(exception_size)).collect();
+    let entry_count = exception_size / 12;
+    let mut unwind_rvas = Vec::new();
+    for idx in 0..entry_count {
+        let entry_rva = exception_rva.saturating_add(idx.saturating_mul(12));
+        if let Some(unwind_rva) = read_u32_at_rva(pe, entry_rva + 8) {
+            if rva_in_image(pe, unwind_rva, 4) {
+                unwind_rvas.push(unwind_rva);
+            }
+        }
+    }
+    unwind_rvas.sort_unstable();
+    unwind_rvas.dedup();
+
+    for (idx, &unwind_rva) in unwind_rvas.iter().enumerate() {
+        let Some(section) = rva_section(&pe.sections, unwind_rva) else {
+            continue;
+        };
+        let min_end = unwind_info_size(pe, unwind_rva)
+            .and_then(|size| unwind_rva.checked_add(size))
+            .unwrap_or_else(|| unwind_rva.saturating_add(4));
+        let next_end = unwind_rvas
+            .get(idx + 1)
+            .copied()
+            .filter(|next| {
+                rva_section(&pe.sections, *next).is_some_and(|next_section| {
+                    next_section.virtual_address == section.virtual_address
+                })
+            })
+            .filter(|next| next.saturating_sub(unwind_rva) <= 0x400);
+        let end = next_end
+            .unwrap_or(min_end)
+            .max(min_end)
+            .min(section_rva_end(section));
+        ranges.push(unwind_rva..end);
+    }
+
+    merge_rva_ranges(ranges)
+}
+
+fn unprotected_section_ranges(
+    section: &SectionInfo,
+    protected_ranges: &[Range<u32>],
+) -> Vec<Range<u32>> {
+    let section_range = section.virtual_address..section_rva_end(section);
+    let mut ranges = vec![section_range.clone()];
+    for protected in protected_ranges
+        .iter()
+        .filter(|protected| range_overlaps(&section_range, protected))
+    {
+        let mut next_ranges = Vec::new();
+        for range in ranges {
+            if !range_overlaps(&range, protected) {
+                next_ranges.push(range);
+                continue;
+            }
+            if range.start < protected.start {
+                next_ranges.push(range.start..protected.start);
+            }
+            if protected.end < range.end {
+                next_ranges.push(protected.end..range.end);
+            }
+        }
+        ranges = next_ranges;
+    }
+    ranges
 }
 
 fn output_file_range_for_rva(
@@ -2546,6 +2671,7 @@ impl Dumper {
         let scanner_config = stub_generator.scanner_config();
         let scanner = PointerScanner::new(scanner_config);
         let cache = stub_generator.cache();
+        let protected_ranges = protected_exception_ranges(pe);
 
         // Calculate total bytes to scan
         let mut total_bytes = 0usize;
@@ -2555,7 +2681,14 @@ impl Dumper {
             if config.skip_sections.contains(&idx) || !should_scan_for_heap_pointers(section) {
                 continue;
             }
-            total_bytes += section.virtual_size.min(0x2000_0000) as usize;
+            let scan_ranges = unprotected_section_ranges(section, &protected_ranges);
+            if scan_ranges.is_empty() {
+                continue;
+            }
+            total_bytes += scan_ranges
+                .iter()
+                .map(|range| (range.end - range.start).min(0x2000_0000) as usize)
+                .sum::<usize>();
             sections_to_scan += 1;
         }
 
@@ -2572,36 +2705,42 @@ impl Dumper {
             if config.skip_sections.contains(&idx) || !should_scan_for_heap_pointers(section) {
                 continue;
             }
+            let scan_ranges = unprotected_section_ranges(section, &protected_ranges);
+            if scan_ranges.is_empty() {
+                continue;
+            }
 
             progress.current_item = Some(section.name.clone());
             progress.current = section_idx;
             report(progress);
 
-            let scan_size = (section.virtual_size as usize).min(0x2000_0000);
-            let sec_addr = unsafe { self.base.add(section.virtual_address as usize) };
+            for scan_range in scan_ranges {
+                let scan_size = ((scan_range.end - scan_range.start) as usize).min(0x2000_0000);
+                let scan_addr = unsafe { self.base.add(scan_range.start as usize) };
 
-            let mut chunk_off = 0;
-            while chunk_off < scan_size {
-                let read_size = CHUNK_SIZE.min(scan_size - chunk_off);
-                let chunk_ptr = unsafe { sec_addr.add(chunk_off) };
+                let mut chunk_off = 0;
+                while chunk_off < scan_size {
+                    let read_size = CHUNK_SIZE.min(scan_size - chunk_off);
+                    let chunk_ptr = unsafe { scan_addr.add(chunk_off) };
 
-                if is_memory_readable(chunk_ptr, read_size) {
-                    let buffer = unsafe { std::slice::from_raw_parts(chunk_ptr, read_size) };
-                    let base_rva = section.virtual_address + chunk_off as u32;
+                    if is_memory_readable(chunk_ptr, read_size) {
+                        let buffer = unsafe { std::slice::from_raw_parts(chunk_ptr, read_size) };
+                        let base_rva = scan_range.start + chunk_off as u32;
 
-                    let chunk_results = scanner.scan_buffer(buffer, base_rva, cache);
-                    results.extend(chunk_results);
+                        let chunk_results = scanner.scan_buffer(buffer, base_rva, cache);
+                        results.extend(chunk_results);
+                    }
+
+                    progress.bytes_processed += read_size;
+                    progress.pointers_found = results.len();
+
+                    // Report every 16MB
+                    if progress.bytes_processed % 0x100_0000 < CHUNK_SIZE {
+                        report(progress);
+                    }
+
+                    chunk_off += CHUNK_SIZE;
                 }
-
-                progress.bytes_processed += read_size;
-                progress.pointers_found = results.len();
-
-                // Report every 16MB
-                if progress.bytes_processed % 0x100_0000 < CHUNK_SIZE {
-                    report(progress);
-                }
-
-                chunk_off += CHUNK_SIZE;
             }
 
             section_idx += 1;
@@ -2875,6 +3014,7 @@ impl Dumper {
             })
             .collect();
 
+        let protected_ranges = protected_exception_ranges(pe);
         let exception_snapshot = exception_directory_file_range(pe, &section_mappings)
             .filter(|range| range.end <= output.len())
             .map(|range| (range.clone(), output[range].to_vec()));
@@ -2889,6 +3029,7 @@ impl Dumper {
             &mut output,
             &fixups,
             &section_mappings,
+            &protected_ranges,
             first_section_rva,
             aligned_headers,
         );
@@ -3268,26 +3409,27 @@ mod tests {
     }
 
     #[test]
-    fn test_heap_pointer_scan_only_uses_writable_data_sections() {
+    fn test_heap_pointer_scan_uses_non_executable_data_sections() {
         let mut section = SectionInfo {
-            name: ".data".to_string(),
+            name: ".rdata".to_string(),
             virtual_size: 0x1000,
             virtual_address: 0x1000,
             size_of_raw_data: 0x1000,
             pointer_to_raw_data: 0x400,
-            characteristics: IMAGE_SCN_MEM_WRITE,
+            characteristics: 0,
             new_pointer_to_raw_data: 0,
             new_size_of_raw_data: 0,
         };
 
         assert!(should_scan_for_heap_pointers(&section));
-
-        section.name = ".pdata".to_string();
-        section.characteristics = 0;
-        assert!(!should_scan_for_heap_pointers(&section));
+        let protected = 0x1200..0x1400;
+        assert_eq!(
+            unprotected_section_ranges(&section, std::slice::from_ref(&protected)),
+            vec![0x1000..0x1200, 0x1400..0x2000]
+        );
 
         section.name = ".text".to_string();
-        section.characteristics = IMAGE_SCN_MEM_WRITE | IMAGE_SCN_MEM_EXECUTE;
+        section.characteristics = IMAGE_SCN_MEM_EXECUTE;
         assert!(!should_scan_for_heap_pointers(&section));
     }
 

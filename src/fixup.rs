@@ -4,8 +4,9 @@
 //! from their runtime values to their new locations in the dumped PE.
 
 use crate::memory::strip_pointer_tags;
-use crate::pe::{IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_WRITE};
+use crate::pe::IMAGE_SCN_MEM_EXECUTE;
 use crate::stub::StubGenerator;
+use std::ops::Range;
 
 /// The kind of pointer fixup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,6 +95,7 @@ pub fn apply_fixups(
     output: &mut [u8],
     fixups: &[PointerFixup],
     sections: &[SectionMapping],
+    protected_ranges: &[Range<u32>],
     first_section_rva: u32,
     headers_size: usize,
 ) -> (usize, usize) {
@@ -103,6 +105,10 @@ pub fn apply_fixups(
     for fix in fixups {
         // Skip fixups in header region
         if fix.rva < first_section_rva {
+            skipped += 1;
+            continue;
+        }
+        if rva_range_overlaps(protected_ranges, fix.rva, 8) {
             skipped += 1;
             continue;
         }
@@ -176,11 +182,19 @@ impl SectionMapping {
         }
     }
 
-    /// Heap pointer fixups should only rewrite writable data, never code or PE metadata.
+    /// Heap pointer fixups may rewrite data sections, but never executable code.
     pub fn allows_heap_pointer_fixups(&self) -> bool {
-        (self.characteristics & IMAGE_SCN_MEM_WRITE) != 0
-            && (self.characteristics & IMAGE_SCN_MEM_EXECUTE) == 0
+        (self.characteristics & IMAGE_SCN_MEM_EXECUTE) == 0
     }
+}
+
+fn rva_range_overlaps(ranges: &[Range<u32>], rva: u32, len: u32) -> bool {
+    let Some(end) = rva.checked_add(len) else {
+        return true;
+    };
+    ranges
+        .iter()
+        .any(|range| rva < range.end && end > range.start)
 }
 
 #[cfg(test)]
@@ -197,14 +211,44 @@ mod tests {
 
     #[test]
     fn test_section_mapping() {
-        let mapping = SectionMapping::new(0x1000, 0x500, 0x600, 0x400, IMAGE_SCN_MEM_WRITE);
+        let mapping = SectionMapping::new(0x1000, 0x500, 0x600, 0x400, 0);
         assert_eq!(mapping.virtual_address, 0x1000);
         assert_eq!(mapping.raw_offset, 0x400);
         assert!(mapping.allows_heap_pointer_fixups());
     }
 
     #[test]
-    fn test_apply_fixups_skips_read_only_metadata_sections() {
+    fn test_apply_fixups_skips_protected_metadata_ranges() {
+        let mut output = vec![0u8; 0x800];
+        output[0x400..0x408].copy_from_slice(&0x1111_2222_3333_4444u64.to_le_bytes());
+        let fixups = vec![PointerFixup {
+            kind: FixupKind::ModuleToStub,
+            rva: 0x1000,
+            old_value: 0x1111_2222_3333_4444,
+            new_value: 0x5555_6666_7777_8888,
+        }];
+        let sections = vec![SectionMapping::new(0x1000, 0x100, 0x100, 0x400, 0)];
+        let protected_range = 0x1000..0x1100;
+
+        let (applied, skipped) = apply_fixups(
+            &mut output,
+            &fixups,
+            &sections,
+            std::slice::from_ref(&protected_range),
+            0x1000,
+            0x400,
+        );
+
+        assert_eq!(applied, 0);
+        assert_eq!(skipped, 1);
+        assert_eq!(
+            u64::from_le_bytes(output[0x400..0x408].try_into().unwrap()),
+            0x1111_2222_3333_4444
+        );
+    }
+
+    #[test]
+    fn test_apply_fixups_allows_read_only_data_sections() {
         let mut output = vec![0u8; 0x800];
         output[0x400..0x408].copy_from_slice(&0x1111_2222_3333_4444u64.to_le_bytes());
         let fixups = vec![PointerFixup {
@@ -215,13 +259,13 @@ mod tests {
         }];
         let sections = vec![SectionMapping::new(0x1000, 0x100, 0x100, 0x400, 0)];
 
-        let (applied, skipped) = apply_fixups(&mut output, &fixups, &sections, 0x1000, 0x400);
+        let (applied, skipped) = apply_fixups(&mut output, &fixups, &sections, &[], 0x1000, 0x400);
 
-        assert_eq!(applied, 0);
-        assert_eq!(skipped, 1);
+        assert_eq!(applied, 1);
+        assert_eq!(skipped, 0);
         assert_eq!(
             u64::from_le_bytes(output[0x400..0x408].try_into().unwrap()),
-            0x1111_2222_3333_4444
+            0x5555_6666_7777_8888
         );
     }
 }
