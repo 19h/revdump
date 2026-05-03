@@ -92,7 +92,7 @@ impl Console {
             max_graph_edges: 50_000,
             min_edge_confidence: EdgeConfidence::Low,
             detect_containers: true,
-            strong_devirt: false,
+            strong_devirt: true,
         }
     }
 
@@ -361,7 +361,7 @@ impl ConsoleState {
         println!("    skipcode, sc         - Toggle skip code section");
         println!("    skipsections, ss     - Set sections to skip");
         println!("    devirt, dv           - Toggle vcall devirtualization");
-        println!("    strongdevirt, sdv    - Toggle stronger devirt analysis");
+        println!("    strongdevirt, sdv    - Toggle stronger devirt analysis (default on)");
         println!("    revdmp               - Toggle .revdmp metadata");
         println!("    rtti                 - Toggle RTTI parsing");
         println!("    containers, ct       - Toggle container detection");
@@ -1087,6 +1087,10 @@ fn print_progress(info: &ProgressInfo) {
         }
         ProgressStage::ApplyingFixups => {
             format!("{}/{} fixups", info.current, info.total)
+        }
+        ProgressStage::AnalyzingMetadata | ProgressStage::BuildingMetadata => {
+            let item = info.current_item.as_deref().unwrap_or("");
+            format!("{}/{} {}", info.current, info.total, item)
         }
         ProgressStage::Devirtualizing => "scanning vcalls...".to_string(),
         _ => {

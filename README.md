@@ -69,7 +69,7 @@ revdump bridges that gap:
 - **Global function-pointer resolution** - Resolves and patches `call [rip+global]` and `mov reg, [rip+global]; call reg` when the global stores a module function pointer
 - **Thunk generation** - Places call thunks in code padding for space-constrained patches
 - **Secondary vfptr support** - Resolves vcalls through nonzero object vfptr offsets
-- **Strong analysis mode** - Optional bounded tracking through object fields, simple stack aliases, guarded call fallthrough, and global function-pointer registers
+- **Strong analysis mode** - Default-enabled bounded tracking through object fields, simple stack aliases, guarded call fallthrough, and global function-pointer registers
 - **Multi-byte NOP detection** - Finds padding regions for thunk placement
 
 ### Analysis Metadata
@@ -118,11 +118,10 @@ cargo build --release --target x86_64-pc-windows-gnu
 The native importer lives in `ida-plugin/` and uses C++23 plus `idax`:
 
 ```bash
-cmake -S ida-plugin -B build/ida-plugin -DCMAKE_BUILD_TYPE=Release
-cmake --build build/ida-plugin
+make -C ida-plugin build
 ```
 
-Load the dumped PE in IDA, run **RevDump Metadata Importer**, review the detected `.revdmp` categories, then enter `all` or a comma-separated subset such as `objects,vtables,calls`.
+Load the dumped PE in IDA, run **RevDump Metadata Importer**, review the detected `.revdmp` categories, then enter `all` or a comma-separated subset such as `objects,vtables,calls`. Long imports update both the IDA wait box and the output console with per-category progress.
 
 ## Usage
 
@@ -146,7 +145,7 @@ revdump dump \
   --max-region-size 4096 \
   --skip-sections 0,1 \
   --devirt \
-  --strong-devirt \
+  --no-strong-devirt \
   --max-graph-edges 50000 \
   --min-edge-confidence medium
 ```
@@ -156,7 +155,7 @@ Useful toggles:
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--devirt` | off | Rewrite resolved virtual calls to direct calls |
-| `--strong-devirt` | off | Track object field loads and simple stack aliases during devirt |
+| `--no-strong-devirt` | off | Disable stronger object-field and stack-alias devirt analysis |
 | `--no-revdmp` | off | Disable embedded `.revdmp` metadata section |
 | `--no-rtti` | off | Disable RTTI parsing for type names |
 | `--max-graph-edges <n>` | `50000` | Limit retained heap graph edges after scoring |
@@ -173,7 +172,7 @@ Useful toggles:
 revdump> target                   # Prompt for target module
 revdump> output                   # Prompt for output path
 revdump> devirt                   # Toggle devirtualization
-revdump> strongdevirt             # Toggle stronger devirtualization analysis
+revdump> strongdevirt             # Toggle stronger devirtualization analysis (enabled by default)
 revdump> dump                     # Execute dump
 
 # Or quick dump with defaults:
@@ -206,7 +205,7 @@ Auto-dump uses `DumpConfig::default()` plus devirtualization enabled by the libr
 | `skipcode` | `sc` | Toggle skip .text section |
 | `skipsections <n,n>` | `ss` | Set section indices to skip |
 | `devirt` | `dv` | Toggle vcall devirtualization |
-| `strongdevirt` | `sdv` | Toggle stronger devirtualization analysis |
+| `strongdevirt` | `sdv` | Toggle stronger devirtualization analysis (default on) |
 | `revdmp` | | Toggle embedded `.revdmp` metadata |
 | `rtti` | | Toggle RTTI parsing |
 | `containers` | `ct` | Toggle conservative container detection |
@@ -313,11 +312,11 @@ mov rax, [rcx+vfptr]
 call qword ptr [rax+slot]
 ```
 
-It also tracks simple stack aliases such as `mov [rsp+X], rcx` followed by `mov rcx, [rsp+X]`. This mode is bounded by `max_block_instructions` and is off by default from the CLI because it is more aggressive than direct global-vfptr tracking.
+It also tracks simple stack aliases such as `mov [rsp+X], rcx` followed by `mov rcx, [rsp+X]`. This mode is bounded by `max_block_instructions`, enabled by default, and can be disabled with `--no-strong-devirt` or the injected console `strongdevirt` toggle.
 
 ### Phase 6: Native Metadata Import
 
-The embedded `.revdmp` section is a binary block stream with fixed-size records and an interned UTF-8 string table. The native IDA plugin reads this section from the loaded database, shows the categories and record counts it found, then imports only the selected data:
+The embedded `.revdmp` section is a binary block stream with fixed-size records and an interned UTF-8 string table. The native IDA plugin reads this section from the loaded database, shows the categories and record counts it found, then imports only the selected data while reporting progress in the IDA wait box and output console:
 
 - Names synthetic heap instances, vtables, function-pointer slots, thunks, CFG targets, and exception functions
 - Converts vfptr, global pointer, heap-edge, and callback-slot qwords to offsets where possible
@@ -359,7 +358,7 @@ src/
 | `max_graph_edges` | `50000` | Max retained heap graph edges after dedup/scoring |
 | `min_edge_confidence` | `Low` | Minimum retained heap graph confidence |
 | `detect_containers` | `true` | Enable conservative container detection |
-| `strong_devirt` | `false` | Enable stronger bounded devirt tracking |
+| `strong_devirt` | `true` | Enable stronger bounded devirt tracking |
 
 ### DevirtConfig
 
@@ -392,7 +391,7 @@ For a heap dump to `autodump.exe`, revdump normally produces:
 
 - **3-byte vcalls without nearby padding** - Cannot patch `call [rax+N]` (3 bytes) if no code padding exists within ±127 bytes for thunk placement
 - **x86-64 only** - Devirtualization patterns are 64-bit specific
-- **Conservative propagation** - Default mode resolves direct global/object vfptr patterns; `strong_devirt` adds bounded field and stack-alias tracking but still avoids full data-flow analysis
+- **Conservative propagation** - Default mode includes bounded field and stack-alias tracking via `strong_devirt`, but still avoids full data-flow analysis
 - **RTTI-dependent names** - Type names require usable RTTI or symbol fallback; stripped targets may still produce unnamed vtables
 - **Container heuristics** - Container recognition intentionally prefers fewer false positives over broad coverage
 

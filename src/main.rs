@@ -4,7 +4,7 @@
 //! On Windows, it can be injected into a target process to dump PE files
 //! with resolved heap pointers.
 
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 use std::path::PathBuf;
 
 #[cfg(target_os = "windows")]
@@ -75,8 +75,12 @@ enum Commands {
         no_containers: bool,
 
         /// Enable stronger bounded devirtualization patterns
-        #[arg(long)]
+        #[arg(long, action = ArgAction::SetTrue, hide = true)]
         strong_devirt: bool,
+
+        /// Disable stronger bounded devirtualization patterns
+        #[arg(long, action = ArgAction::SetTrue)]
+        no_strong_devirt: bool,
     },
 
     /// Dump a module without heap snapshot (standard dump)
@@ -121,6 +125,7 @@ fn main() -> anyhow::Result<()> {
             min_edge_confidence,
             no_containers,
             strong_devirt,
+            no_strong_devirt,
         } => {
             dump_with_heap(
                 &module,
@@ -135,7 +140,7 @@ fn main() -> anyhow::Result<()> {
                 max_graph_edges,
                 &min_edge_confidence,
                 no_containers,
-                strong_devirt,
+                strong_devirt || !no_strong_devirt,
             )?;
         }
 
@@ -221,6 +226,10 @@ fn dump_with_heap(
                 ProgressStage::CreatingStubs => {
                     format!("{} - {} stubs", info.stage.name(), info.stubs_created)
                 }
+                ProgressStage::AnalyzingMetadata | ProgressStage::BuildingMetadata => {
+                    let item = info.current_item.as_deref().unwrap_or("");
+                    format!("{} - {}", info.stage.name(), item)
+                }
                 ProgressStage::Devirtualizing => {
                     format!("{}", info.stage.name())
                 }
@@ -235,9 +244,10 @@ fn dump_with_heap(
 
     if devirt {
         println!("Devirtualization: enabled");
-    }
-    if strong_devirt {
-        println!("Strong devirtualization analysis: enabled");
+        println!(
+            "Strong devirtualization analysis: {}",
+            if strong_devirt { "enabled" } else { "disabled" }
+        );
     }
 
     dumper.dump_with_heap(output, &config)?;

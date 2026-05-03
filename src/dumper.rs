@@ -1595,7 +1595,9 @@ pub fn build_revdmp_metadata(
         out.add_record(BLOCK_FUNCTION_POINTER_TABLES, record.finish());
     }
 
-    for stub in stub_generator.stubs() {
+    let mut stubs = stub_generator.stubs().collect::<Vec<_>>();
+    stubs.sort_by_key(|stub| stub.new_rva);
+    for stub in stubs {
         let vfptr_offsets = stub
             .vtable_refs
             .iter()
@@ -2138,7 +2140,7 @@ impl Default for DumpConfig {
             max_graph_edges: 50_000,
             min_edge_confidence: EdgeConfidence::Low,
             detect_containers: true,
-            strong_devirt: false,
+            strong_devirt: true,
         }
     }
 }
@@ -2294,11 +2296,18 @@ impl Dumper {
         let heap_section_va = pe.next_section_va();
         let heap_section_size = stub_generator.assign_rvas(heap_section_va);
         let vtable_facts = stub_generator.vtable_facts(&heap_ptr_locs);
+        if config.emit_revdmp {
+            progress.stage = ProgressStage::AnalyzingMetadata;
+            progress.current = 1;
+            progress.total = 7;
+            progress.current_item = Some("Resolving RTTI/type names".to_string());
+            report(&progress);
+        }
         let enriched_facts = enrich_vtable_facts(pe, &vtable_facts, config.parse_rtti);
         let indirect_calls = if config.emit_revdmp {
             progress.stage = ProgressStage::AnalyzingMetadata;
-            progress.current = 1;
-            progress.total = 6;
+            progress.current = 2;
+            progress.total = 7;
             progress.current_item = Some("Resolving indirect calls".to_string());
             report(&progress);
 
@@ -2323,8 +2332,8 @@ impl Dumper {
         };
         let (function_pointers, function_pointer_tables) = if config.emit_revdmp {
             progress.stage = ProgressStage::AnalyzingMetadata;
-            progress.current = 2;
-            progress.total = 6;
+            progress.current = 3;
+            progress.total = 7;
             progress.current_item = Some("Scanning function pointer tables".to_string());
             report(&progress);
 
@@ -2334,8 +2343,8 @@ impl Dumper {
         };
         let (vtable_slots, thunk_normalizations) = if config.emit_revdmp {
             progress.stage = ProgressStage::AnalyzingMetadata;
-            progress.current = 3;
-            progress.total = 6;
+            progress.current = 4;
+            progress.total = 7;
             progress.current_item = Some("Analyzing vtable slots".to_string());
             report(&progress);
 
@@ -2345,8 +2354,8 @@ impl Dumper {
         };
         let cfg_functions = if config.emit_revdmp {
             progress.stage = ProgressStage::AnalyzingMetadata;
-            progress.current = 4;
-            progress.total = 6;
+            progress.current = 5;
+            progress.total = 7;
             progress.current_item = Some("Reading CFG function table".to_string());
             report(&progress);
 
@@ -2356,8 +2365,8 @@ impl Dumper {
         };
         let exception_functions = if config.emit_revdmp {
             progress.stage = ProgressStage::AnalyzingMetadata;
-            progress.current = 5;
-            progress.total = 6;
+            progress.current = 6;
+            progress.total = 7;
             progress.current_item = Some("Reading exception directory".to_string());
             report(&progress);
 
@@ -2367,8 +2376,8 @@ impl Dumper {
         };
         let metadata_data = if config.emit_revdmp {
             progress.stage = ProgressStage::BuildingMetadata;
-            progress.current = 6;
-            progress.total = 6;
+            progress.current = 7;
+            progress.total = 7;
             progress.current_item = Some("Encoding metadata section".to_string());
             report(&progress);
 
@@ -3139,6 +3148,7 @@ mod tests {
         let config = DumpConfig::default();
         assert_eq!(config.max_vfptr_probe, 256);
         assert!(config.skip_sections.is_empty());
+        assert!(config.strong_devirt);
     }
 
     #[test]
