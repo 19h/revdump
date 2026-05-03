@@ -113,6 +113,17 @@ cargo build --release --target x86_64-pc-windows-gnu
 - Windows target (runs on Windows or via Wine)
 - Optional: IDA Pro and IDA SDK-compatible CMake environment for building the native importer plugin
 
+### Native IDA Plugin
+
+The native importer lives in `ida-plugin/` and uses C++23 plus `idax`:
+
+```bash
+cmake -S ida-plugin -B build/ida-plugin -DCMAKE_BUILD_TYPE=Release
+cmake --build build/ida-plugin
+```
+
+Load the dumped PE in IDA, run **RevDump Metadata Importer**, review the detected `.revdmp` categories, then enter `all` or a comma-separated subset such as `objects,vtables,calls`.
+
 ## Usage
 
 ### CLI Mode

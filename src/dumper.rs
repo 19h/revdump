@@ -195,6 +195,8 @@ pub enum ProgressStage {
     ScanningSection,
     CreatingStubs,
     AssigningRvas,
+    AnalyzingMetadata,
+    BuildingMetadata,
     BuildingOutput,
     ApplyingFixups,
     Devirtualizing,
@@ -211,6 +213,8 @@ impl ProgressStage {
             Self::ScanningSection => "Scanning sections",
             Self::CreatingStubs => "Creating vtable stubs",
             Self::AssigningRvas => "Assigning RVAs",
+            Self::AnalyzingMetadata => "Analyzing .revdmp metadata",
+            Self::BuildingMetadata => "Building .revdmp metadata",
             Self::BuildingOutput => "Building output PE",
             Self::ApplyingFixups => "Applying fixups",
             Self::Devirtualizing => "Devirtualizing vcalls",
@@ -1565,7 +1569,12 @@ pub fn build_revdmp_metadata(
         record.u32(out.string(&pointer.section_name));
         record.u32(out.string(pointer.kind));
         record.u32(out.string(pointer.table_id.as_deref().unwrap_or("")));
-        record.u32(pointer.index.map(|idx| idx as u32).unwrap_or(REVDMP_NONE_U32));
+        record.u32(
+            pointer
+                .index
+                .map(|idx| idx as u32)
+                .unwrap_or(REVDMP_NONE_U32),
+        );
         record.u32(pointer.target_rva);
         record.u64(pointer.target_va);
         record.u32(out.string(pointer.confidence));
@@ -2287,6 +2296,12 @@ impl Dumper {
         let vtable_facts = stub_generator.vtable_facts(&heap_ptr_locs);
         let enriched_facts = enrich_vtable_facts(pe, &vtable_facts, config.parse_rtti);
         let indirect_calls = if config.emit_revdmp {
+            progress.stage = ProgressStage::AnalyzingMetadata;
+            progress.current = 1;
+            progress.total = 6;
+            progress.current_item = Some("Resolving indirect calls".to_string());
+            report(&progress);
+
             pe.sections
                 .iter()
                 .find(|s| s.name == ".text" || (s.characteristics & 0x20) != 0)
@@ -2307,26 +2322,56 @@ impl Dumper {
             Vec::new()
         };
         let (function_pointers, function_pointer_tables) = if config.emit_revdmp {
+            progress.stage = ProgressStage::AnalyzingMetadata;
+            progress.current = 2;
+            progress.total = 6;
+            progress.current_item = Some("Scanning function pointer tables".to_string());
+            report(&progress);
+
             analyze_function_pointer_tables(pe)
         } else {
             (Vec::new(), Vec::new())
         };
         let (vtable_slots, thunk_normalizations) = if config.emit_revdmp {
+            progress.stage = ProgressStage::AnalyzingMetadata;
+            progress.current = 3;
+            progress.total = 6;
+            progress.current_item = Some("Analyzing vtable slots".to_string());
+            report(&progress);
+
             analyze_vtable_slots(pe, &enriched_facts)
         } else {
             (Vec::new(), Vec::new())
         };
         let cfg_functions = if config.emit_revdmp {
+            progress.stage = ProgressStage::AnalyzingMetadata;
+            progress.current = 4;
+            progress.total = 6;
+            progress.current_item = Some("Reading CFG function table".to_string());
+            report(&progress);
+
             analyze_cfg_functions(pe)
         } else {
             Vec::new()
         };
         let exception_functions = if config.emit_revdmp {
+            progress.stage = ProgressStage::AnalyzingMetadata;
+            progress.current = 5;
+            progress.total = 6;
+            progress.current_item = Some("Reading exception directory".to_string());
+            report(&progress);
+
             analyze_exception_functions(pe)
         } else {
             Vec::new()
         };
         let metadata_data = if config.emit_revdmp {
+            progress.stage = ProgressStage::BuildingMetadata;
+            progress.current = 6;
+            progress.total = 6;
+            progress.current_item = Some("Encoding metadata section".to_string());
+            report(&progress);
+
             build_revdmp_metadata(
                 &enriched_facts,
                 &heap_ptr_locs,
@@ -2352,6 +2397,7 @@ impl Dumper {
 
         // Build output PE
         progress.stage = ProgressStage::BuildingOutput;
+        progress.current_item = None;
         report(&progress);
 
         let (mut output, section_mappings) = self.build_output_pe(
@@ -3324,7 +3370,10 @@ mod tests {
         assert_eq!(read_u32(&vtable_facts[0], 16), 0x20);
         assert_eq!(read_u32(&vtable_facts[0], 20), 0x5000);
         assert_eq!(read_u64(&vtable_facts[0], 24), 0x1400_5000);
-        assert_eq!(parsed.string(read_u32(&vtable_facts[0], 32)), "AudioService");
+        assert_eq!(
+            parsed.string(read_u32(&vtable_facts[0], 32)),
+            "AudioService"
+        );
         assert_eq!(read_u32(&vtable_facts[1], 0), REVDMP_NONE_U32);
 
         let rtti = parsed.block(BLOCK_MSVC_RTTI);
@@ -3354,7 +3403,10 @@ mod tests {
         assert_eq!(read_u64(&heap_edges[0], 0), 0x1000_0000);
         assert_eq!(read_u32(&heap_edges[0], 12), 0x18);
         assert_eq!(read_u64(&heap_edges[0], 16), 0x2000_0000);
-        assert_eq!(parsed.string(read_u32(&heap_edges[0], 36)), "raw_heap_pointer");
+        assert_eq!(
+            parsed.string(read_u32(&heap_edges[0], 36)),
+            "raw_heap_pointer"
+        );
 
         let containers = parsed.block(BLOCK_CONTAINERS);
         assert_eq!(containers.len(), 1);
@@ -3368,8 +3420,14 @@ mod tests {
         assert_eq!(read_u32(&field_types[0], 16), 0x20);
         assert_eq!(parsed.string(read_u32(&field_types[0], 20)), "vfptr");
         assert_eq!(parsed.string(read_u32(&field_types[1], 20)), "vfptr");
-        assert_eq!(parsed.string(read_u32(&field_types[2], 20)), "object_pointer");
-        assert_eq!(parsed.string(read_u32(&field_types[3], 20)), "vector_triple");
+        assert_eq!(
+            parsed.string(read_u32(&field_types[2], 20)),
+            "object_pointer"
+        );
+        assert_eq!(
+            parsed.string(read_u32(&field_types[3], 20)),
+            "vector_triple"
+        );
 
         let container_elements = parsed.block(BLOCK_CONTAINER_ELEMENTS);
         assert_eq!(container_elements.len(), 1);
@@ -3392,7 +3450,10 @@ mod tests {
         assert_eq!(function_pointers.len(), 1);
         assert_eq!(read_u32(&function_pointers[0], 0), 0x6000);
         assert_eq!(parsed.string(read_u32(&function_pointers[0], 12)), ".rdata");
-        assert_eq!(parsed.string(read_u32(&function_pointers[0], 16)), "callback_slot");
+        assert_eq!(
+            parsed.string(read_u32(&function_pointers[0], 16)),
+            "callback_slot"
+        );
         assert_eq!(read_u32(&function_pointers[0], 24), REVDMP_NONE_U32);
         assert_eq!(read_u32(&function_pointers[0], 28), 0x4560);
 
@@ -3415,10 +3476,7 @@ mod tests {
         assert_eq!(read_u32(&slots[0], 16), 0x7100);
         assert_eq!(read_u32(&slots[0], 28), 0x7200);
         assert_eq!(parsed.string(read_u32(&slots[0], 40)), "adjustor_thunk");
-        assert_eq!(
-            parsed.string(read_u32(&slots[0], 48)),
-            "AudioService::tick"
-        );
+        assert_eq!(parsed.string(read_u32(&slots[0], 48)), "AudioService::tick");
 
         let thunks = parsed.block(BLOCK_THUNK_NORMALIZATIONS);
         assert_eq!(thunks.len(), 1);
