@@ -1124,12 +1124,12 @@ fn print_progress(info: &ProgressInfo) {
     // Print progress line
     if metrics.is_empty() {
         print!(
-            "\r  [{}] {:5.1}% | {:<26} | {:<24} | {}",
+            "\r\x1B[2K  [{}] {:5.1}% | {:<26} | {:<24} | {}",
             bar, percent, display.stage, display.step, display.progress
         );
     } else {
         print!(
-            "\r  [{}] {:5.1}% | {:<26} | {:<24} | {:<18} | {}",
+            "\r\x1B[2K  [{}] {:5.1}% | {:<26} | {:<24} | {:<18} | {}",
             bar, percent, display.stage, display.step, display.progress, metrics
         );
     }

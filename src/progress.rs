@@ -145,7 +145,10 @@ fn devirt_progress_display(info: &ProgressInfo) -> ProgressDisplay {
     let Some(devirt) = info.devirt_progress.as_ref() else {
         return ProgressDisplay {
             stage: info.stage.name().to_string(),
-            step: String::new(),
+            step: info
+                .current_item
+                .clone()
+                .unwrap_or_else(|| "starting".to_string()),
             progress: format_count_progress(info.current, info.total),
             metrics: Vec::new(),
         };

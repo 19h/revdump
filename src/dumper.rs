@@ -2712,6 +2712,11 @@ impl Dumper {
         // Build output PE
         progress.stage = ProgressStage::BuildingOutput;
         progress.current_item = None;
+        progress.current = 0;
+        progress.total = 0;
+        progress.stub_debug = None;
+        progress.eh_progress = None;
+        progress.devirt_progress = None;
         report(&progress);
 
         let (mut output, section_mappings) = self.build_output_pe(
@@ -2729,6 +2734,14 @@ impl Dumper {
         // Devirtualize vcalls if enabled
         if config.enable_devirt {
             progress.stage = ProgressStage::Devirtualizing;
+            progress.current_item = Some("starting".to_string());
+            progress.current = 0;
+            progress.total = 0;
+            progress.eh_progress = None;
+            progress.devirt_progress = None;
+            progress.fixups_applied = 0;
+            progress.fixups_skipped = 0;
+            progress.protected_fixups_skipped = 0;
             report(&progress);
 
             let devirt_stats = self.apply_devirt(
@@ -2753,9 +2766,14 @@ impl Dumper {
 
         // Write to file
         progress.stage = ProgressStage::WritingFile;
+        progress.current = 0;
         progress.total = output.len();
         progress.current_item = None;
         progress.devirt_progress = None;
+        progress.eh_progress = None;
+        progress.fixups_applied = 0;
+        progress.fixups_skipped = 0;
+        progress.protected_fixups_skipped = 0;
         report(&progress);
 
         self.write_output(output_path.as_ref(), &output)?;
