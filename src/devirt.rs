@@ -22,7 +22,7 @@ use crate::memory::{safe_read_memory, strip_pointer_tags};
 use crate::stub::{HeapPointerEdge, VtableFact};
 
 use iced_x86::{code_asm::*, Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 // ============================================================================
 // Types
@@ -630,8 +630,20 @@ impl GlobalVtableMap {
         let mut map = HashMap::with_capacity(vtable_facts.len());
         let mut globals = HashMap::new();
         let mut field_map = HashMap::new();
+        let mut source_objects = HashSet::new();
+        let mut facts_by_heap: HashMap<u64, Vec<&VtableFact>> = HashMap::new();
+        let mut edges_by_source: HashMap<u64, Vec<&HeapPointerEdge>> = HashMap::new();
+
+        for edge in heap_edges {
+            edges_by_source
+                .entry(edge.source_heap_addr)
+                .or_default()
+                .push(edge);
+        }
 
         for fact in vtable_facts {
+            facts_by_heap.entry(fact.heap_addr).or_default().push(fact);
+
             let Some(global_rva) = fact.source_rva else {
                 continue;
             };
@@ -645,26 +657,26 @@ impl GlobalVtableMap {
                 },
             );
             *globals.entry(global_rva).or_insert(0) += 1;
+            source_objects.insert((global_rva, fact.heap_addr));
         }
 
-        for source_fact in vtable_facts.iter().filter(|fact| fact.source_rva.is_some()) {
-            let global_rva = source_fact.source_rva.unwrap();
-            for edge in heap_edges
-                .iter()
-                .filter(|edge| edge.source_heap_addr == source_fact.heap_addr)
-            {
-                for target_fact in vtable_facts
-                    .iter()
-                    .filter(|fact| fact.heap_addr == edge.target_heap_addr)
-                {
-                    field_map.insert(
-                        (global_rva, edge.field_offset, target_fact.vfptr_offset),
-                        VtableInfo {
-                            heap_addr: target_fact.heap_addr,
-                            vtable_rva: target_fact.vtable_rva,
-                            vfptr_offset: target_fact.vfptr_offset,
-                        },
-                    );
+        for (global_rva, source_heap_addr) in source_objects {
+            let Some(edges) = edges_by_source.get(&source_heap_addr) else {
+                continue;
+            };
+
+            for edge in edges {
+                if let Some(target_facts) = facts_by_heap.get(&edge.target_heap_addr) {
+                    for target_fact in target_facts {
+                        field_map.insert(
+                            (global_rva, edge.field_offset, target_fact.vfptr_offset),
+                            VtableInfo {
+                                heap_addr: target_fact.heap_addr,
+                                vtable_rva: target_fact.vtable_rva,
+                                vfptr_offset: target_fact.vfptr_offset,
+                            },
+                        );
+                    }
                 }
             }
         }
@@ -2541,7 +2553,23 @@ fn devirtualize_inner(
     mut progress: Option<&mut dyn FnMut(DevirtProgress)>,
 ) -> Result<DevirtStats> {
     // Build global-to-vtable mapping
+    let build_total = vtable_facts.len().saturating_add(heap_edges.len());
+    let build_stats = DevirtStats::default();
+    emit_devirt_progress(
+        &mut progress,
+        0,
+        build_total,
+        "building vtable map",
+        &build_stats,
+    );
     let global_map = GlobalVtableMap::build(vtable_facts, heap_edges, image_base);
+    emit_devirt_progress(
+        &mut progress,
+        build_total,
+        build_total,
+        "building vtable map",
+        &build_stats,
+    );
 
     // Read .text section from memory
     let text_addr = unsafe { mod_base.add(text_section_rva as usize) };
