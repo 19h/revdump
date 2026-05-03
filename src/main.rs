@@ -54,10 +54,6 @@ enum Commands {
         #[arg(long)]
         devirt: bool,
 
-        /// Disable IDAPython sidecar generation
-        #[arg(long)]
-        no_ida_script: bool,
-
         /// Disable embedded .revdmp metadata section
         #[arg(long)]
         no_revdmp: bool,
@@ -119,7 +115,6 @@ fn main() -> anyhow::Result<()> {
             skip_code,
             skip_sections,
             devirt,
-            no_ida_script,
             no_revdmp,
             no_rtti,
             max_graph_edges,
@@ -135,7 +130,6 @@ fn main() -> anyhow::Result<()> {
                 skip_code,
                 skip_sections,
                 devirt,
-                no_ida_script,
                 no_revdmp,
                 no_rtti,
                 max_graph_edges,
@@ -166,7 +160,6 @@ fn dump_with_heap(
     skip_code: bool,
     mut skip_sections: Vec<usize>,
     devirt: bool,
-    no_ida_script: bool,
     no_revdmp: bool,
     no_rtti: bool,
     max_graph_edges: usize,
@@ -200,7 +193,6 @@ fn dump_with_heap(
         recursive_heap_scan_depth: max_depth,
         skip_sections,
         enable_devirt: devirt,
-        emit_ida_script: !no_ida_script,
         emit_revdmp: !no_revdmp,
         parse_rtti: !no_rtti,
         max_graph_edges,

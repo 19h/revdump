@@ -58,7 +58,6 @@ pub struct Console {
     skip_sections: Vec<usize>,
     /// Enable devirtualization.
     devirt: bool,
-    emit_ida_script: bool,
     emit_revdmp: bool,
     parse_rtti: bool,
     max_graph_edges: usize,
@@ -88,7 +87,6 @@ impl Console {
             skip_code: false,
             skip_sections: Vec::new(),
             devirt: false,
-            emit_ida_script: true,
             emit_revdmp: true,
             parse_rtti: true,
             max_graph_edges: 50_000,
@@ -196,7 +194,6 @@ impl Console {
         let skip_code = self.skip_code;
         let skip_sections = self.skip_sections.clone();
         let devirt = self.devirt;
-        let emit_ida_script = self.emit_ida_script;
         let emit_revdmp = self.emit_revdmp;
         let parse_rtti = self.parse_rtti;
         let max_graph_edges = self.max_graph_edges;
@@ -214,7 +211,6 @@ impl Console {
                 skip_code,
                 skip_sections,
                 devirt,
-                emit_ida_script,
                 emit_revdmp,
                 parse_rtti,
                 max_graph_edges,
@@ -268,7 +264,6 @@ struct ConsoleState {
     skip_code: bool,
     skip_sections: Vec<usize>,
     devirt: bool,
-    emit_ida_script: bool,
     emit_revdmp: bool,
     parse_rtti: bool,
     max_graph_edges: usize,
@@ -313,7 +308,6 @@ impl ConsoleState {
                 "skipcode" | "sc" => self.cmd_toggle_skip_code(),
                 "skipsections" | "ss" => self.cmd_set_skip_sections(),
                 "devirt" | "dv" => self.cmd_toggle_devirt(),
-                "ida" => self.cmd_toggle_ida_script(),
                 "revdmp" => self.cmd_toggle_revdmp(),
                 "rtti" => self.cmd_toggle_rtti(),
                 "containers" | "ct" => self.cmd_toggle_containers(),
@@ -368,7 +362,6 @@ impl ConsoleState {
         println!("    skipsections, ss     - Set sections to skip");
         println!("    devirt, dv           - Toggle vcall devirtualization");
         println!("    strongdevirt, sdv    - Toggle stronger devirt analysis");
-        println!("    ida                  - Toggle IDA sidecar script");
         println!("    revdmp               - Toggle .revdmp metadata");
         println!("    rtti                 - Toggle RTTI parsing");
         println!("    containers, ct       - Toggle container detection");
@@ -414,10 +407,6 @@ impl ConsoleState {
         println!(
             "  Strong Devirt:    {}",
             if self.strong_devirt { "Yes" } else { "No" }
-        );
-        println!(
-            "  IDA Script:       {}",
-            if self.emit_ida_script { "Yes" } else { "No" }
         );
         println!(
             "  .revdmp:          {}",
@@ -595,18 +584,6 @@ impl ConsoleState {
         );
     }
 
-    fn cmd_toggle_ida_script(&mut self) {
-        self.emit_ida_script = !self.emit_ida_script;
-        println!(
-            "[OK] IDA script: {}",
-            if self.emit_ida_script {
-                "Enabled"
-            } else {
-                "Disabled"
-            }
-        );
-    }
-
     fn cmd_toggle_revdmp(&mut self) {
         self.emit_revdmp = !self.emit_revdmp;
         println!(
@@ -767,10 +744,6 @@ impl ConsoleState {
             "  Strong Devirt: {}",
             if self.strong_devirt { "Yes" } else { "No" }
         );
-        println!(
-            "  IDA Script: {}",
-            if self.emit_ida_script { "Yes" } else { "No" }
-        );
         println!("  .revdmp: {}", if self.emit_revdmp { "Yes" } else { "No" });
         println!("  RTTI: {}", if self.parse_rtti { "Yes" } else { "No" });
         println!(
@@ -855,7 +828,6 @@ impl ConsoleState {
             recursive_heap_scan_depth: self.max_depth,
             skip_sections,
             enable_devirt: self.devirt,
-            emit_ida_script: self.emit_ida_script,
             emit_revdmp: self.emit_revdmp,
             parse_rtti: self.parse_rtti,
             max_graph_edges: self.max_graph_edges,

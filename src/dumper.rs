@@ -21,11 +21,9 @@ use crate::stub::{
 };
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fmt::Write as FmtWrite;
 use std::fs::File;
 use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 
 #[derive(Clone, Debug)]
 pub struct EnrichedVtableFact {
@@ -1052,7 +1050,153 @@ fn analyze_exception_functions(pe: &PeParser) -> Vec<ExceptionFunctionFact> {
     functions
 }
 
-/// Build an IDA-friendly metadata section that lists every flattened vtable fact.
+const REVDMP_BINARY_MAGIC: &[u8; 8] = b"REVDMPB\0";
+const REVDMP_BINARY_VERSION: u32 = 1;
+const REVDMP_ENDIAN_MARKER: u32 = 0x0102_0304;
+const REVDMP_NONE_U32: u32 = u32::MAX;
+
+const BLOCK_OBJECTS: u32 = 1;
+const BLOCK_VTABLE_FACTS: u32 = 2;
+const BLOCK_MSVC_RTTI: u32 = 3;
+const BLOCK_MSVC_BASE_CLASSES: u32 = 4;
+const BLOCK_GLOBAL_POINTERS: u32 = 5;
+const BLOCK_HEAP_EDGES: u32 = 6;
+const BLOCK_CONTAINERS: u32 = 7;
+const BLOCK_FIELD_TYPES: u32 = 8;
+const BLOCK_CONTAINER_ELEMENTS: u32 = 9;
+const BLOCK_INDIRECT_CALLS: u32 = 10;
+const BLOCK_FUNCTION_POINTERS: u32 = 11;
+const BLOCK_FUNCTION_POINTER_TABLES: u32 = 12;
+const BLOCK_VTABLE_SLOTS: u32 = 13;
+const BLOCK_THUNK_NORMALIZATIONS: u32 = 14;
+const BLOCK_CFG_FUNCTIONS: u32 = 15;
+const BLOCK_EXCEPTION_FUNCTIONS: u32 = 16;
+const BLOCK_SYNTHETIC_STRUCTS: u32 = 17;
+
+#[derive(Default)]
+struct RevdmpRecord(Vec<u8>);
+
+impl RevdmpRecord {
+    fn u8(&mut self, value: u8) {
+        self.0.push(value);
+    }
+
+    fn u32(&mut self, value: u32) {
+        self.0.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn i32(&mut self, value: i32) {
+        self.0.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn u64(&mut self, value: u64) {
+        self.0.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn pad(&mut self, count: usize) {
+        self.0.resize(self.0.len() + count, 0);
+    }
+
+    fn finish(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+struct RevdmpBlock {
+    record_size: u32,
+    count: u32,
+    data: Vec<u8>,
+}
+
+struct RevdmpBinaryBuilder {
+    strings: Vec<u8>,
+    string_offsets: BTreeMap<String, u32>,
+    blocks: BTreeMap<u32, RevdmpBlock>,
+}
+
+impl RevdmpBinaryBuilder {
+    fn new() -> Self {
+        let mut string_offsets = BTreeMap::new();
+        string_offsets.insert(String::new(), 0);
+        Self {
+            strings: vec![0],
+            string_offsets,
+            blocks: BTreeMap::new(),
+        }
+    }
+
+    fn string(&mut self, value: &str) -> u32 {
+        if value.is_empty() {
+            return 0;
+        }
+        if let Some(&offset) = self.string_offsets.get(value) {
+            return offset;
+        }
+        let offset = self.strings.len() as u32;
+        self.strings.extend_from_slice(value.as_bytes());
+        self.strings.push(0);
+        self.string_offsets.insert(value.to_string(), offset);
+        offset
+    }
+
+    fn add_record(&mut self, kind: u32, record: Vec<u8>) {
+        let record_size = record.len() as u32;
+        let block = self.blocks.entry(kind).or_insert_with(|| RevdmpBlock {
+            record_size,
+            count: 0,
+            data: Vec::new(),
+        });
+        debug_assert_eq!(block.record_size, record_size);
+        if block.record_size != record_size {
+            return;
+        }
+        block.count = block.count.saturating_add(1);
+        block.data.extend_from_slice(&record);
+    }
+
+    fn finish(self, image_base: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(REVDMP_BINARY_MAGIC);
+        out.extend_from_slice(&REVDMP_BINARY_VERSION.to_le_bytes());
+        out.extend_from_slice(&REVDMP_ENDIAN_MARKER.to_le_bytes());
+        out.extend_from_slice(&(self.blocks.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(self.strings.len() as u32).to_le_bytes());
+        out.extend_from_slice(&image_base.to_le_bytes());
+
+        for (&kind, block) in &self.blocks {
+            out.extend_from_slice(&kind.to_le_bytes());
+            out.extend_from_slice(&block.record_size.to_le_bytes());
+            out.extend_from_slice(&block.count.to_le_bytes());
+            out.extend_from_slice(&(block.data.len() as u32).to_le_bytes());
+            out.extend_from_slice(&block.data);
+        }
+
+        out.extend_from_slice(&self.strings);
+        out
+    }
+}
+
+fn opt_rva(value: Option<u32>) -> u32 {
+    value.unwrap_or(REVDMP_NONE_U32)
+}
+
+fn opt_va(value: Option<u64>) -> u64 {
+    value.unwrap_or(u64::MAX)
+}
+
+fn bool_byte(value: bool) -> u8 {
+    u8::from(value)
+}
+
+fn joined_u64(values: &[u64]) -> String {
+    values
+        .iter()
+        .map(|value| format!("0x{value:X}"))
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+/// Build the embedded binary `.revdmp` metadata section.
 pub fn build_revdmp_metadata(
     facts: &[EnrichedVtableFact],
     heap_ptr_locs: &[(u32, u64)],
@@ -1068,7 +1212,7 @@ pub fn build_revdmp_metadata(
     image_base: u64,
     stub_generator: &StubGenerator,
 ) -> Vec<u8> {
-    let mut text = String::new();
+    let mut out = RevdmpBinaryBuilder::new();
     let runtime_objects = build_runtime_objects(
         facts,
         heap_ptr_locs,
@@ -1088,227 +1232,144 @@ pub fn build_revdmp_metadata(
         }
     }
 
-    let _ = writeln!(text, "REVDMP_SCHEMA v3");
-    let _ = writeln!(text, "key,value");
-    let _ = writeln!(text, "sidecar_required,false");
-    let _ = writeln!(text, "relationship_model,runtime_graph_v3");
-    let _ = writeln!(text, "target_consumers,ida;ghidra;binaryninja;custom");
-    let _ = writeln!(text);
-
-    let _ = writeln!(text, "REVDMP_OBJECTS v1");
-    let _ = writeln!(
-        text,
-        "object_id,heap_addr,stub_rva,stub_va,stub_size,vfptr_count,vfptr_offsets,vtable_rvas,type_names,root_rvas,in_edges,out_edges,container_owner_count,container_element_count,confidence,provenance"
-    );
     for object in &runtime_objects {
+        let mut record = RevdmpRecord::default();
         let type_names = object.type_names.join(";");
-        let _ = writeln!(
-            text,
-            "{},0x{:X},0x{:X},0x{:X},0x{:X},{},{},{},{},{},{},{},{},{},{},{}",
-            object.id,
-            object.heap_addr,
-            object.stub_rva,
-            object.stub_va,
-            object.stub_size,
-            object.vfptr_offsets.len(),
-            join_hex_u32(&object.vfptr_offsets),
-            join_hex_u32(&object.vtable_rvas),
-            type_names,
-            join_hex_u32(&object.root_rvas),
-            object.incoming_edges,
-            object.outgoing_edges,
-            object.container_owner_count,
-            object.container_element_count,
-            object.confidence,
-            object.provenance,
-        );
+        record.u32(out.string(&object.id));
+        record.u64(object.heap_addr);
+        record.u32(object.stub_rva);
+        record.u64(object.stub_va);
+        record.u32(object.stub_size as u32);
+        record.u32(object.vfptr_offsets.len() as u32);
+        record.u32(out.string(&join_hex_u32(&object.vfptr_offsets)));
+        record.u32(out.string(&join_hex_u32(&object.vtable_rvas)));
+        record.u32(out.string(&type_names));
+        record.u32(out.string(&join_hex_u32(&object.root_rvas)));
+        record.u32(object.incoming_edges as u32);
+        record.u32(object.outgoing_edges as u32);
+        record.u32(object.container_owner_count as u32);
+        record.u32(object.container_element_count as u32);
+        record.u32(out.string(object.confidence));
+        record.u32(out.string(object.provenance));
+        out.add_record(BLOCK_OBJECTS, record.finish());
     }
-    let _ = writeln!(text);
-
-    let _ = writeln!(text, "REVDMP_VTABLE_FACTS v1");
-    let _ = writeln!(
-        text,
-        "source_rva,heap_addr,stub_rva,vfptr_offset,vtable_rva,vtable_va,type_name"
-    );
 
     for enriched in facts {
         let fact = &enriched.fact;
-        let source = fact
-            .source_rva
-            .map(|rva| format!("0x{rva:X}"))
-            .unwrap_or_else(|| "heap".to_string());
-        let _ = writeln!(
-            text,
-            "{},0x{:X},0x{:X},0x{:X},0x{:X},0x{:X},{}",
-            source,
-            fact.heap_addr,
-            fact.stub_rva,
-            fact.vfptr_offset,
-            fact.vtable_rva,
-            image_base + fact.vtable_rva as u64,
-            enriched.type_name.as_deref().unwrap_or(""),
-        );
+        let mut record = RevdmpRecord::default();
+        record.u32(opt_rva(fact.source_rva));
+        record.u64(fact.heap_addr);
+        record.u32(fact.stub_rva);
+        record.u32(fact.vfptr_offset);
+        record.u32(fact.vtable_rva);
+        record.u64(image_base + fact.vtable_rva as u64);
+        record.u32(out.string(enriched.type_name.as_deref().unwrap_or("")));
+        out.add_record(BLOCK_VTABLE_FACTS, record.finish());
     }
 
-    let _ = writeln!(text);
-    let _ = writeln!(text, "REVDMP_MSVC_RTTI v1");
-    let _ = writeln!(
-        text,
-        "vtable_rva,col_rva,object_offset,constructor_displacement,type_descriptor_rva,type_name,hierarchy_rva,hierarchy_attributes,base_count,bases"
-    );
     for rtti in msvc_rtti_by_vtable.values() {
-        let hierarchy_rva = rtti
-            .hierarchy_rva
-            .map(|rva| format!("0x{rva:X}"))
-            .unwrap_or_default();
-        let _ = writeln!(
-            text,
-            "0x{:X},0x{:X},0x{:X},0x{:X},0x{:X},{},{},0x{:X},{},{}",
-            rtti.vtable_rva,
-            rtti.col_rva,
-            rtti.object_offset,
-            rtti.constructor_displacement,
-            rtti.type_descriptor_rva,
-            rtti.type_name,
-            hierarchy_rva,
-            rtti.hierarchy_attributes,
-            rtti.base_classes.len(),
-            format_msvc_base_classes(&rtti.base_classes),
-        );
+        let mut record = RevdmpRecord::default();
+        record.u32(rtti.vtable_rva);
+        record.u32(rtti.col_rva);
+        record.u32(rtti.object_offset);
+        record.u32(rtti.constructor_displacement);
+        record.u32(rtti.type_descriptor_rva);
+        record.u32(out.string(&rtti.type_name));
+        record.u32(opt_rva(rtti.hierarchy_rva));
+        record.u32(rtti.hierarchy_attributes);
+        record.u32(rtti.base_classes.len() as u32);
+        out.add_record(BLOCK_MSVC_RTTI, record.finish());
+
+        for base in &rtti.base_classes {
+            let mut base_record = RevdmpRecord::default();
+            base_record.u32(rtti.vtable_rva);
+            base_record.u32(out.string(&base.type_name));
+            base_record.u32(base.type_descriptor_rva);
+            base_record.u32(base.num_contained_bases);
+            base_record.i32(base.mdisp);
+            base_record.i32(base.pdisp);
+            base_record.i32(base.vdisp);
+            base_record.u32(base.attributes);
+            out.add_record(BLOCK_MSVC_BASE_CLASSES, base_record.finish());
+        }
     }
 
-    let _ = writeln!(text);
-    let _ = writeln!(text, "REVDMP_VTABLE_SLOTS v1");
-    let _ = writeln!(
-        text,
-        "vtable_rva,type_name,slot_index,slot_offset,entry_rva,entry_va,normalized_target_rva,normalized_target_va,slot_kind,target_kind,function_symbol,confidence,reason"
-    );
     for slot in vtable_slots {
-        let _ = writeln!(
-            text,
-            "0x{:X},{},{},0x{:X},0x{:X},0x{:X},0x{:X},0x{:X},{},{},{},{},{}",
-            slot.vtable_rva,
-            slot.type_name.as_deref().unwrap_or(""),
-            slot.slot_index,
-            slot.slot_offset,
-            slot.entry_rva,
-            slot.entry_va,
-            slot.normalized_target_rva,
-            slot.normalized_target_va,
-            slot.slot_kind,
-            slot.target_kind,
-            slot.function_symbol,
-            slot.confidence,
-            slot.reason,
-        );
+        let mut record = RevdmpRecord::default();
+        record.u32(slot.vtable_rva);
+        record.u32(out.string(slot.type_name.as_deref().unwrap_or("")));
+        record.u32(slot.slot_index as u32);
+        record.u32(slot.slot_offset);
+        record.u32(slot.entry_rva);
+        record.u64(slot.entry_va);
+        record.u32(slot.normalized_target_rva);
+        record.u64(slot.normalized_target_va);
+        record.u32(out.string(slot.slot_kind));
+        record.u32(out.string(slot.target_kind));
+        record.u32(out.string(&slot.function_symbol));
+        record.u32(out.string(slot.confidence));
+        record.u32(out.string(slot.reason));
+        out.add_record(BLOCK_VTABLE_SLOTS, record.finish());
     }
 
-    let _ = writeln!(text);
-    let _ = writeln!(text, "REVDMP_THUNK_NORMALIZATIONS v1");
-    let _ = writeln!(
-        text,
-        "thunk_rva,thunk_va,normalized_target_rva,normalized_target_va,thunk_kind,instruction_len,this_adjustment,confidence,reason"
-    );
     for thunk in thunk_normalizations {
-        let this_adjustment = thunk
-            .this_adjustment
-            .map(|adjustment| adjustment.to_string())
-            .unwrap_or_default();
-        let _ = writeln!(
-            text,
-            "0x{:X},0x{:X},0x{:X},0x{:X},{},0x{:X},{},{},{}",
-            thunk.thunk_rva,
-            thunk.thunk_va,
-            thunk.normalized_target_rva,
-            thunk.normalized_target_va,
-            thunk.thunk_kind,
-            thunk.instruction_len,
-            this_adjustment,
-            thunk.confidence,
-            thunk.reason,
-        );
+        let mut record = RevdmpRecord::default();
+        record.u32(thunk.thunk_rva);
+        record.u64(thunk.thunk_va);
+        record.u32(thunk.normalized_target_rva);
+        record.u64(thunk.normalized_target_va);
+        record.u32(out.string(thunk.thunk_kind));
+        record.u32(thunk.instruction_len as u32);
+        record.i32(thunk.this_adjustment.unwrap_or_default());
+        record.u8(bool_byte(thunk.this_adjustment.is_some()));
+        record.pad(3);
+        record.u32(out.string(thunk.confidence));
+        record.u32(out.string(thunk.reason));
+        out.add_record(BLOCK_THUNK_NORMALIZATIONS, record.finish());
     }
 
-    let _ = writeln!(text);
-    let _ = writeln!(text, "REVDMP_CFG_FUNCTIONS v1");
-    let _ = writeln!(
-        text,
-        "table_rva,entry_index,entry_rva,raw_entry,target_rva,target_va,suppressed,export_suppressed,guard_flags,confidence,reason"
-    );
     for cfg in cfg_functions {
-        let _ = writeln!(
-            text,
-            "0x{:X},{},0x{:X},0x{:X},0x{:X},0x{:X},{},{},0x{:X},{},{}",
-            cfg.table_rva,
-            cfg.entry_index,
-            cfg.entry_rva,
-            cfg.raw_entry,
-            cfg.target_rva,
-            cfg.target_va,
-            cfg.suppressed,
-            cfg.export_suppressed,
-            cfg.guard_flags,
-            cfg.confidence,
-            cfg.reason,
-        );
+        let mut record = RevdmpRecord::default();
+        record.u32(cfg.table_rva);
+        record.u32(cfg.entry_index as u32);
+        record.u32(cfg.entry_rva);
+        record.u32(cfg.raw_entry);
+        record.u32(cfg.target_rva);
+        record.u64(cfg.target_va);
+        record.u8(bool_byte(cfg.suppressed));
+        record.u8(bool_byte(cfg.export_suppressed));
+        record.pad(2);
+        record.u32(cfg.guard_flags);
+        record.u32(out.string(cfg.confidence));
+        record.u32(out.string(cfg.reason));
+        out.add_record(BLOCK_CFG_FUNCTIONS, record.finish());
     }
 
-    let _ = writeln!(text);
-    let _ = writeln!(text, "REVDMP_EXCEPTION_FUNCTIONS v1");
-    let _ = writeln!(
-        text,
-        "entry_rva,begin_rva,end_rva,unwind_info_rva,unwind_flags,unwind_flag_names,prolog_size,unwind_code_count,frame_register,frame_offset,handler_rva,handler_va,chained_begin_rva,chained_end_rva,chained_unwind_info_rva,confidence,reason"
-    );
     for function in exception_functions {
-        let handler_rva = function
-            .handler_rva
-            .map(|rva| format!("0x{rva:X}"))
-            .unwrap_or_default();
-        let handler_va = function
-            .handler_va
-            .map(|va| format!("0x{va:X}"))
-            .unwrap_or_default();
-        let chained_begin_rva = function
-            .chained_begin_rva
-            .map(|rva| format!("0x{rva:X}"))
-            .unwrap_or_default();
-        let chained_end_rva = function
-            .chained_end_rva
-            .map(|rva| format!("0x{rva:X}"))
-            .unwrap_or_default();
-        let chained_unwind_info_rva = function
-            .chained_unwind_info_rva
-            .map(|rva| format!("0x{rva:X}"))
-            .unwrap_or_default();
-        let _ = writeln!(
-            text,
-            "0x{:X},0x{:X},0x{:X},0x{:X},0x{:X},{},0x{:X},0x{:X},0x{:X},0x{:X},{},{},{},{},{},{},{}",
-            function.entry_rva,
-            function.begin_rva,
-            function.end_rva,
-            function.unwind_info_rva,
-            function.unwind_flags,
-            function.unwind_flag_names,
-            function.prolog_size,
-            function.unwind_code_count,
-            function.frame_register,
-            function.frame_offset,
-            handler_rva,
-            handler_va,
-            chained_begin_rva,
-            chained_end_rva,
-            chained_unwind_info_rva,
-            function.confidence,
-            function.reason,
-        );
+        let mut record = RevdmpRecord::default();
+        record.u32(function.entry_rva);
+        record.u32(function.begin_rva);
+        record.u32(function.end_rva);
+        record.u32(function.unwind_info_rva);
+        record.u8(function.unwind_flags);
+        record.u8(function.prolog_size);
+        record.u8(function.unwind_code_count);
+        record.u8(function.frame_register);
+        record.u8(function.frame_offset);
+        record.u8(bool_byte(function.handler_rva.is_some()));
+        record.u8(bool_byte(function.chained_begin_rva.is_some()));
+        record.pad(1);
+        record.u32(opt_rva(function.handler_rva));
+        record.u64(opt_va(function.handler_va));
+        record.u32(opt_rva(function.chained_begin_rva));
+        record.u32(opt_rva(function.chained_end_rva));
+        record.u32(opt_rva(function.chained_unwind_info_rva));
+        record.u32(out.string(&function.unwind_flag_names));
+        record.u32(out.string(function.confidence));
+        record.u32(out.string(function.reason));
+        out.add_record(BLOCK_EXCEPTION_FUNCTIONS, record.finish());
     }
 
-    let _ = writeln!(text);
-    let _ = writeln!(text, "REVDMP_OBJECT_GRAPH v1");
-    let _ = writeln!(
-        text,
-        "source_kind,source_rva,source_heap_addr,source_stub_rva,field_offset,target_heap_addr,target_stub_rva,confidence,reason,target_has_vtable"
-    );
     for &(source_rva, target_heap_addr) in heap_ptr_locs {
         let target_heap_addr = strip_pointer_tags(target_heap_addr);
         let target_stub = stub_generator.get_stub(target_heap_addr).map(|s| s.new_rva);
@@ -1317,18 +1378,15 @@ pub fn build_revdmp_metadata(
         } else {
             ("low", "raw_heap_pointer", false)
         };
-        let _ = writeln!(
-            text,
-            "global,0x{:X},,,0x0,0x{:X},{},{},{},{}",
-            source_rva,
-            target_heap_addr,
-            target_stub
-                .map(|rva| format!("0x{rva:X}"))
-                .unwrap_or_default(),
-            confidence,
-            reason,
-            target_has_vtable,
-        );
+        let mut record = RevdmpRecord::default();
+        record.u32(source_rva);
+        record.u64(target_heap_addr);
+        record.u32(opt_rva(target_stub));
+        record.u8(bool_byte(target_has_vtable));
+        record.pad(3);
+        record.u32(out.string(confidence));
+        record.u32(out.string(reason));
+        out.add_record(BLOCK_GLOBAL_POINTERS, record.finish());
     }
     for edge in heap_edges {
         let source_stub = stub_generator
@@ -1337,76 +1395,52 @@ pub fn build_revdmp_metadata(
         let target_stub = stub_generator
             .get_stub(edge.target_heap_addr)
             .map(|s| s.new_rva);
-        let _ = writeln!(
-            text,
-            "heap,,0x{:X},{},0x{:X},0x{:X},{},{},{},{}",
-            edge.source_heap_addr,
-            source_stub
-                .map(|rva| format!("0x{rva:X}"))
-                .unwrap_or_default(),
-            edge.field_offset,
-            edge.target_heap_addr,
-            target_stub
-                .map(|rva| format!("0x{rva:X}"))
-                .unwrap_or_default(),
-            edge.confidence.as_str(),
-            edge.reason,
-            edge.target_has_vtable,
-        );
+        let mut record = RevdmpRecord::default();
+        record.u64(edge.source_heap_addr);
+        record.u32(opt_rva(source_stub));
+        record.u32(edge.field_offset);
+        record.u64(edge.target_heap_addr);
+        record.u32(opt_rva(target_stub));
+        record.u8(bool_byte(edge.target_has_vtable));
+        record.pad(3);
+        record.u32(out.string(edge.confidence.as_str()));
+        record.u32(out.string(edge.reason));
+        out.add_record(BLOCK_HEAP_EDGES, record.finish());
     }
 
-    let _ = writeln!(text);
-    let _ = writeln!(text, "REVDMP_CONTAINERS v1");
-    let _ = writeln!(
-        text,
-        "source_heap_addr,source_stub_rva,field_offset,kind,element_count,target_heap_addrs"
-    );
     for container in containers {
         let source_stub = stub_generator
             .get_stub(container.source_heap_addr)
             .map(|s| s.new_rva);
-        let targets = container
-            .targets
-            .iter()
-            .map(|addr| format!("0x{addr:X}"))
-            .collect::<Vec<_>>()
-            .join(";");
-        let _ = writeln!(
-            text,
-            "0x{:X},{},0x{:X},{},{},{}",
-            container.source_heap_addr,
-            source_stub
-                .map(|rva| format!("0x{rva:X}"))
-                .unwrap_or_default(),
-            container.field_offset,
-            container.kind,
-            container.element_count,
-            targets,
-        );
+        let mut record = RevdmpRecord::default();
+        record.u64(container.source_heap_addr);
+        record.u32(opt_rva(source_stub));
+        record.u32(container.field_offset);
+        record.u32(out.string(container.kind));
+        record.u32(container.element_count as u32);
+        record.u32(out.string(&joined_u64(&container.targets)));
+        out.add_record(BLOCK_CONTAINERS, record.finish());
     }
 
-    let _ = writeln!(text);
-    let _ = writeln!(text, "REVDMP_FIELD_TYPES v1");
-    let _ = writeln!(
-        text,
-        "owner_id,owner_heap_addr,owner_stub_rva,field_offset,field_kind,target_kind,target_id,target_type_names,evidence_count,confidence,reason"
-    );
     for enriched in facts {
         let fact = &enriched.fact;
         let owner_id = object_ids
             .get(&fact.heap_addr)
             .cloned()
             .unwrap_or_else(|| runtime_object_id(fact.stub_rva));
-        let _ = writeln!(
-            text,
-            "{},0x{:X},0x{:X},0x{:X},vfptr,vtable,vtable_{:08X},{},1,high,vfptr_points_to_module_vtable",
-            owner_id,
-            fact.heap_addr,
-            fact.stub_rva,
-            fact.vfptr_offset,
-            fact.vtable_rva,
-            enriched.type_name.as_deref().unwrap_or(""),
-        );
+        let mut record = RevdmpRecord::default();
+        record.u32(out.string(&owner_id));
+        record.u64(fact.heap_addr);
+        record.u32(fact.stub_rva);
+        record.u32(fact.vfptr_offset);
+        record.u32(out.string("vfptr"));
+        record.u32(out.string("vtable"));
+        record.u32(out.string(&format!("vtable_{:08X}", fact.vtable_rva)));
+        record.u32(out.string(enriched.type_name.as_deref().unwrap_or("")));
+        record.u32(1);
+        record.u32(out.string("high"));
+        record.u32(out.string("vfptr_points_to_module_vtable"));
+        out.add_record(BLOCK_FIELD_TYPES, record.finish());
     }
     for edge in heap_edges {
         let source_stub = stub_generator
@@ -1421,20 +1455,19 @@ pub fn build_revdmp_metadata(
             .cloned()
             .unwrap_or_else(|| format!("heap_{:016X}", edge.target_heap_addr));
         let target_type_names = join_type_names(type_names_by_heap.get(&edge.target_heap_addr));
-        let _ = writeln!(
-            text,
-            "{},0x{:X},{},0x{:X},object_pointer,heap_object,{},{},1,{},{}",
-            owner_id,
-            edge.source_heap_addr,
-            source_stub
-                .map(|rva| format!("0x{rva:X}"))
-                .unwrap_or_default(),
-            edge.field_offset,
-            target_id,
-            target_type_names,
-            edge.confidence.as_str(),
-            edge.reason,
-        );
+        let mut record = RevdmpRecord::default();
+        record.u32(out.string(&owner_id));
+        record.u64(edge.source_heap_addr);
+        record.u32(opt_rva(source_stub));
+        record.u32(edge.field_offset);
+        record.u32(out.string("object_pointer"));
+        record.u32(out.string("heap_object"));
+        record.u32(out.string(&target_id));
+        record.u32(out.string(&target_type_names));
+        record.u32(1);
+        record.u32(out.string(edge.confidence.as_str()));
+        record.u32(out.string(edge.reason));
+        out.add_record(BLOCK_FIELD_TYPES, record.finish());
     }
     for container in containers {
         let source_stub = stub_generator
@@ -1464,28 +1497,21 @@ pub fn build_revdmp_metadata(
             .into_iter()
             .collect::<Vec<_>>()
             .join(";");
-        let _ = writeln!(
-            text,
-            "{},0x{:X},{},0x{:X},{},heap_object_set,{},{},{},high,container_shape_analysis",
-            owner_id,
-            container.source_heap_addr,
-            source_stub
-                .map(|rva| format!("0x{rva:X}"))
-                .unwrap_or_default(),
-            container.field_offset,
-            container.kind,
-            target_ids,
-            target_type_names,
-            container.element_count,
-        );
+        let mut record = RevdmpRecord::default();
+        record.u32(out.string(&owner_id));
+        record.u64(container.source_heap_addr);
+        record.u32(opt_rva(source_stub));
+        record.u32(container.field_offset);
+        record.u32(out.string(container.kind));
+        record.u32(out.string("heap_object_set"));
+        record.u32(out.string(&target_ids));
+        record.u32(out.string(&target_type_names));
+        record.u32(container.element_count as u32);
+        record.u32(out.string("high"));
+        record.u32(out.string("container_shape_analysis"));
+        out.add_record(BLOCK_FIELD_TYPES, record.finish());
     }
 
-    let _ = writeln!(text);
-    let _ = writeln!(text, "REVDMP_CONTAINER_ELEMENTS v1");
-    let _ = writeln!(
-        text,
-        "container_id,owner_id,owner_heap_addr,field_offset,kind,element_index,target_heap_addr,target_id,target_type_names,confidence,reason"
-    );
     for container in containers {
         let owner_id = object_ids
             .get(&container.source_heap_addr)
@@ -1501,383 +1527,82 @@ pub fn build_revdmp_metadata(
                 .cloned()
                 .unwrap_or_else(|| format!("heap_{target:016X}"));
             let target_type_names = join_type_names(type_names_by_heap.get(target));
-            let _ = writeln!(
-                text,
-                "{},{},0x{:X},0x{:X},{},{},0x{:X},{},{},high,container_element_has_vtable",
-                container_id,
-                owner_id,
-                container.source_heap_addr,
-                container.field_offset,
-                container.kind,
-                idx,
-                target,
-                target_id,
-                target_type_names,
-            );
+            let mut record = RevdmpRecord::default();
+            record.u32(out.string(&container_id));
+            record.u32(out.string(&owner_id));
+            record.u64(container.source_heap_addr);
+            record.u32(container.field_offset);
+            record.u32(out.string(container.kind));
+            record.u32(idx as u32);
+            record.u64(*target);
+            record.u32(out.string(&target_id));
+            record.u32(out.string(&target_type_names));
+            record.u32(out.string("high"));
+            record.u32(out.string("container_element_has_vtable"));
+            out.add_record(BLOCK_CONTAINER_ELEMENTS, record.finish());
         }
     }
 
-    let _ = writeln!(text);
-    let _ = writeln!(text, "REVDMP_INDIRECT_CALLS v1");
-    let _ = writeln!(
-        text,
-        "instruction_rva,instruction_len,kind,global_rva,target_rva,target_va,via_register,confidence,reason"
-    );
     for call in indirect_calls {
-        let _ = writeln!(
-            text,
-            "0x{:X},0x{:X},{},0x{:X},0x{:X},0x{:X},{},{},{}",
-            call.instruction_rva,
-            call.instruction_len,
-            indirect_call_kind_name(call.kind),
-            call.global_rva,
-            call.target_rva,
-            call.target_va,
-            call.via_register,
-            call.confidence,
-            call.reason,
-        );
+        let mut record = RevdmpRecord::default();
+        record.u32(call.instruction_rva);
+        record.u32(call.instruction_len as u32);
+        record.u32(out.string(indirect_call_kind_name(call.kind)));
+        record.u32(call.global_rva);
+        record.u32(call.target_rva);
+        record.u64(call.target_va);
+        record.u8(bool_byte(call.via_register));
+        record.pad(3);
+        record.u32(out.string(call.confidence));
+        record.u32(out.string(call.reason));
+        out.add_record(BLOCK_INDIRECT_CALLS, record.finish());
     }
 
-    let _ = writeln!(text);
-    let _ = writeln!(text, "REVDMP_FUNCTION_POINTERS v1");
-    let _ = writeln!(
-        text,
-        "location_rva,location_va,section,kind,table_id,index,target_rva,target_va,confidence,reason"
-    );
     for pointer in function_pointers {
-        let table_id = pointer.table_id.as_deref().unwrap_or("");
-        let index = pointer.index.map(|idx| idx.to_string()).unwrap_or_default();
-        let _ = writeln!(
-            text,
-            "0x{:X},0x{:X},{},{},{},{},0x{:X},0x{:X},{},{}",
-            pointer.location_rva,
-            pointer.location_va,
-            pointer.section_name,
-            pointer.kind,
-            table_id,
-            index,
-            pointer.target_rva,
-            pointer.target_va,
-            pointer.confidence,
-            pointer.reason,
-        );
+        let mut record = RevdmpRecord::default();
+        record.u32(pointer.location_rva);
+        record.u64(pointer.location_va);
+        record.u32(out.string(&pointer.section_name));
+        record.u32(out.string(pointer.kind));
+        record.u32(out.string(pointer.table_id.as_deref().unwrap_or("")));
+        record.u32(pointer.index.map(|idx| idx as u32).unwrap_or(REVDMP_NONE_U32));
+        record.u32(pointer.target_rva);
+        record.u64(pointer.target_va);
+        record.u32(out.string(pointer.confidence));
+        record.u32(out.string(pointer.reason));
+        out.add_record(BLOCK_FUNCTION_POINTERS, record.finish());
     }
 
-    let _ = writeln!(text);
-    let _ = writeln!(text, "REVDMP_FUNCTION_POINTER_TABLES v1");
-    let _ = writeln!(
-        text,
-        "table_id,start_rva,start_va,section,entry_count,target_rvas,confidence,reason"
-    );
     for table in function_pointer_tables {
-        let _ = writeln!(
-            text,
-            "{},0x{:X},0x{:X},{},{},{},{},{}",
-            table.id,
-            table.start_rva,
-            table.start_va,
-            table.section_name,
-            table.entry_count,
-            join_hex_u32(&table.target_rvas),
-            table.confidence,
-            table.reason,
-        );
+        let mut record = RevdmpRecord::default();
+        record.u32(out.string(&table.id));
+        record.u32(table.start_rva);
+        record.u64(table.start_va);
+        record.u32(out.string(&table.section_name));
+        record.u32(table.entry_count as u32);
+        record.u32(out.string(&join_hex_u32(&table.target_rvas)));
+        record.u32(out.string(table.confidence));
+        record.u32(out.string(table.reason));
+        out.add_record(BLOCK_FUNCTION_POINTER_TABLES, record.finish());
     }
 
-    let _ = writeln!(text);
-    let _ = writeln!(text, "REVDMP_RUNTIME_RELATIONSHIPS v3");
-    let _ = writeln!(
-        text,
-        "id,kind,source_id,target_id,source_kind,source_rva,source_heap_addr,source_stub_rva,source_offset,target_kind,target_rva,target_va,target_heap_addr,target_stub_rva,confidence,reason,provenance"
-    );
-    let mut relationship_id = 0usize;
-    for enriched in facts {
-        let fact = &enriched.fact;
-        relationship_id += 1;
-        let provenance = fact
-            .source_rva
-            .map(|rva| format!("global:0x{rva:X}"))
-            .unwrap_or_else(|| "heap_recursive".to_string());
-        let _ = writeln!(
-            text,
-            "{},vfptr_to_vtable,{},vtable_{:08X},stub_vfptr,,0x{:X},0x{:X},0x{:X},vtable,0x{:X},0x{:X},,,high,vfptr_points_to_module_vtable,{}",
-            relationship_id,
-            object_ids
-                .get(&fact.heap_addr)
-                .cloned()
-                .unwrap_or_else(|| runtime_object_id(fact.stub_rva)),
-            fact.vtable_rva,
-            fact.heap_addr,
-            fact.stub_rva,
-            fact.vfptr_offset,
-            fact.vtable_rva,
-            image_base + fact.vtable_rva as u64,
-            provenance,
-        );
-    }
-    for &(source_rva, target_heap_addr) in heap_ptr_locs {
-        let target_heap_addr = strip_pointer_tags(target_heap_addr);
-        let target_stub = stub_generator.get_stub(target_heap_addr).map(|s| s.new_rva);
-        relationship_id += 1;
-        let (confidence, reason) = if target_stub.is_some() {
-            ("high", "global_targets_vtable_object")
-        } else {
-            ("low", "global_targets_heap_pointer")
-        };
-        let _ = writeln!(
-            text,
-            "{},global_to_heap_object,global_{:08X},{},global,0x{:X},,,0x0,heap_object,,,0x{:X},{},{},{},module_pointer_scan",
-            relationship_id,
-            source_rva,
-            target_stub
-                .map(runtime_object_id)
-                .unwrap_or_else(|| format!("heap_{target_heap_addr:016X}")),
-            source_rva,
-            target_heap_addr,
-            target_stub
-                .map(|rva| format!("0x{rva:X}"))
-                .unwrap_or_default(),
-            confidence,
-            reason,
-        );
-    }
-    for edge in heap_edges {
-        let source_stub = stub_generator
-            .get_stub(edge.source_heap_addr)
-            .map(|s| s.new_rva);
-        let target_stub = stub_generator
-            .get_stub(edge.target_heap_addr)
-            .map(|s| s.new_rva);
-        relationship_id += 1;
-        let _ = writeln!(
-            text,
-            "{},heap_field_to_heap_object,{},{},heap_object,,0x{:X},{},0x{:X},heap_object,,,0x{:X},{},{},{},recursive_heap_scan",
-            relationship_id,
-            object_ids
-                .get(&edge.source_heap_addr)
-                .cloned()
-                .unwrap_or_else(|| format!("heap_{:016X}", edge.source_heap_addr)),
-            object_ids
-                .get(&edge.target_heap_addr)
-                .cloned()
-                .unwrap_or_else(|| format!("heap_{:016X}", edge.target_heap_addr)),
-            edge.source_heap_addr,
-            source_stub
-                .map(|rva| format!("0x{rva:X}"))
-                .unwrap_or_default(),
-            edge.field_offset,
-            edge.target_heap_addr,
-            target_stub
-                .map(|rva| format!("0x{rva:X}"))
-                .unwrap_or_default(),
-            edge.confidence.as_str(),
-            edge.reason,
-        );
-    }
-    for container in containers {
-        let source_stub = stub_generator
-            .get_stub(container.source_heap_addr)
-            .map(|s| s.new_rva);
-        let target_heap_addrs = container
-            .targets
-            .iter()
-            .map(|addr| format!("0x{addr:X}"))
-            .collect::<Vec<_>>()
-            .join(";");
-        let target_stub_rvas = container
-            .targets
-            .iter()
-            .filter_map(|addr| {
-                stub_generator
-                    .get_stub(*addr)
-                    .map(|stub| format!("0x{:X}", stub.new_rva))
-            })
-            .collect::<Vec<_>>()
-            .join(";");
-        let target_object_ids = container
-            .targets
-            .iter()
-            .map(|addr| {
-                object_ids
-                    .get(addr)
-                    .cloned()
-                    .unwrap_or_else(|| format!("heap_{addr:016X}"))
-            })
-            .collect::<Vec<_>>()
-            .join(";");
-        relationship_id += 1;
-        let _ = writeln!(
-            text,
-            "{},container_to_heap_objects,{},{},heap_container,,0x{:X},{},0x{:X},heap_object_set,,,{},{},high,{},container_shape_analysis",
-            relationship_id,
-            object_ids
-                .get(&container.source_heap_addr)
-                .cloned()
-                .unwrap_or_else(|| format!("heap_{:016X}", container.source_heap_addr)),
-            target_object_ids,
-            container.source_heap_addr,
-            source_stub
-                .map(|rva| format!("0x{rva:X}"))
-                .unwrap_or_default(),
-            container.field_offset,
-            target_heap_addrs,
-            target_stub_rvas,
-            container.kind,
-        );
-    }
-    for call in indirect_calls {
-        relationship_id += 1;
-        let _ = writeln!(
-            text,
-            "{},global_indirect_call,call_{:08X},func_{:08X},instruction,0x{:X},,,0x{:X},function,0x{:X},0x{:X},,,{},{},global_function_pointer_resolution",
-            relationship_id,
-            call.instruction_rva,
-            call.target_rva,
-            call.instruction_rva,
-            call.global_rva,
-            call.target_rva,
-            call.target_va,
-            call.confidence,
-            call.reason,
-        );
-    }
-    for pointer in function_pointers {
-        relationship_id += 1;
-        let _ = writeln!(
-            text,
-            "{},function_pointer_slot,fptr_{:08X},func_{:08X},data_pointer,0x{:X},,,{},function,0x{:X},0x{:X},,,{},{},function_pointer_scan",
-            relationship_id,
-            pointer.location_rva,
-            pointer.target_rva,
-            pointer.location_rva,
-            pointer.index
-                .map(|idx| idx.to_string())
-                .unwrap_or_default(),
-            pointer.target_rva,
-            pointer.target_va,
-            pointer.confidence,
-            pointer.reason,
-        );
-    }
-    for slot in vtable_slots {
-        relationship_id += 1;
-        let slot_rva = slot.vtable_rva.saturating_add(slot.slot_offset);
-        let _ = writeln!(
-            text,
-            "{},vtable_slot_to_function,vslot_{:08X}_{:03},func_{:08X},vtable_slot,0x{:X},,,0x{:X},function,0x{:X},0x{:X},,,{},{},vtable_slot_analysis",
-            relationship_id,
-            slot.vtable_rva,
-            slot.slot_index,
-            slot.normalized_target_rva,
-            slot_rva,
-            slot.slot_offset,
-            slot.normalized_target_rva,
-            slot.normalized_target_va,
-            slot.confidence,
-            slot.reason,
-        );
-    }
-    for thunk in thunk_normalizations {
-        relationship_id += 1;
-        let _ = writeln!(
-            text,
-            "{},thunk_to_function,thunk_{:08X},func_{:08X},thunk,0x{:X},,,0x0,function,0x{:X},0x{:X},,,{},{},thunk_normalization",
-            relationship_id,
-            thunk.thunk_rva,
-            thunk.normalized_target_rva,
-            thunk.thunk_rva,
-            thunk.normalized_target_rva,
-            thunk.normalized_target_va,
-            thunk.confidence,
-            thunk.reason,
-        );
-    }
-    for cfg in cfg_functions {
-        relationship_id += 1;
-        let _ = writeln!(
-            text,
-            "{},cfg_valid_indirect_target,cfg_{:08X}_{:06},func_{:08X},cfg_table,0x{:X},,,0x{:X},function,0x{:X},0x{:X},,,{},{},pe_load_config",
-            relationship_id,
-            cfg.table_rva,
-            cfg.entry_index,
-            cfg.target_rva,
-            cfg.table_rva,
-            cfg.entry_index,
-            cfg.target_rva,
-            cfg.target_va,
-            cfg.confidence,
-            cfg.reason,
-        );
-    }
-    for function in exception_functions {
-        relationship_id += 1;
-        let _ = writeln!(
-            text,
-            "{},exception_function_unwind,func_{:08X},unwind_{:08X},function,0x{:X},,,0x0,unwind_info,0x{:X},,,,high,{},x64_exception_directory",
-            relationship_id,
-            function.begin_rva,
-            function.unwind_info_rva,
-            function.begin_rva,
-            function.unwind_info_rva,
-            function.reason,
-        );
-        if let (Some(handler_rva), Some(handler_va)) = (function.handler_rva, function.handler_va) {
-            relationship_id += 1;
-            let _ = writeln!(
-                text,
-                "{},exception_handler,func_{:08X},func_{:08X},function,0x{:X},,,0x0,function,0x{:X},0x{:X},,,high,{},x64_unwind_info",
-                relationship_id,
-                function.begin_rva,
-                handler_rva,
-                function.begin_rva,
-                handler_rva,
-                handler_va,
-                function.reason,
-            );
-        }
-    }
-    for rtti in msvc_rtti_by_vtable.values() {
-        for base in &rtti.base_classes {
-            if base.type_descriptor_rva == rtti.type_descriptor_rva {
-                continue;
-            }
-            relationship_id += 1;
-            let _ = writeln!(
-                text,
-                "{},msvc_inheritance,{},{},type,0x{:X},,,{},type,0x{:X},,,,high,msvc_base_class_descriptor,msvc_rtti",
-                relationship_id,
-                type_graph_id(&rtti.type_name),
-                type_graph_id(&base.type_name),
-                rtti.vtable_rva,
-                base.mdisp,
-                base.type_descriptor_rva,
-            );
-        }
-    }
-
-    let _ = writeln!(text);
-    let _ = writeln!(text, "REVDMP_SYNTHETIC_STRUCTS v1");
-    let _ = writeln!(text, "stub_rva,heap_addr,struct_name,size,vfptr_offsets");
     for stub in stub_generator.stubs() {
-        let offsets = stub
+        let vfptr_offsets = stub
             .vtable_refs
             .iter()
             .map(|r| format!("0x{:X}", r.offset))
             .collect::<Vec<_>>()
             .join(";");
-        let _ = writeln!(
-            text,
-            "0x{:X},0x{:X},{},0x{:X},{}",
-            stub.new_rva,
-            stub.original_addr,
-            synthetic_struct_name(stub.new_rva),
-            stub.size,
-            offsets,
-        );
+        let mut record = RevdmpRecord::default();
+        record.u32(stub.new_rva);
+        record.u64(stub.original_addr);
+        record.u32(out.string(&synthetic_struct_name(stub.new_rva)));
+        record.u32(stub.size as u32);
+        record.u32(out.string(&vfptr_offsets));
+        out.add_record(BLOCK_SYNTHETIC_STRUCTS, record.finish());
     }
 
-    text.into_bytes()
+    out.finish(image_base)
 }
 
 /// Build a COFF string table for output. If the original table is unavailable in
@@ -1933,69 +1658,6 @@ fn indirect_call_kind_name(kind: VcallKind) -> &'static str {
         VcallKind::GlobalIndirectCall => "call",
         VcallKind::GlobalIndirectJmp => "jmp",
         _ => "unknown",
-    }
-}
-
-fn type_graph_id(type_name: &str) -> String {
-    format!("type_{}", sanitize_ida_name(type_name))
-}
-
-fn format_msvc_base_classes(base_classes: &[MsvcBaseClassFact]) -> String {
-    base_classes
-        .iter()
-        .map(|base| {
-            format!(
-                "{}@td=0x{:X}:contained={}:mdisp={}:pdisp={}:vdisp={}:attrs=0x{:X}",
-                base.type_name,
-                base.type_descriptor_rva,
-                base.num_contained_bases,
-                base.mdisp,
-                base.pdisp,
-                base.vdisp,
-                base.attributes,
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(";")
-}
-
-fn ida_script_path(output_path: &Path) -> PathBuf {
-    let file_name = output_path
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_else(|| "dump.exe".to_string());
-    output_path.with_file_name(format!("{file_name}.ida.py"))
-}
-
-fn find_ida_executable() -> Option<String> {
-    if let Ok(path) = std::env::var("IDA_PATH") {
-        if !path.trim().is_empty() {
-            return Some(path);
-        }
-    }
-    for candidate in ["idat64", "ida64"] {
-        if Command::new(candidate).arg("-h").output().is_ok() {
-            return Some(candidate.to_string());
-        }
-    }
-    None
-}
-
-fn sanitize_ida_name(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    for ch in name.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' {
-            out.push(ch);
-        } else if ch == ':' {
-            out.push('_');
-        }
-    }
-    if out.is_empty() {
-        "unknown".to_string()
-    } else if out.as_bytes()[0].is_ascii_digit() {
-        format!("_{out}")
-    } else {
-        out
     }
 }
 
@@ -2394,204 +2056,6 @@ fn enrich_vtable_facts(
         .collect()
 }
 
-pub fn build_ida_script(
-    facts: &[EnrichedVtableFact],
-    heap_ptr_locs: &[(u32, u64)],
-    heap_edges: &[HeapPointerEdge],
-    containers: &[ContainerFact],
-    image_base: u64,
-    stub_generator: &StubGenerator,
-) -> String {
-    let mut script = String::new();
-    let _ = writeln!(
-        script,
-        "# Auto-generated by revdump. Load after opening the dumped PE in IDA."
-    );
-    let _ = writeln!(script, "import ida_bytes");
-    let _ = writeln!(script, "import ida_name");
-    let _ = writeln!(script, "import ida_offset");
-    let _ = writeln!(script, "import ida_struct");
-    let _ = writeln!(script, "import idc");
-    let _ = writeln!(script, "BADADDR = 0xFFFFFFFFFFFFFFFF");
-    let _ = writeln!(script, "revdump_selfcheck = []");
-    let _ = writeln!(
-        script,
-        "revdump_counts = {{'offsets': 0, 'names': 0, 'structs': 0, 'comments': 0}}"
-    );
-    let _ = writeln!(script, "def check(ok, text):");
-    let _ = writeln!(script, "    revdump_selfcheck.append((bool(ok), text))");
-    let _ = writeln!(script, "def qword_off(ea, target=0):");
-    let _ = writeln!(script, "    ida_bytes.create_qword(ea, 8)");
-    let _ = writeln!(script, "    ida_offset.op_plain_offset(ea, 0, 0)");
-    let _ = writeln!(script, "    revdump_counts['offsets'] += 1");
-    let _ = writeln!(script, "def set_name(ea, name):");
-    let _ = writeln!(
-        script,
-        "    if ida_name.set_name(ea, name, ida_name.SN_CHECK | ida_name.SN_FORCE) or ida_name.get_name(ea):"
-    );
-    let _ = writeln!(script, "        revdump_counts['names'] += 1");
-    let _ = writeln!(script, "def cmt(ea, text):");
-    let _ = writeln!(script, "    ida_bytes.set_cmt(ea, text, False)");
-    let _ = writeln!(script, "    if ida_bytes.get_cmt(ea, False):");
-    let _ = writeln!(script, "        revdump_counts['comments'] += 1");
-    let _ = writeln!(script, "def make_struct(name, members):");
-    let _ = writeln!(script, "    sid = ida_struct.get_struc_id(name)");
-    let _ = writeln!(script, "    if sid == BADADDR:");
-    let _ = writeln!(
-        script,
-        "        sid = ida_struct.add_struc(BADADDR, name, False)"
-    );
-    let _ = writeln!(script, "    sptr = ida_struct.get_struc(sid)");
-    let _ = writeln!(script, "    if sptr:");
-    let _ = writeln!(script, "        for off, mname in members:");
-    let _ = writeln!(script, "            ida_struct.add_struc_member(sptr, mname, off, ida_bytes.FF_QWORD | ida_bytes.FF_DATA, None, 8)");
-    let _ = writeln!(script, "        revdump_counts['structs'] += 1");
-    let _ = writeln!(script);
-
-    for stub in stub_generator.stubs() {
-        let struct_name = synthetic_struct_name(stub.new_rva);
-        let members = stub
-            .vtable_refs
-            .iter()
-            .map(|r| format!("(0x{:X}, 'vfptr_{:X}')", r.offset, r.offset))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let _ = writeln!(script, "make_struct('{}', [{}])", struct_name, members);
-        let _ = writeln!(
-            script,
-            "set_name(0x{:X}, '{}_instance')",
-            image_base + stub.new_rva as u64,
-            struct_name
-        );
-        let _ = writeln!(
-            script,
-            "cmt(0x{:X}, 'original heap object 0x{:X}, synthetic size 0x{:X}')",
-            image_base + stub.new_rva as u64,
-            stub.original_addr,
-            stub.size
-        );
-    }
-
-    for enriched in facts {
-        let fact = &enriched.fact;
-        let vfptr_va = image_base + fact.stub_rva as u64 + fact.vfptr_offset as u64;
-        let vtable_va = image_base + fact.vtable_rva as u64;
-        let type_suffix = enriched
-            .type_name
-            .as_deref()
-            .map(sanitize_ida_name)
-            .unwrap_or_else(|| format!("{:X}", fact.vtable_rva));
-        let _ = writeln!(script, "qword_off(0x{vfptr_va:X}, 0x{vtable_va:X})");
-        let _ = writeln!(
-            script,
-            "set_name(0x{vfptr_va:X}, 'vfptr_{}_off_{:X}')",
-            type_suffix, fact.vfptr_offset
-        );
-        let _ = writeln!(
-            script,
-            "set_name(0x{vtable_va:X}, 'vftable_{}')",
-            type_suffix
-        );
-        let _ = writeln!(
-            script,
-            "cmt(0x{vfptr_va:X}, 'vfptr -> vtable 0x{:X}; heap=0x{:X}; source={}')",
-            fact.vtable_rva,
-            fact.heap_addr,
-            fact.source_rva
-                .map(|rva| format!("0x{rva:X}"))
-                .unwrap_or_else(|| "heap-only".to_string())
-        );
-    }
-
-    for &(source_rva, heap_addr) in heap_ptr_locs {
-        let heap_addr = strip_pointer_tags(heap_addr);
-        let source_va = image_base + source_rva as u64;
-        if let Some(stub) = stub_generator.get_stub(heap_addr) {
-            let stub_va = image_base + stub.new_rva as u64;
-            let _ = writeln!(script, "qword_off(0x{source_va:X}, 0x{stub_va:X})");
-            let _ = writeln!(
-                script,
-                "cmt(0x{source_va:X}, 'revdump global -> stub 0x{:X}; original heap 0x{:X}')",
-                stub.new_rva, heap_addr
-            );
-        }
-    }
-
-    for edge in heap_edges {
-        if let (Some(source), Some(target)) = (
-            stub_generator.get_stub(edge.source_heap_addr),
-            stub_generator.get_stub(edge.target_heap_addr),
-        ) {
-            let field_va = image_base + source.new_rva as u64 + edge.field_offset as u64;
-            let target_va = image_base + target.new_rva as u64;
-            let _ = writeln!(
-                script,
-                "cmt(0x{field_va:X}, 'heap edge +0x{:X} -> stub 0x{:X} (heap 0x{:X}); confidence={}; reason={}')",
-                edge.field_offset,
-                target.new_rva,
-                edge.target_heap_addr,
-                edge.confidence.as_str(),
-                edge.reason,
-            );
-            let _ = writeln!(script, "qword_off(0x{field_va:X}, 0x{target_va:X})");
-        }
-    }
-
-    for container in containers {
-        if let Some(source) = stub_generator.get_stub(container.source_heap_addr) {
-            let field_va = image_base + source.new_rva as u64 + container.field_offset as u64;
-            let _ = writeln!(
-                script,
-                "cmt(0x{field_va:X}, 'container {}; elements={}; targets={}')",
-                container.kind,
-                container.element_count,
-                container
-                    .targets
-                    .iter()
-                    .map(|addr| format!("0x{addr:X}"))
-                    .collect::<Vec<_>>()
-                    .join(";")
-            );
-        }
-    }
-
-    let expected_structs = stub_generator.stub_count();
-    let expected_offsets = facts.len() + heap_ptr_locs.len() + heap_edges.len();
-    let expected_names = stub_generator.stub_count() + facts.len() * 2;
-    let expected_comments =
-        stub_generator.stub_count() + facts.len() + heap_ptr_locs.len() + heap_edges.len();
-    let _ = writeln!(
-        script,
-        "check(revdump_counts['structs'] >= {expected_structs}, 'expected structs applied')"
-    );
-    let _ = writeln!(
-        script,
-        "check(revdump_counts['offsets'] >= {expected_offsets}, 'expected offsets applied')"
-    );
-    let _ = writeln!(
-        script,
-        "check(revdump_counts['names'] >= {expected_names}, 'expected names applied')"
-    );
-    let _ = writeln!(
-        script,
-        "check(revdump_counts['comments'] >= {expected_comments}, 'expected comments applied')"
-    );
-    let _ = writeln!(
-        script,
-        "failed = [text for ok, text in revdump_selfcheck if not ok]"
-    );
-    let _ = writeln!(script, "if failed:");
-    let _ = writeln!(
-        script,
-        "    print('revdump IDA self-check failed: ' + '; '.join(failed))"
-    );
-    let _ = writeln!(script, "else:");
-    let _ = writeln!(script, "    print('revdump IDA self-check passed')");
-
-    let _ = writeln!(script, "print('revdump IDA annotations applied')");
-    script
-}
-
 /// Configuration for the dump operation.
 pub struct DumpConfig {
     /// Minimum valid pointer value.
@@ -2612,11 +2076,9 @@ pub struct DumpConfig {
     pub max_heap_scan_size: usize,
     /// Maximum recursive heap-pointer scan depth.
     pub recursive_heap_scan_depth: usize,
-    /// Emit IDAPython sidecar script.
-    pub emit_ida_script: bool,
     /// Emit `.revdmp` metadata section.
     pub emit_revdmp: bool,
-    /// Parse RTTI/type names for metadata and IDA annotations.
+    /// Parse RTTI/type names for metadata.
     pub parse_rtti: bool,
     /// Maximum heap graph edges to retain after scoring.
     pub max_graph_edges: usize,
@@ -2640,7 +2102,6 @@ impl std::fmt::Debug for DumpConfig {
             .field("devirt_config", &self.devirt_config)
             .field("max_heap_scan_size", &self.max_heap_scan_size)
             .field("recursive_heap_scan_depth", &self.recursive_heap_scan_depth)
-            .field("emit_ida_script", &self.emit_ida_script)
             .field("emit_revdmp", &self.emit_revdmp)
             .field("parse_rtti", &self.parse_rtti)
             .field("max_graph_edges", &self.max_graph_edges)
@@ -2663,7 +2124,6 @@ impl Default for DumpConfig {
             devirt_config: DevirtConfig::default(),
             max_heap_scan_size: 0x1000,
             recursive_heap_scan_depth: 2,
-            emit_ida_script: true,
             emit_revdmp: true,
             parse_rtti: true,
             max_graph_edges: 50_000,
@@ -2885,18 +2345,6 @@ impl Dumper {
         } else {
             Vec::new()
         };
-        let ida_script = if config.emit_ida_script {
-            Some(build_ida_script(
-                &enriched_facts,
-                &heap_ptr_locs,
-                stub_generator.heap_edges(),
-                stub_generator.containers(),
-                pe.image_base,
-                &stub_generator,
-            ))
-        } else {
-            None
-        };
         let metadata_section_va = PeParser::align_up(
             heap_section_va as usize + heap_section_size,
             pe.section_alignment as usize,
@@ -2945,9 +2393,6 @@ impl Dumper {
         report(&progress);
 
         self.write_output(output_path.as_ref(), &output)?;
-        if let Some(ida_script) = ida_script {
-            self.write_ida_script(output_path.as_ref(), &ida_script)?;
-        }
 
         progress.stage = ProgressStage::Complete;
         progress.current = progress.total;
@@ -3096,7 +2541,7 @@ impl Dumper {
         let heap_raw_offset = current_raw_offset as u32;
         current_raw_offset += heap_raw_size;
 
-        // Build metadata section data for IDA/Ghidra sidecar consumers.
+        // Build embedded binary metadata for native analysis consumers.
         let metadata_raw_size = if has_metadata {
             PeParser::align_up(metadata_data.len(), pe.file_alignment as usize)
         } else {
@@ -3545,30 +2990,6 @@ impl Dumper {
         Ok(())
     }
 
-    fn write_ida_script(&self, output_path: &Path, script: &str) -> Result<()> {
-        let script_path = ida_script_path(output_path);
-        let mut file =
-            File::create(&script_path).map_err(|e| Error::OutputCreationFailed(e.to_string()))?;
-        file.write_all(script.as_bytes())
-            .map_err(|e| Error::OutputWriteFailed(e.to_string()))?;
-        eprintln!("IDA script: {}", script_path.display());
-        if let Some(ida) = find_ida_executable() {
-            eprintln!(
-                "IDA smoke command: {} -A -S{} {}",
-                ida,
-                script_path.display(),
-                output_path.display()
-            );
-        } else {
-            eprintln!(
-                "IDA smoke command: idat64 -A -S{} {} (set IDA_PATH or add idat64/ida64 to PATH)",
-                script_path.display(),
-                output_path.display()
-            );
-        }
-        Ok(())
-    }
-
     /// Get module name.
     pub fn module_name(&self) -> &str {
         &self.module_name
@@ -3589,6 +3010,83 @@ impl Dumper {
 mod tests {
     use super::*;
     use crate::stub::{VtableRef, VtableStub};
+
+    struct ParsedRevdmp {
+        image_base: u64,
+        strings: Vec<u8>,
+        blocks: BTreeMap<u32, Vec<Vec<u8>>>,
+    }
+
+    impl ParsedRevdmp {
+        fn block(&self, kind: u32) -> &[Vec<u8>] {
+            self.blocks.get(&kind).map(Vec::as_slice).unwrap_or(&[])
+        }
+
+        fn string(&self, offset: u32) -> &str {
+            let offset = offset as usize;
+            let end = self.strings[offset..]
+                .iter()
+                .position(|&byte| byte == 0)
+                .map(|pos| offset + pos)
+                .unwrap();
+            std::str::from_utf8(&self.strings[offset..end]).unwrap()
+        }
+    }
+
+    fn read_u32(record: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(record[offset..offset + 4].try_into().unwrap())
+    }
+
+    fn read_u64(record: &[u8], offset: usize) -> u64 {
+        u64::from_le_bytes(record[offset..offset + 8].try_into().unwrap())
+    }
+
+    fn read_i32(record: &[u8], offset: usize) -> i32 {
+        i32::from_le_bytes(record[offset..offset + 4].try_into().unwrap())
+    }
+
+    fn parse_revdmp(data: &[u8]) -> ParsedRevdmp {
+        assert!(data.starts_with(REVDMP_BINARY_MAGIC));
+        let mut offset = REVDMP_BINARY_MAGIC.len();
+        assert_eq!(read_u32(data, offset), REVDMP_BINARY_VERSION);
+        offset += 4;
+        assert_eq!(read_u32(data, offset), REVDMP_ENDIAN_MARKER);
+        offset += 4;
+        let block_count = read_u32(data, offset) as usize;
+        offset += 4;
+        let string_len = read_u32(data, offset) as usize;
+        offset += 4;
+        let image_base = read_u64(data, offset);
+        offset += 8;
+
+        let mut blocks = BTreeMap::new();
+        for _ in 0..block_count {
+            let kind = read_u32(data, offset);
+            offset += 4;
+            let record_size = read_u32(data, offset) as usize;
+            offset += 4;
+            let count = read_u32(data, offset) as usize;
+            offset += 4;
+            let data_len = read_u32(data, offset) as usize;
+            offset += 4;
+            assert_eq!(data_len, record_size * count);
+
+            let mut records = Vec::with_capacity(count);
+            for record in data[offset..offset + data_len].chunks_exact(record_size) {
+                records.push(record.to_vec());
+            }
+            offset += data_len;
+            blocks.insert(kind, records);
+        }
+
+        let strings = data[offset..offset + string_len].to_vec();
+        assert_eq!(strings[0], 0);
+        ParsedRevdmp {
+            image_base,
+            strings,
+            blocks,
+        }
+    }
 
     #[test]
     fn test_dump_config_default() {
@@ -3795,77 +3293,165 @@ mod tests {
             0x1400_0000,
             &stub_generator,
         );
-        let text = String::from_utf8(metadata).unwrap();
-        assert!(text.contains("REVDMP_SCHEMA v3"));
-        assert!(text.contains("sidecar_required,false"));
-        assert!(text.contains("REVDMP_OBJECTS v1"));
-        assert!(text.contains(
-            "obj_00008000,0x10000000,0x8000,0x14008000,0x28,1,0x20,0x5000,AudioService,0x2000,0,1,1,0,rtti_confirmed,module_pointer_scan"
-        ));
-        assert!(text.contains("REVDMP_VTABLE_FACTS v1"));
-        assert!(text.contains("0x2000,0x10000000,0x8000,0x20,0x5000,0x14005000,AudioService"));
-        assert!(text.contains("heap,0x20000000,0x9000,0x0,0x7000,0x14007000,"));
-        assert!(text.contains("REVDMP_MSVC_RTTI v1"));
-        assert!(text.contains(
-            "0x5000,0x4800,0x0,0x0,0x4900,AudioService,0x4A00,0x3,1,IService@td=0x4B00:contained=1:mdisp=0:pdisp=-1:vdisp=0:attrs=0x40"
-        ));
-        assert!(text.contains("REVDMP_OBJECT_GRAPH v1"));
-        assert!(text.contains("global,0x2000,,,0x0,0x10000000,0x8000"));
-        assert!(text.contains("heap,,0x10000000,0x8000,0x18,0x20000000,"));
-        assert!(text.contains("REVDMP_CONTAINERS v1"));
-        assert!(text.contains("0x10000000,0x8000,0x30,vector_triple,1,0x20000000"));
-        assert!(text.contains("REVDMP_VTABLE_SLOTS v1"));
-        assert!(text.contains(
-            "0x5000,AudioService,0,0x0,0x7100,0x14007100,0x7200,0x14007200,adjustor_thunk,normalized_function,AudioService::tick,high,this_adjustment_then_jump"
-        ));
-        assert!(text.contains("REVDMP_THUNK_NORMALIZATIONS v1"));
-        assert!(text.contains(
-            "0x7100,0x14007100,0x7200,0x14007200,adjustor_thunk,0x9,-8,high,this_adjustment_then_jump"
-        ));
-        assert!(text.contains("REVDMP_CFG_FUNCTIONS v1"));
-        assert!(text.contains(
-            "0x7300,0,0x7300,0x7200,0x7200,0x14007200,false,false,0x500,high,pe_load_config_guard_cf_function_table"
-        ));
-        assert!(text.contains("REVDMP_EXCEPTION_FUNCTIONS v1"));
-        assert!(text.contains(
-            "0x7400,0x7200,0x7250,0x7500,0x1,EHANDLER,0x4,0x0,0x0,0x0,0x7600,0x14007600,,,,high,x64_unwind_info_with_handler"
-        ));
-        assert!(text.contains("REVDMP_FIELD_TYPES v1"));
-        assert!(text.contains(
-            "obj_00008000,0x10000000,0x8000,0x20,vfptr,vtable,vtable_00005000,AudioService,1,high,vfptr_points_to_module_vtable"
-        ));
-        assert!(text.contains(
-            "obj_00008000,0x10000000,0x8000,0x18,object_pointer,heap_object,obj_00009000,Mixer,1,low,raw_heap_pointer"
-        ));
-        assert!(text.contains(
-            "obj_00008000,0x10000000,0x8000,0x30,vector_triple,heap_object_set,obj_00009000,Mixer,1,high,container_shape_analysis"
-        ));
-        assert!(text.contains("REVDMP_CONTAINER_ELEMENTS v1"));
-        assert!(text.contains(
-            "container_0000000010000000_30,obj_00008000,0x10000000,0x30,vector_triple,0,0x20000000,obj_00009000,Mixer,high,container_element_has_vtable"
-        ));
-        assert!(text.contains("REVDMP_INDIRECT_CALLS v1"));
-        assert!(text.contains("0x1234,0x6,call,0x3000,0x4560,0x14004560,false,high"));
-        assert!(text.contains("REVDMP_FUNCTION_POINTERS v1"));
-        assert!(text.contains(
-            "0x6000,0x14006000,.rdata,callback_slot,,,0x4560,0x14004560,medium,isolated_code_pointer"
-        ));
-        assert!(text.contains("REVDMP_FUNCTION_POINTER_TABLES v1"));
-        assert!(text.contains(
-            "fptable_00006100,0x6100,0x14006100,.rdata,2,0x4560;0x4570,high,contiguous_code_pointer_run"
-        ));
-        assert!(text.contains("REVDMP_RUNTIME_RELATIONSHIPS v3"));
-        assert!(text.contains("vfptr_to_vtable,obj_00008000,vtable_00005000"));
-        assert!(text.contains("function_pointer_slot,fptr_00006000,func_00004560"));
-        assert!(text.contains("vtable_slot_to_function,vslot_00005000_000,func_00007200"));
-        assert!(text.contains("thunk_to_function,thunk_00007100,func_00007200"));
-        assert!(text.contains("cfg_valid_indirect_target,cfg_00007300_000000,func_00007200"));
-        assert!(text.contains("exception_handler,func_00007200,func_00007600"));
-        assert!(text.contains("msvc_inheritance,type_AudioService,type_IService"));
-        assert!(
-            text.contains("global_indirect_call,call_00001234,func_00004560,instruction,0x1234")
+        let parsed = parse_revdmp(&metadata);
+        assert_eq!(parsed.image_base, 0x1400_0000);
+
+        let objects = parsed.block(BLOCK_OBJECTS);
+        assert_eq!(objects.len(), 2);
+        assert_eq!(parsed.string(read_u32(&objects[0], 0)), "obj_00008000");
+        assert_eq!(read_u64(&objects[0], 4), 0x1000_0000);
+        assert_eq!(read_u32(&objects[0], 12), 0x8000);
+        assert_eq!(read_u64(&objects[0], 16), 0x1400_8000);
+        assert_eq!(read_u32(&objects[0], 24), 0x28);
+        assert_eq!(read_u32(&objects[0], 28), 1);
+        assert_eq!(parsed.string(read_u32(&objects[0], 32)), "0x20");
+        assert_eq!(parsed.string(read_u32(&objects[0], 36)), "0x5000");
+        assert_eq!(parsed.string(read_u32(&objects[0], 40)), "AudioService");
+        assert_eq!(parsed.string(read_u32(&objects[0], 44)), "0x2000");
+        assert_eq!(read_u32(&objects[0], 52), 1);
+        assert_eq!(read_u32(&objects[0], 56), 1);
+        assert_eq!(parsed.string(read_u32(&objects[0], 64)), "rtti_confirmed");
+        assert_eq!(
+            parsed.string(read_u32(&objects[0], 68)),
+            "module_pointer_scan"
         );
-        assert!(text.contains("REVDMP_SYNTHETIC_STRUCTS v1"));
+
+        let vtable_facts = parsed.block(BLOCK_VTABLE_FACTS);
+        assert_eq!(vtable_facts.len(), 2);
+        assert_eq!(read_u32(&vtable_facts[0], 0), 0x2000);
+        assert_eq!(read_u64(&vtable_facts[0], 4), 0x1000_0000);
+        assert_eq!(read_u32(&vtable_facts[0], 12), 0x8000);
+        assert_eq!(read_u32(&vtable_facts[0], 16), 0x20);
+        assert_eq!(read_u32(&vtable_facts[0], 20), 0x5000);
+        assert_eq!(read_u64(&vtable_facts[0], 24), 0x1400_5000);
+        assert_eq!(parsed.string(read_u32(&vtable_facts[0], 32)), "AudioService");
+        assert_eq!(read_u32(&vtable_facts[1], 0), REVDMP_NONE_U32);
+
+        let rtti = parsed.block(BLOCK_MSVC_RTTI);
+        assert_eq!(rtti.len(), 1);
+        assert_eq!(read_u32(&rtti[0], 0), 0x5000);
+        assert_eq!(read_u32(&rtti[0], 4), 0x4800);
+        assert_eq!(parsed.string(read_u32(&rtti[0], 20)), "AudioService");
+        assert_eq!(read_u32(&rtti[0], 24), 0x4A00);
+        assert_eq!(read_u32(&rtti[0], 32), 1);
+
+        let bases = parsed.block(BLOCK_MSVC_BASE_CLASSES);
+        assert_eq!(bases.len(), 1);
+        assert_eq!(read_u32(&bases[0], 0), 0x5000);
+        assert_eq!(parsed.string(read_u32(&bases[0], 4)), "IService");
+        assert_eq!(read_i32(&bases[0], 20), -1);
+        assert_eq!(read_u32(&bases[0], 28), 0x40);
+
+        let globals = parsed.block(BLOCK_GLOBAL_POINTERS);
+        assert_eq!(globals.len(), 1);
+        assert_eq!(read_u32(&globals[0], 0), 0x2000);
+        assert_eq!(read_u64(&globals[0], 4), 0x1000_0000);
+        assert_eq!(read_u32(&globals[0], 12), 0x8000);
+        assert_eq!(globals[0][16], 1);
+
+        let heap_edges = parsed.block(BLOCK_HEAP_EDGES);
+        assert_eq!(heap_edges.len(), 1);
+        assert_eq!(read_u64(&heap_edges[0], 0), 0x1000_0000);
+        assert_eq!(read_u32(&heap_edges[0], 12), 0x18);
+        assert_eq!(read_u64(&heap_edges[0], 16), 0x2000_0000);
+        assert_eq!(parsed.string(read_u32(&heap_edges[0], 36)), "raw_heap_pointer");
+
+        let containers = parsed.block(BLOCK_CONTAINERS);
+        assert_eq!(containers.len(), 1);
+        assert_eq!(parsed.string(read_u32(&containers[0], 16)), "vector_triple");
+        assert_eq!(read_u32(&containers[0], 20), 1);
+        assert_eq!(parsed.string(read_u32(&containers[0], 24)), "0x20000000");
+
+        let field_types = parsed.block(BLOCK_FIELD_TYPES);
+        assert_eq!(field_types.len(), 4);
+        assert_eq!(parsed.string(read_u32(&field_types[0], 0)), "obj_00008000");
+        assert_eq!(read_u32(&field_types[0], 16), 0x20);
+        assert_eq!(parsed.string(read_u32(&field_types[0], 20)), "vfptr");
+        assert_eq!(parsed.string(read_u32(&field_types[1], 20)), "vfptr");
+        assert_eq!(parsed.string(read_u32(&field_types[2], 20)), "object_pointer");
+        assert_eq!(parsed.string(read_u32(&field_types[3], 20)), "vector_triple");
+
+        let container_elements = parsed.block(BLOCK_CONTAINER_ELEMENTS);
+        assert_eq!(container_elements.len(), 1);
+        assert_eq!(
+            parsed.string(read_u32(&container_elements[0], 0)),
+            "container_0000000010000000_30"
+        );
+        assert_eq!(read_u32(&container_elements[0], 24), 0);
+        assert_eq!(read_u64(&container_elements[0], 28), 0x2000_0000);
+
+        let indirect_calls = parsed.block(BLOCK_INDIRECT_CALLS);
+        assert_eq!(indirect_calls.len(), 1);
+        assert_eq!(read_u32(&indirect_calls[0], 0), 0x1234);
+        assert_eq!(read_u32(&indirect_calls[0], 4), 6);
+        assert_eq!(parsed.string(read_u32(&indirect_calls[0], 8)), "call");
+        assert_eq!(read_u32(&indirect_calls[0], 16), 0x4560);
+        assert_eq!(read_u64(&indirect_calls[0], 20), 0x1400_4560);
+
+        let function_pointers = parsed.block(BLOCK_FUNCTION_POINTERS);
+        assert_eq!(function_pointers.len(), 1);
+        assert_eq!(read_u32(&function_pointers[0], 0), 0x6000);
+        assert_eq!(parsed.string(read_u32(&function_pointers[0], 12)), ".rdata");
+        assert_eq!(parsed.string(read_u32(&function_pointers[0], 16)), "callback_slot");
+        assert_eq!(read_u32(&function_pointers[0], 24), REVDMP_NONE_U32);
+        assert_eq!(read_u32(&function_pointers[0], 28), 0x4560);
+
+        let function_pointer_tables = parsed.block(BLOCK_FUNCTION_POINTER_TABLES);
+        assert_eq!(function_pointer_tables.len(), 1);
+        assert_eq!(
+            parsed.string(read_u32(&function_pointer_tables[0], 0)),
+            "fptable_00006100"
+        );
+        assert_eq!(read_u32(&function_pointer_tables[0], 20), 2);
+        assert_eq!(
+            parsed.string(read_u32(&function_pointer_tables[0], 24)),
+            "0x4560;0x4570"
+        );
+
+        let slots = parsed.block(BLOCK_VTABLE_SLOTS);
+        assert_eq!(slots.len(), 1);
+        assert_eq!(read_u32(&slots[0], 0), 0x5000);
+        assert_eq!(parsed.string(read_u32(&slots[0], 4)), "AudioService");
+        assert_eq!(read_u32(&slots[0], 16), 0x7100);
+        assert_eq!(read_u32(&slots[0], 28), 0x7200);
+        assert_eq!(parsed.string(read_u32(&slots[0], 40)), "adjustor_thunk");
+        assert_eq!(
+            parsed.string(read_u32(&slots[0], 48)),
+            "AudioService::tick"
+        );
+
+        let thunks = parsed.block(BLOCK_THUNK_NORMALIZATIONS);
+        assert_eq!(thunks.len(), 1);
+        assert_eq!(read_u32(&thunks[0], 0), 0x7100);
+        assert_eq!(read_u32(&thunks[0], 28), 9);
+        assert_eq!(read_i32(&thunks[0], 32), -8);
+        assert_eq!(thunks[0][36], 1);
+
+        let cfg = parsed.block(BLOCK_CFG_FUNCTIONS);
+        assert_eq!(cfg.len(), 1);
+        assert_eq!(read_u32(&cfg[0], 0), 0x7300);
+        assert_eq!(read_u32(&cfg[0], 16), 0x7200);
+        assert_eq!(cfg[0][28], 0);
+        assert_eq!(read_u32(&cfg[0], 32), 0x500);
+
+        let exceptions = parsed.block(BLOCK_EXCEPTION_FUNCTIONS);
+        assert_eq!(exceptions.len(), 1);
+        assert_eq!(read_u32(&exceptions[0], 0), 0x7400);
+        assert_eq!(read_u32(&exceptions[0], 4), 0x7200);
+        assert_eq!(exceptions[0][16], 1);
+        assert_eq!(exceptions[0][21], 1);
+        assert_eq!(read_u32(&exceptions[0], 24), 0x7600);
+        assert_eq!(read_u64(&exceptions[0], 28), 0x1400_7600);
+        assert_eq!(parsed.string(read_u32(&exceptions[0], 48)), "EHANDLER");
+
+        let synthetic_structs = parsed.block(BLOCK_SYNTHETIC_STRUCTS);
+        assert_eq!(synthetic_structs.len(), 2);
+        assert_eq!(read_u32(&synthetic_structs[0], 0), 0x8000);
+        assert_eq!(
+            parsed.string(read_u32(&synthetic_structs[0], 12)),
+            "revdump_obj_8000"
+        );
+        assert_eq!(parsed.string(read_u32(&synthetic_structs[0], 20)), "0x20");
     }
 
     #[test]
@@ -4288,49 +3874,6 @@ mod tests {
         assert_eq!(exception_functions[0].unwind_flags, 1);
         assert_eq!(exception_functions[0].unwind_flag_names, "EHANDLER");
         assert_eq!(exception_functions[0].handler_rva, Some(0x190));
-    }
-
-    #[test]
-    fn test_ida_script_contains_offsets_names_structs_and_edges() {
-        let stub_generator = StubGenerator::from_test_stubs(
-            0x1400_0000,
-            0x100000,
-            vec![VtableStub {
-                original_addr: 0x1000_0000,
-                size: 0x28,
-                data: vec![0; 0x28],
-                new_rva: 0x8000,
-                vtable_refs: vec![VtableRef {
-                    offset: 0x20,
-                    vtable_rva: 0x5000,
-                }],
-                vfptr_offsets: [0x20].into_iter().collect(),
-            }],
-        );
-        let facts = vec![EnrichedVtableFact {
-            type_name: Some("AudioService".to_string()),
-            msvc_rtti: None,
-            fact: VtableFact {
-                source_rva: Some(0x2000),
-                heap_addr: 0x1000_0000,
-                stub_rva: 0x8000,
-                vfptr_offset: 0x20,
-                vtable_rva: 0x5000,
-            },
-        }];
-
-        let script = build_ida_script(
-            &facts,
-            &[(0x2000, 0x1000_0000)],
-            &[],
-            &[],
-            0x1400_0000,
-            &stub_generator,
-        );
-        assert!(script.contains("make_struct('revdump_obj_8000'"));
-        assert!(script.contains("qword_off(0x14008020, 0x14005000)"));
-        assert!(script.contains("vftable_AudioService"));
-        assert!(script.contains("qword_off(0x14002000, 0x14008000)"));
     }
 
     #[test]
