@@ -17,7 +17,8 @@ use crate::pe::{
 };
 use crate::scanner::{PointerScanner, ScanResult};
 use crate::stub::{
-    ContainerFact, EdgeConfidence, HeapPointerEdge, StubConfig, StubGenerator, VtableFact,
+    ContainerFact, EdgeConfidence, HeapPointerEdge, StubConfig, StubDebugProgress, StubGenerator,
+    VtableFact,
 };
 use sha2::{Digest, Sha256};
 
@@ -244,6 +245,8 @@ pub struct ProgressInfo {
     pub bytes_processed: usize,
     /// Total bytes to process.
     pub total_bytes: usize,
+    /// Detailed heap-stub progress for heap processing stages.
+    pub stub_debug: Option<StubDebugProgress>,
 }
 
 impl Default for ProgressInfo {
@@ -257,6 +260,7 @@ impl Default for ProgressInfo {
             pointers_found: 0,
             bytes_processed: 0,
             total_bytes: 0,
+            stub_debug: None,
         }
     }
 }
@@ -2298,10 +2302,19 @@ impl Dumper {
         progress.stage = ProgressStage::CreatingStubs;
         progress.total = heap_ptr_locs.len();
         progress.current = 0;
+        progress.stub_debug = None;
         report(&progress);
 
-        stub_generator.process_heap_pointers(&heap_ptr_locs);
+        stub_generator.process_heap_pointers_with_progress(&heap_ptr_locs, |stub_progress| {
+            progress.current = stub_progress.current;
+            progress.total = stub_progress.total;
+            progress.stubs_created = stub_progress.created;
+            progress.stub_debug = Some(stub_progress);
+            report(&progress);
+        });
         progress.stubs_created = stub_generator.stub_count();
+        progress.current = progress.total;
+        report(&progress);
 
         if stub_generator.stub_count() == 0 {
             return self.standard_dump(output_path, config);
@@ -2309,6 +2322,7 @@ impl Dumper {
 
         // Assign RVAs
         progress.stage = ProgressStage::AssigningRvas;
+        progress.stub_debug = None;
         report(&progress);
 
         let heap_section_va = pe.next_section_va();

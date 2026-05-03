@@ -160,7 +160,7 @@ Useful toggles:
 | `--no-revdmp` | off | Disable embedded `.revdmp` metadata section |
 | `--no-rtti` | off | Disable RTTI parsing for type names |
 | `--max-graph-edges <n>` | `100000` | Limit retained heap graph edges after scoring |
-| `--min-edge-confidence <low|medium|high>` | `low` | Drop lower-confidence heap graph edges |
+| `--min-edge-confidence <low/medium/high>` | `low` | Drop lower-confidence heap graph edges |
 | `--no-containers` | off | Disable conservative container detection |
 
 ### DLL Injection Mode

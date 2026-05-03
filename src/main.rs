@@ -229,7 +229,35 @@ fn dump_with_heap(
                     )
                 }
                 ProgressStage::CreatingStubs => {
-                    format!("{} - {} stubs", info.stage.name(), info.stubs_created)
+                    if let Some(stub) = info.stub_debug {
+                        if stub.total == 0 {
+                            format!(
+                                "{} - {} (stubs {}, dup {}, invalid {}, no vfptr {}, outside module {}, rec {})",
+                                info.stage.name(),
+                                stub.phase,
+                                stub.created,
+                                stub.already_visited,
+                                stub.invalid_heap_ptr,
+                                stub.no_vfptr_found,
+                                stub.vtable_not_in_module,
+                                stub.recursive_discovered,
+                            )
+                        } else {
+                            format!(
+                                "{} - {}/{} (stubs {}, dup {}, invalid {}, no vfptr {}, outside module {})",
+                                info.stage.name(),
+                                stub.current,
+                                stub.total,
+                                stub.created,
+                                stub.already_visited,
+                                stub.invalid_heap_ptr,
+                                stub.no_vfptr_found,
+                                stub.vtable_not_in_module,
+                            )
+                        }
+                    } else {
+                        format!("{} - {} stubs", info.stage.name(), info.stubs_created)
+                    }
                 }
                 ProgressStage::AnalyzingMetadata | ProgressStage::BuildingMetadata => {
                     let item = info.current_item.as_deref().unwrap_or("");

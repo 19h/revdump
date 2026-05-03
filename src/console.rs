@@ -1132,10 +1132,38 @@ fn print_progress(info: &ProgressInfo) {
             )
         }
         ProgressStage::CreatingStubs => {
-            format!(
-                "{}/{} | {} stubs",
-                info.current, info.total, info.stubs_created
-            )
+            if let Some(stub) = info.stub_debug {
+                if stub.total == 0 {
+                    format!(
+                        "{} | stubs={} dup={} invalid={} no_vfptr={} no_module_vtbl={} rec={}",
+                        stub.phase,
+                        stub.created,
+                        stub.already_visited,
+                        stub.invalid_heap_ptr,
+                        stub.no_vfptr_found,
+                        stub.vtable_not_in_module,
+                        stub.recursive_discovered
+                    )
+                } else {
+                    format!(
+                        "{}/{} | stubs={} dup={} invalid={} no_vfptr={} no_module_vtbl={} rva=0x{:X} heap=0x{:X}",
+                        stub.current,
+                        stub.total,
+                        stub.created,
+                        stub.already_visited,
+                        stub.invalid_heap_ptr,
+                        stub.no_vfptr_found,
+                        stub.vtable_not_in_module,
+                        stub.current_rva,
+                        stub.current_heap_addr
+                    )
+                }
+            } else {
+                format!(
+                    "{}/{} | {} stubs",
+                    info.current, info.total, info.stubs_created
+                )
+            }
         }
         ProgressStage::ApplyingFixups => {
             format!("{}/{} fixups", info.current, info.total)

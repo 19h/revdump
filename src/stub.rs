@@ -488,12 +488,23 @@ impl StubGenerator {
 
     /// Process all heap pointer locations and create stubs.
     pub fn process_heap_pointers(&mut self, heap_ptr_locs: &[(u32, u64)]) {
-        self.process_heap_pointers_inner(heap_ptr_locs, false, None)
+        self.process_heap_pointers_inner(heap_ptr_locs, false, false, None)
     }
 
     /// Process heap pointers with optional verbose debugging.
     pub fn process_heap_pointers_verbose(&mut self, heap_ptr_locs: &[(u32, u64)]) {
-        self.process_heap_pointers_inner(heap_ptr_locs, true, None)
+        self.process_heap_pointers_inner(heap_ptr_locs, true, true, None)
+    }
+
+    /// Process heap pointers with progress snapshots.
+    pub fn process_heap_pointers_with_progress<F>(
+        &mut self,
+        heap_ptr_locs: &[(u32, u64)],
+        mut progress: F,
+    ) where
+        F: FnMut(StubDebugProgress),
+    {
+        self.process_heap_pointers_inner(heap_ptr_locs, false, false, Some(&mut progress))
     }
 
     /// Process heap pointers with verbose debugging and progress snapshots.
@@ -504,13 +515,14 @@ impl StubGenerator {
     ) where
         F: FnMut(StubDebugProgress),
     {
-        self.process_heap_pointers_inner(heap_ptr_locs, true, Some(&mut progress))
+        self.process_heap_pointers_inner(heap_ptr_locs, true, false, Some(&mut progress))
     }
 
     fn process_heap_pointers_inner(
         &mut self,
         heap_ptr_locs: &[(u32, u64)],
         verbose: bool,
+        print_skipped: bool,
         mut progress: Option<&mut dyn FnMut(StubDebugProgress)>,
     ) {
         let mut stats = StubCreationStats::default();
@@ -525,7 +537,7 @@ impl StubGenerator {
             let target_addr = strip_pointer_tags(target_addr);
             stats.total += 1;
 
-            if verbose {
+            if verbose && print_skipped {
                 eprintln!(
                     "  [{}] RVA 0x{:X} -> heap 0x{:X}",
                     stats.total, rva, target_addr
@@ -535,7 +547,7 @@ impl StubGenerator {
             // Track why stubs fail to be created
             if self.visited.contains(&target_addr) {
                 stats.already_visited += 1;
-                if verbose {
+                if verbose && print_skipped {
                     eprintln!("      SKIP: already visited");
                 }
                 emit_stub_debug_progress(
@@ -552,7 +564,7 @@ impl StubGenerator {
 
             if !self.is_valid_heap_ptr(target_addr) {
                 stats.invalid_heap_ptr += 1;
-                if verbose {
+                if verbose && print_skipped {
                     eprintln!("      SKIP: not a valid heap pointer");
                     eprintln!("        reason: {}", self.debug_check_pointer(target_addr));
                 }
@@ -570,7 +582,7 @@ impl StubGenerator {
 
             self.visited.insert(target_addr);
 
-            let vfptr_offsets = if verbose {
+            let vfptr_offsets = if verbose && print_skipped {
                 self.probe_vfptr_offsets_verbose(target_addr)
             } else {
                 self.probe_vfptr_offsets(target_addr)
@@ -578,7 +590,7 @@ impl StubGenerator {
 
             if vfptr_offsets.is_empty() {
                 stats.no_vfptr_found += 1;
-                if verbose {
+                if verbose && print_skipped {
                     eprintln!("      SKIP: no vfptr found at any offset");
                 }
                 emit_stub_debug_progress(
@@ -600,11 +612,17 @@ impl StubGenerator {
             {
                 stats.created += 1;
                 if verbose {
+                    if !print_skipped {
+                        eprintln!(
+                            "  [{}] RVA 0x{:X} -> heap 0x{:X}",
+                            stats.total, rva, target_addr
+                        );
+                    }
                     eprintln!("      OK: stub created");
                 }
             } else {
                 stats.vtable_not_in_module += 1;
-                if verbose {
+                if verbose && print_skipped {
                     eprintln!("      SKIP: vtable not in module");
                 }
             }
